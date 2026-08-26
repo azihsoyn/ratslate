@@ -1,5 +1,8 @@
 mod app;
 mod canvas_io;
+mod mind_app;
+mod mind_render;
+mod mindmap;
 mod model;
 mod render;
 
@@ -19,23 +22,37 @@ use ratatui::{
 };
 
 use app::App;
+use mind_app::MindApp;
 
 type Backend = CrosstermBackend<io::Stdout>;
 
 fn main() -> io::Result<()> {
-    let save_path = std::env::args().nth(1).map(PathBuf::from);
+    let path = std::env::args().nth(1).map(PathBuf::from);
+    let is_markdown = path.as_ref().is_some_and(|p| {
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("md") | Some("markdown")
+        )
+    });
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut app = App::new(save_path);
-    let result = run(&mut terminal, &mut app);
-
-    if app.save_path.is_some() {
+    let result = if is_markdown {
+        let mut app = MindApp::new(path.expect("is_markdown implies a path"));
+        let result = run_mind(&mut terminal, &mut app);
         app.save();
-    }
+        result
+    } else {
+        let mut app = App::new(path);
+        let result = run_whiteboard(&mut terminal, &mut app);
+        if app.save_path.is_some() {
+            app.save();
+        }
+        result
+    };
 
     disable_raw_mode()?;
     execute!(
@@ -48,7 +65,7 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
+fn run_whiteboard(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
     loop {
         let mut canvas_area = Rect::default();
         terminal.draw(|frame| {
@@ -62,6 +79,29 @@ fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
             match event::read()? {
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse, canvas_area),
+                _ => {}
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn run_mind(terminal: &mut Terminal<Backend>, app: &mut MindApp) -> io::Result<()> {
+    loop {
+        terminal.draw(|frame| {
+            let full = frame.area();
+            let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(full);
+            mind_render::render(frame, app, chunks[0], chunks[1]);
+        })?;
+
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => app.on_key(key),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
                 _ => {}
             }
         }

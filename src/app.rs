@@ -88,6 +88,10 @@ pub struct App {
     pub should_quit: bool,
     pub save_path: Option<PathBuf>,
     pub status: String,
+    /// Refreshed by `render` every frame, so a height grown while typing
+    /// has something to clamp against without threading it through
+    /// `on_key`.
+    pub canvas_area: Rect,
     grab_offset: (u16, u16),
     resize_origin: Option<(ShapeId, Corner, Rect)>,
     press_on_empty: Option<(u16, u16)>,
@@ -122,6 +126,7 @@ impl App {
             should_quit: false,
             save_path,
             status,
+            canvas_area: Rect::default(),
             grab_offset: (0, 0),
             resize_origin: None,
             press_on_empty: None,
@@ -223,6 +228,21 @@ impl App {
             _ => String::new(),
         };
         self.mode = Mode::Editing(id);
+    }
+
+    /// Grows the box being edited so a newline, or text wrapping past
+    /// its width, never runs past the bottom border. Only grows — a
+    /// box does not shrink back down as text is deleted.
+    fn grow_to_fit(&mut self, id: &ShapeId) {
+        let Some(node) = self.canvas.node(id) else { return };
+        let inner_width = node.rect.width.saturating_sub(2).max(1);
+        let needed = wrapped_height(&self.editing_text, inner_width);
+        if needed <= node.rect.height {
+            return;
+        }
+        let (x, y, w) = (node.rect.x, node.rect.y, node.rect.width);
+        let max_h = self.canvas_area.bottom().saturating_sub(y).max(MIN_H);
+        let _ = self.dispatch(Request::SetRect { id: id.clone(), x, y, w, h: needed.min(max_h) });
     }
 
     /// The node closest to this cell — a drop that missed a box by a
@@ -339,13 +359,19 @@ impl App {
         }
 
         match self.mode.clone() {
-            Mode::Editing(_) => match key.code {
+            Mode::Editing(id) => match key.code {
                 KeyCode::Esc => self.commit_edit(),
-                KeyCode::Enter => self.editing_text.push('\n'),
+                KeyCode::Enter => {
+                    self.editing_text.push('\n');
+                    self.grow_to_fit(&id);
+                }
                 KeyCode::Backspace => {
                     self.editing_text.pop();
                 }
-                KeyCode::Char(c) => self.editing_text.push(c),
+                KeyCode::Char(c) => {
+                    self.editing_text.push(c);
+                    self.grow_to_fit(&id);
+                }
                 _ => {}
             },
             Mode::Normal => match key.code {
@@ -425,4 +451,19 @@ fn rect_distance(r: Rect, x: u16, y: u16) -> u32 {
         y.saturating_sub(r.y + r.height.saturating_sub(1))
     };
     dx as u32 + dy as u32
+}
+
+/// How tall a box needs to be to show `text` without clipping, wrapped
+/// to `width` columns the same simple way `Paragraph`'s `Wrap` would,
+/// plus the top and bottom border.
+fn wrapped_height(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let content_lines: u16 = text
+        .split('\n')
+        .map(|line| {
+            let len = line.chars().count();
+            if len == 0 { 1 } else { len.div_ceil(width) as u16 }
+        })
+        .sum();
+    content_lines.max(1) + 2
 }

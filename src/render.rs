@@ -10,13 +10,25 @@ use crate::model::{Canvas, Color, EdgeEnd, Node, NodeKind};
 
 pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: Rect) {
     app.hits.clear();
+    app.canvas_area = canvas_area;
 
     let hidden_id: Option<String> = match app.drag.moving() {
         Some(HitTarget::Move(id)) | Some(HitTarget::Resize(id, _)) => Some(id.clone()),
         _ => None,
     };
 
-    draw_edges(frame, &app.canvas);
+    // Where the box being dragged actually is right now, so a
+    // connector follows the ghost instead of staying put until the
+    // drop lands.
+    let live_rect: Option<(String, Rect)> = if let Some((id, rect)) = app.resize_preview(canvas_area) {
+        Some((id, rect))
+    } else if let Some(HitTarget::Move(id)) = app.drag.moving() {
+        app.drag.ghost(canvas_area).map(|g| (id.clone(), g))
+    } else {
+        None
+    };
+
+    draw_edges(frame, &app.canvas, live_rect.as_ref());
 
     for node in &app.canvas.nodes {
         if hidden_id.as_deref() == Some(node.id.as_str()) {
@@ -31,15 +43,9 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         draw_node(frame, node, selected, editing, &app.editing_text);
     }
 
-    if let Some((id, rect)) = app.resize_preview(canvas_area) {
-        let color = app.canvas.node(&id).and_then(|n| n.color.as_ref());
-        draw_ghost(frame, rect, color);
-    } else if let Some(ghost) = app.drag.ghost(canvas_area) {
-        let color = match app.drag.moving() {
-            Some(HitTarget::Move(id)) => app.canvas.node(id).and_then(|n| n.color.as_ref()),
-            _ => None,
-        };
-        draw_ghost(frame, ghost, color);
+    if let Some((id, rect)) = &live_rect {
+        let color = app.canvas.node(id).and_then(|n| n.color.as_ref());
+        draw_ghost(frame, *rect, color);
     }
 
     if let Some(HitTarget::Connect(from)) = app.drag.moving()
@@ -143,9 +149,14 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
     frame.render_widget(Block::bordered().border_style(style), rect);
 }
 
-fn draw_edges(frame: &mut Frame, canvas: &Canvas) {
+fn draw_edges(frame: &mut Frame, canvas: &Canvas, live: Option<&(String, Rect)>) {
+    let rect_of = |id: &str| -> Option<Rect> {
+        live.filter(|(live_id, _)| live_id == id)
+            .map(|(_, r)| *r)
+            .or_else(|| canvas.node(id).map(|n| n.rect))
+    };
     for edge in &canvas.edges {
-        let (Some(from), Some(to)) = (canvas.node(&edge.from), canvas.node(&edge.to)) else {
+        let (Some(from_rect), Some(to_rect)) = (rect_of(&edge.from), rect_of(&edge.to)) else {
             continue;
         };
         let style = edge
@@ -154,8 +165,8 @@ fn draw_edges(frame: &mut Frame, canvas: &Canvas) {
             .map(ratatui_color)
             .map(|c| Style::default().fg(c))
             .unwrap_or_default();
-        let (fc, tc) = (center(from.rect), center(to.rect));
-        let path = clipped_path(from.rect, to.rect, fc, tc);
+        let (fc, tc) = (center(from_rect), center(to_rect));
+        let path = clipped_path(from_rect, to_rect, fc, tc);
         draw_path(frame, &path, style);
         if edge.to_end == EdgeEnd::Arrow
             && let Some(&(x, y)) = path.last()

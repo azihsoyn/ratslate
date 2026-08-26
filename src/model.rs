@@ -89,7 +89,7 @@ pub struct Edge {
 
 /// Nodes are drawn (and hit-tested) in this order, so the last one is on
 /// top — the same z-index rule JSON Canvas uses for its `nodes` array.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Canvas {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -147,6 +147,18 @@ impl Canvas {
     pub fn delete(&mut self, id: &str) {
         self.nodes.retain(|n| n.id != id);
         self.edges.retain(|e| e.from != id && e.to != id);
+    }
+
+    pub fn edge(&self, id: &str) -> Option<&Edge> {
+        self.edges.iter().find(|e| e.id == id)
+    }
+
+    pub fn edge_mut(&mut self, id: &str) -> Option<&mut Edge> {
+        self.edges.iter_mut().find(|e| e.id == id)
+    }
+
+    pub fn delete_edge(&mut self, id: &str) {
+        self.edges.retain(|e| e.id != id);
     }
 
     pub fn edit_text(&mut self, id: &str, f: impl FnOnce(&mut String)) {

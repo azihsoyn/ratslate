@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use ratatui_dnd::{Act, Sortable};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,14 @@ pub enum Request {
     State,
     /// Write the document to the path given on the command line.
     Save,
+    /// Undo the last change that touched the document.
+    Undo,
+}
+
+impl Request {
+    fn mutates(&self) -> bool {
+        !matches!(self, Request::Select { .. } | Request::State | Request::Save | Request::Undo)
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -45,6 +53,7 @@ pub enum Response {
     Ok,
     State { roots: Vec<TreeNode> },
     Saved { path: String },
+    Undone { done: bool },
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -68,6 +77,8 @@ fn tree_node(tree: &MindTree, id: NodeId) -> TreeNode {
     }
 }
 
+const UNDO_LIMIT: usize = 100;
+
 pub struct MindApp {
     pub lines: Vec<String>,
     pub tree: MindTree,
@@ -78,6 +89,7 @@ pub struct MindApp {
     pub save_path: PathBuf,
     pub status: String,
     pub should_quit: bool,
+    undo_stack: Vec<Vec<String>>,
 }
 
 impl MindApp {
@@ -105,7 +117,28 @@ impl MindApp {
             save_path,
             status,
             should_quit: false,
+            undo_stack: Vec::new(),
         }
+    }
+
+    fn push_undo(&mut self) {
+        self.undo_stack.push(self.lines.clone());
+        if self.undo_stack.len() > UNDO_LIMIT {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            self.status = "nothing to undo".to_string();
+            return false;
+        };
+        self.lines = prev;
+        self.tree = mindmap::parse(&self.lines);
+        self.selected = None;
+        self.mode = Mode::Normal;
+        self.status = "undone".to_string();
+        true
     }
 
     pub fn save(&mut self) {
@@ -123,6 +156,9 @@ impl MindApp {
     /// The single place every document mutation goes through, whether
     /// it came from a mouse drag, a keystroke, or `--api`.
     pub fn dispatch(&mut self, req: Request) -> Result<Response, String> {
+        if req.mutates() {
+            self.push_undo();
+        }
         match req {
             Request::Move { id, parent, index } => {
                 self.tree.node(id).ok_or_else(|| format!("no such node: {id}"))?;
@@ -161,6 +197,7 @@ impl MindApp {
                 self.save();
                 Ok(Response::Saved { path: self.save_path.display().to_string() })
             }
+            Request::Undo => Ok(Response::Undone { done: self.undo() }),
         }
     }
 
@@ -200,10 +237,15 @@ impl MindApp {
                 KeyCode::Backspace => {
                     self.editing_text.pop();
                 }
-                KeyCode::Char(c) => self.editing_text.push(c),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.editing_text.push(c);
+                }
                 _ => {}
             },
             Mode::Normal => match key.code {
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.undo();
+                }
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('s') => {
                     let _ = self.dispatch(Request::Save);

@@ -11,6 +11,7 @@ use crate::model::{Canvas, Color, ShapeId};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
+const UNDO_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Corner {
@@ -35,10 +36,19 @@ impl HitTarget {
     }
 }
 
+/// What's currently under the selection — a box or a connector, never
+/// both. Doubles as the payload of `Mode::Editing`: whichever is
+/// selected is what a click or an Enter would go on to edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selected {
+    Node(ShapeId),
+    Edge(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    Editing(ShapeId),
+    Editing(Selected),
 }
 
 /// Every way the board can change. The TUI's mouse and key handlers
@@ -61,12 +71,75 @@ pub enum Request {
     Connect { from: ShapeId, to: ShapeId },
     /// Remove a box and any connectors touching it.
     Delete { id: ShapeId },
-    /// Select a box, or clear the selection with `null`.
-    Select { id: Option<ShapeId> },
+    /// Label a connector, or clear its label with `null`.
+    SetLabel { id: String, label: Option<String> },
+    /// Remove a connector without touching the boxes it joined.
+    DeleteEdge { id: String },
+    /// Select a box or a connector, or clear the selection with `null`.
+    Select { id: Option<Selected> },
     /// The whole board, as JSON Canvas.
     State,
     /// Write the board to the path given on the command line.
     Save,
+    /// Undo the last change that touched the board.
+    Undo,
+}
+
+impl Request {
+    /// Whether this changes the board in a way undo should be able to
+    /// step back through. Select/State/Save/Undo itself don't.
+    fn mutates(&self) -> bool {
+        !matches!(self, Request::Select { .. } | Request::State | Request::Save | Request::Undo)
+    }
+}
+
+// serde can't derive on an enum with a `String` and a `ShapeId` (also a
+// `String`) sharing a tag position across variants cleanly here, so
+// `Selected` gets its own small wire shape instead of leaning on serde's
+// externally-tagged default, which would ask for `{"Node": "..."}`.
+impl<'de> Deserialize<'de> for Selected {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, JsonSchema)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Wire {
+            Node { id: ShapeId },
+            Edge { id: String },
+        }
+        Ok(match Wire::deserialize(d)? {
+            Wire::Node { id } => Selected::Node(id),
+            Wire::Edge { id } => Selected::Edge(id),
+        })
+    }
+}
+
+impl Serialize for Selected {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let (kind, id) = match self {
+            Selected::Node(id) => ("node", id),
+            Selected::Edge(id) => ("edge", id),
+        };
+        let mut st = s.serialize_struct("Selected", 2)?;
+        st.serialize_field("kind", kind)?;
+        st.serialize_field("id", id)?;
+        st.end()
+    }
+}
+
+impl JsonSchema for Selected {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Selected".into()
+    }
+    fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        #[derive(JsonSchema)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum Wire {
+            Node { id: ShapeId },
+            Edge { id: String },
+        }
+        g.subschema_for::<Wire>()
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -76,13 +149,15 @@ pub enum Response {
     Ok,
     State { board: FileRoot },
     Saved { path: String },
+    Undone { done: bool },
 }
 
 pub struct App {
     pub canvas: Canvas,
     pub drag: Drag<HitTarget>,
     pub hits: Hits<HitTarget>,
-    pub selected: Option<ShapeId>,
+    pub edge_hits: Hits<String>,
+    pub selected: Option<Selected>,
     pub mode: Mode,
     pub editing_text: String,
     pub should_quit: bool,
@@ -92,9 +167,11 @@ pub struct App {
     /// has something to clamp against without threading it through
     /// `on_key`.
     pub canvas_area: Rect,
+    undo_stack: Vec<Canvas>,
     grab_offset: (u16, u16),
     resize_origin: Option<(ShapeId, Corner, Rect)>,
     press_on_empty: Option<(u16, u16)>,
+    press_on_edge: Option<(String, u16, u16)>,
 }
 
 impl App {
@@ -120,6 +197,7 @@ impl App {
             canvas,
             drag: Drag::new(),
             hits: Hits::new(),
+            edge_hits: Hits::new(),
             selected: None,
             mode: Mode::Normal,
             editing_text: String::new(),
@@ -127,9 +205,11 @@ impl App {
             save_path,
             status,
             canvas_area: Rect::default(),
+            undo_stack: Vec::new(),
             grab_offset: (0, 0),
             resize_origin: None,
             press_on_empty: None,
+            press_on_edge: None,
         }
     }
 
@@ -144,9 +224,31 @@ impl App {
         }
     }
 
+    fn push_undo(&mut self) {
+        self.undo_stack.push(self.canvas.clone());
+        if self.undo_stack.len() > UNDO_LIMIT {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            self.status = "nothing to undo".to_string();
+            return false;
+        };
+        self.canvas = prev;
+        self.selected = None;
+        self.mode = Mode::Normal;
+        self.status = "undone".to_string();
+        true
+    }
+
     /// The single place every board mutation goes through, whether it
     /// came from a mouse drag, a keystroke, or `--api`.
     pub fn dispatch(&mut self, req: Request) -> Result<Response, String> {
+        if req.mutates() {
+            self.push_undo();
+        }
         match req {
             Request::Place { x, y } => {
                 let id = self.canvas.place_text(x, y);
@@ -178,7 +280,19 @@ impl App {
             }
             Request::Delete { id } => {
                 self.canvas.delete(&id);
-                if self.selected.as_deref() == Some(id.as_str()) {
+                if self.selected == Some(Selected::Node(id)) {
+                    self.selected = None;
+                }
+                Ok(Response::Ok)
+            }
+            Request::SetLabel { id, label } => {
+                let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
+                edge.label = label.filter(|l| !l.is_empty());
+                Ok(Response::Ok)
+            }
+            Request::DeleteEdge { id } => {
+                self.canvas.delete_edge(&id);
+                if self.selected == Some(Selected::Edge(id)) {
                     self.selected = None;
                 }
                 Ok(Response::Ok)
@@ -194,6 +308,7 @@ impl App {
                     path: self.save_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
                 })
             }
+            Request::Undo => Ok(Response::Undone { done: self.undo() }),
         }
     }
 
@@ -210,24 +325,29 @@ impl App {
         Some((id.clone(), resized_rect(*origin_rect, *corner, cx, cy, bounds)))
     }
 
-    /// Write whatever is in the scratch buffer back to the node being
-    /// edited and leave edit mode. Called before any new press is acted
-    /// on, so clicking away from an edit-in-progress can never lose it
-    /// the way jumping straight to a different mode used to.
+    /// Write whatever is in the scratch buffer back to whatever is
+    /// being edited and leave edit mode. Called before any new press is
+    /// acted on, so clicking away from an edit-in-progress can never
+    /// lose it the way jumping straight to a different mode used to.
     fn commit_edit(&mut self) {
-        if let Mode::Editing(id) = self.mode.clone() {
-            let text = std::mem::take(&mut self.editing_text);
-            let _ = self.dispatch(Request::SetText { id, text });
-            self.mode = Mode::Normal;
-        }
+        let Mode::Editing(target) = self.mode.clone() else { return };
+        let text = std::mem::take(&mut self.editing_text);
+        let _ = match target {
+            Selected::Node(id) => self.dispatch(Request::SetText { id, text }),
+            Selected::Edge(id) => self.dispatch(Request::SetLabel { id, label: Some(text) }),
+        };
+        self.mode = Mode::Normal;
     }
 
-    fn begin_edit(&mut self, id: ShapeId) {
-        self.editing_text = match self.canvas.node(&id).map(|n| &n.kind) {
-            Some(crate::model::NodeKind::Text(t)) => t.clone(),
-            _ => String::new(),
+    fn begin_edit(&mut self, target: Selected) {
+        self.editing_text = match &target {
+            Selected::Node(id) => match self.canvas.node(id).map(|n| &n.kind) {
+                Some(crate::model::NodeKind::Text(t)) => t.clone(),
+                _ => String::new(),
+            },
+            Selected::Edge(id) => self.canvas.edge(id).and_then(|e| e.label.clone()).unwrap_or_default(),
         };
-        self.mode = Mode::Editing(id);
+        self.mode = Mode::Editing(target);
     }
 
     /// Grows the box being edited so a newline, or text wrapping past
@@ -276,21 +396,31 @@ impl App {
                         ev.row.saturating_sub(rect.y),
                     );
                     self.press_on_empty = None;
+                    self.press_on_edge = None;
                 }
-                Some(_) => self.press_on_empty = None,
+                Some(_) => {
+                    self.press_on_empty = None;
+                    self.press_on_edge = None;
+                }
                 None => {
-                    self.press_on_empty = canvas_area
-                        .contains(Position::new(ev.column, ev.row))
-                        .then_some((ev.column, ev.row));
+                    if let Some((edge_id, _)) = self.edge_hits.at(ev.column, ev.row) {
+                        self.press_on_edge = Some((edge_id, ev.column, ev.row));
+                        self.press_on_empty = None;
+                    } else {
+                        self.press_on_edge = None;
+                        self.press_on_empty = canvas_area
+                            .contains(Position::new(ev.column, ev.row))
+                            .then_some((ev.column, ev.row));
+                    }
                 }
             }
         }
 
         match self.drag.on_mouse(ev, hit) {
             Did::Click(target) => {
-                let id = target.shape_id().clone();
-                let _ = self.dispatch(Request::Select { id: Some(id.clone()) });
-                self.begin_edit(id);
+                let selected = Selected::Node(target.shape_id().clone());
+                let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
+                self.begin_edit(selected);
             }
             Did::Lift(HitTarget::Resize(id, corner)) => {
                 if let Some(node) = self.canvas.node(&id) {
@@ -342,14 +472,23 @@ impl App {
             _ => {}
         }
 
-        if let MouseEventKind::Up(MouseButton::Left) = ev.kind
-            && let Some((px, py)) = self.press_on_empty.take()
-            && px == ev.column
-            && py == ev.row
-            && let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x: px, y: py })
-        {
-            self.selected = Some(id.clone());
-            self.begin_edit(id);
+        if let MouseEventKind::Up(MouseButton::Left) = ev.kind {
+            if let Some((edge_id, px, py)) = self.press_on_edge.take()
+                && px == ev.column
+                && py == ev.row
+            {
+                let selected = Selected::Edge(edge_id);
+                let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
+                self.begin_edit(selected);
+            } else if let Some((px, py)) = self.press_on_empty.take()
+                && px == ev.column
+                && py == ev.row
+                && let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x: px, y: py })
+            {
+                let selected = Selected::Node(id);
+                self.selected = Some(selected.clone());
+                self.begin_edit(selected);
+            }
         }
     }
 
@@ -359,44 +498,55 @@ impl App {
         }
 
         match self.mode.clone() {
-            Mode::Editing(id) => match key.code {
+            Mode::Editing(target) => match key.code {
                 KeyCode::Esc => self.commit_edit(),
                 KeyCode::Enter => {
                     self.editing_text.push('\n');
-                    self.grow_to_fit(&id);
+                    if let Selected::Node(id) = &target {
+                        self.grow_to_fit(id);
+                    }
                 }
                 KeyCode::Backspace => {
                     self.editing_text.pop();
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.editing_text.push(c);
-                    self.grow_to_fit(&id);
+                    if let Selected::Node(id) = &target {
+                        self.grow_to_fit(id);
+                    }
                 }
                 _ => {}
             },
             Mode::Normal => match key.code {
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.undo();
+                }
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('s') => {
                     let _ = self.dispatch(Request::Save);
                 }
                 KeyCode::Enter => {
-                    if let Some(id) = self.selected.clone() {
-                        self.begin_edit(id);
+                    if let Some(target) = self.selected.clone() {
+                        self.begin_edit(target);
                     }
                 }
                 KeyCode::Char('c') => {
-                    if let Some(id) = self.selected.clone()
+                    if let Some(Selected::Node(id)) = self.selected.clone()
                         && let Some(node) = self.canvas.node(&id)
                     {
                         let next = Color::cycle(node.color.as_ref());
                         let _ = self.dispatch(Request::SetColor { id, color: next.map(|c| c.to_string()) });
                     }
                 }
-                KeyCode::Char('d') | KeyCode::Delete => {
-                    if let Some(id) = self.selected.clone() {
+                KeyCode::Char('d') | KeyCode::Delete => match self.selected.clone() {
+                    Some(Selected::Node(id)) => {
                         let _ = self.dispatch(Request::Delete { id });
                     }
-                }
+                    Some(Selected::Edge(id)) => {
+                        let _ = self.dispatch(Request::DeleteEdge { id });
+                    }
+                    None => {}
+                },
                 KeyCode::Esc => {
                     if self.selected.is_some() {
                         let _ = self.dispatch(Request::Select { id: None });

@@ -5,11 +5,12 @@ use ratatui::{
     widgets::{Block, Paragraph, Wrap},
 };
 
-use crate::app::{App, Corner, HitTarget, Mode};
-use crate::model::{Canvas, Color, EdgeEnd, Node, NodeKind};
+use crate::app::{App, Corner, HitTarget, Mode, Selected};
+use crate::model::{Color, EdgeEnd, Node, NodeKind};
 
 pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: Rect) {
     app.hits.clear();
+    app.edge_hits.clear();
     app.canvas_area = canvas_area;
 
     let hidden_id: Option<String> = match app.drag.moving() {
@@ -28,7 +29,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         None
     };
 
-    draw_edges(frame, &app.canvas, live_rect.as_ref());
+    draw_edges(frame, app, live_rect.as_ref());
 
     for node in &app.canvas.nodes {
         if hidden_id.as_deref() == Some(node.id.as_str()) {
@@ -38,8 +39,8 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         for (corner, rect) in corner_rects(node.rect) {
             app.hits.put(rect, HitTarget::Resize(node.id.clone(), corner));
         }
-        let selected = app.selected.as_deref() == Some(node.id.as_str());
-        let editing = matches!(&app.mode, Mode::Editing(id) if id == &node.id);
+        let selected = matches!(&app.selected, Some(Selected::Node(id)) if id == &node.id);
+        let editing = matches!(&app.mode, Mode::Editing(Selected::Node(id)) if id == &node.id);
         draw_node(frame, node, selected, editing, &app.editing_text);
     }
 
@@ -149,35 +150,159 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
     frame.render_widget(Block::bordered().border_style(style), rect);
 }
 
-fn draw_edges(frame: &mut Frame, canvas: &Canvas, live: Option<&(String, Rect)>) {
-    let rect_of = |id: &str| -> Option<Rect> {
-        live.filter(|(live_id, _)| live_id == id)
-            .map(|(_, r)| *r)
-            .or_else(|| canvas.node(id).map(|n| n.rect))
-    };
-    for edge in &canvas.edges {
-        let (Some(from_rect), Some(to_rect)) = (rect_of(&edge.from), rect_of(&edge.to)) else {
+fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>) {
+    for i in 0..app.canvas.edges.len() {
+        let (from_id, to_id, color, to_end, from_end, label, edge_id) = {
+            let edge = &app.canvas.edges[i];
+            (
+                edge.from.clone(),
+                edge.to.clone(),
+                edge.color.clone(),
+                edge.to_end,
+                edge.from_end,
+                edge.label.clone(),
+                edge.id.clone(),
+            )
+        };
+        let rect_of = |id: &str| -> Option<Rect> {
+            live.filter(|(live_id, _)| live_id == id)
+                .map(|(_, r)| *r)
+                .or_else(|| app.canvas.node(id).map(|n| n.rect))
+        };
+        let (Some(from_rect), Some(to_rect)) = (rect_of(&from_id), rect_of(&to_id)) else {
             continue;
         };
-        let style = edge
-            .color
+        let selected = app.selected == Some(Selected::Edge(edge_id.clone()));
+        let editing = matches!(&app.mode, Mode::Editing(Selected::Edge(id)) if id == &edge_id);
+        let mut style = color
             .as_ref()
             .map(ratatui_color)
             .map(|c| Style::default().fg(c))
             .unwrap_or_default();
-        let (fc, tc) = (center(from_rect), center(to_rect));
-        let path = clipped_path(from_rect, to_rect, fc, tc);
-        draw_path(frame, &path, style);
-        if edge.to_end == EdgeEnd::Arrow
-            && let Some(&(x, y)) = path.last()
-        {
-            put_char(frame, x, y, arrow_char(tc.0 - fc.0, tc.1 - fc.1), style);
+        if selected {
+            style = style.fg(RColor::Cyan).add_modifier(Modifier::BOLD);
         }
-        if edge.from_end == EdgeEnd::Arrow
-            && let Some(&(x, y)) = path.first()
-        {
-            put_char(frame, x, y, arrow_char(fc.0 - tc.0, fc.1 - tc.1), style);
+        let waypoints = route(from_rect, to_rect);
+        let glyphs: Vec<(i32, i32, char)> = route_glyphs(&waypoints)
+            .into_iter()
+            .filter(|&(x, y, _)| !inside(from_rect, x, y) && !inside(to_rect, x, y))
+            .collect();
+
+        for &(x, y, ch) in &glyphs {
+            put_char(frame, x, y, ch, style);
+            app.edge_hits.put(rect_at(x, y), edge_id.clone());
         }
+
+        if to_end == EdgeEnd::Arrow {
+            let last = waypoints.len() - 1;
+            let (dx, dy) = (waypoints[last].0 - waypoints[last - 1].0, waypoints[last].1 - waypoints[last - 1].1);
+            put_char(frame, waypoints[last].0, waypoints[last].1, arrow_char(dx, dy), style);
+        }
+        if from_end == EdgeEnd::Arrow {
+            let (dx, dy) = (waypoints[0].0 - waypoints[1].0, waypoints[0].1 - waypoints[1].1);
+            put_char(frame, waypoints[0].0, waypoints[0].1, arrow_char(dx, dy), style);
+        }
+
+        let shown = if editing {
+            Some(format!("{}▏", app.editing_text))
+        } else {
+            label.filter(|l| !l.is_empty())
+        };
+        if let Some(shown) = shown {
+            let (mx, my) = glyphs.get(glyphs.len() / 2).map(|&(x, y, _)| (x, y)).unwrap_or(waypoints[0]);
+            if mx >= 0 && my >= 0 {
+                let width = shown.chars().count().min(u16::MAX as usize) as u16;
+                frame.render_widget(Paragraph::new(shown).style(style), Rect::new(mx as u16, my as u16, width, 1));
+            }
+        }
+    }
+}
+
+fn rect_at(x: i32, y: i32) -> Rect {
+    if x < 0 || y < 0 || x > u16::MAX as i32 || y > u16::MAX as i32 {
+        return Rect::default();
+    }
+    Rect::new(x as u16, y as u16, 1, 1)
+}
+
+/// The corner-to-corner path a connector takes between two boxes: a
+/// straight line when they share a row or column, one right-angle bend
+/// otherwise — never the diagonal a straight cursor-to-cursor line would
+/// draw, which reads as noise rather than a wire between two boxes.
+fn route(from: Rect, to: Rect) -> Vec<(i32, i32)> {
+    let (fx0, fy0, fx1, fy1) = (from.x as i32, from.y as i32, from.right() as i32, from.bottom() as i32);
+    let (tx0, ty0, tx1, ty1) = (to.x as i32, to.y as i32, to.right() as i32, to.bottom() as i32);
+
+    let (oy0, oy1) = (fy0.max(ty0), fy1.min(ty1));
+    if oy0 < oy1 {
+        let y = (oy0 + oy1 - 1) / 2;
+        return if fx0 <= tx0 { vec![(fx1, y), (tx0 - 1, y)] } else { vec![(fx0 - 1, y), (tx1, y)] };
+    }
+
+    let (ox0, ox1) = (fx0.max(tx0), fx1.min(tx1));
+    if ox0 < ox1 {
+        let x = (ox0 + ox1 - 1) / 2;
+        return if fy0 <= ty0 { vec![(x, fy1), (x, ty0 - 1)] } else { vec![(x, fy0 - 1), (x, ty1)] };
+    }
+
+    let (fcx, fcy) = center(from);
+    let (tcx, tcy) = center(to);
+    let exit_x = if tcx > fcx { fx1 } else { fx0 - 1 };
+    let enter_y = if tcy > fcy { ty0 } else { ty1 - 1 };
+    vec![(exit_x, fcy), (tcx, fcy), (tcx, enter_y)]
+}
+
+/// Walks a waypoint path (each leg strictly horizontal or vertical) and
+/// draws it in box-drawing characters, replacing each interior waypoint
+/// with the corner glyph its two legs meet at.
+fn route_glyphs(waypoints: &[(i32, i32)]) -> Vec<(i32, i32, char)> {
+    let seg_char = |a: (i32, i32), b: (i32, i32)| if a.1 == b.1 { '─' } else { '│' };
+    let mut out = vec![(waypoints[0].0, waypoints[0].1, seg_char(waypoints[0], waypoints[1]))];
+    for w in waypoints.windows(2) {
+        let (x0, y0) = w[0];
+        let (x1, y1) = w[1];
+        let ch = seg_char(w[0], w[1]);
+        if x0 == x1 {
+            let step = if y1 > y0 { 1 } else { -1 };
+            let mut y = y0;
+            while y != y1 {
+                y += step;
+                out.push((x0, y, ch));
+            }
+        } else {
+            let step = if x1 > x0 { 1 } else { -1 };
+            let mut x = x0;
+            while x != x1 {
+                x += step;
+                out.push((x, y0, ch));
+            }
+        }
+    }
+    for i in 1..waypoints.len() - 1 {
+        let ch = corner_char(waypoints[i - 1], waypoints[i], waypoints[i + 1]);
+        if let Some(entry) = out.iter_mut().rev().find(|(x, y, _)| (*x, *y) == waypoints[i]) {
+            entry.2 = ch;
+        }
+    }
+    out
+}
+
+fn corner_char(prev: (i32, i32), corner: (i32, i32), next: (i32, i32)) -> char {
+    let dir = |a: (i32, i32), b: (i32, i32)| {
+        if a.1 == b.1 {
+            if b.0 > a.0 { 'R' } else { 'L' }
+        } else if b.1 > a.1 {
+            'D'
+        } else {
+            'U'
+        }
+    };
+    match (dir(prev, corner), dir(corner, next)) {
+        ('R', 'D') | ('U', 'L') => '┐',
+        ('R', 'U') | ('D', 'L') => '┘',
+        ('L', 'D') | ('U', 'R') => '┌',
+        ('L', 'U') | ('D', 'R') => '└',
+        _ => '+',
     }
 }
 
@@ -260,7 +385,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
     };
-    let hint = "click to place/edit · drag move · shift+drag connect · corner resize · esc then c color / d delete · s save · q/esc quit";
+    let hint = "click box/connector to edit · drag move · shift+drag connect · corner resize · esc then c color / d delete · ctrl+z undo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

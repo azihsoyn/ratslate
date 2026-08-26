@@ -1,0 +1,11 @@
+[package]
+name = "slate"
+version = "0.1.0"
+edition = "2024"
+description = "An infinite canvas in the terminal: boxes, arrows and text, placed with the mouse, written out as ASCII"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+crossterm = "0.29"
+ratatui = "0.30"
+ratatui-dnd = { path = "../ratatui-dnd" }

@@ -205,10 +205,42 @@ impl App {
         Some((id.clone(), resized_rect(*origin_rect, *corner, cx, cy, bounds)))
     }
 
+    /// Write whatever is in the scratch buffer back to the node being
+    /// edited and leave edit mode. Called before any new press is acted
+    /// on, so clicking away from an edit-in-progress can never lose it
+    /// the way jumping straight to a different mode used to.
+    fn commit_edit(&mut self) {
+        if let Mode::Editing(id) = self.mode.clone() {
+            let text = std::mem::take(&mut self.editing_text);
+            let _ = self.dispatch(Request::SetText { id, text });
+            self.mode = Mode::Normal;
+        }
+    }
+
+    fn begin_edit(&mut self, id: ShapeId) {
+        self.editing_text = match self.canvas.node(&id).map(|n| &n.kind) {
+            Some(crate::model::NodeKind::Text(t)) => t.clone(),
+            _ => String::new(),
+        };
+        self.mode = Mode::Editing(id);
+    }
+
+    /// The node closest to this cell — a drop that missed a box by a
+    /// little should still connect, not silently do nothing.
+    fn nearest_node(&self, x: u16, y: u16) -> Option<ShapeId> {
+        self.canvas
+            .nodes
+            .iter()
+            .min_by_key(|n| rect_distance(n.rect, x, y))
+            .map(|n| n.id.clone())
+    }
+
     pub fn on_mouse(&mut self, ev: MouseEvent, canvas_area: Rect) {
         let mut hit = self.hits.at(ev.column, ev.row);
 
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            self.commit_edit();
+
             // Shift turns a grab on a box into a connector draw instead
             // of a move — the same body hit, reinterpreted.
             if ev.modifiers.contains(KeyModifiers::SHIFT)
@@ -236,7 +268,9 @@ impl App {
 
         match self.drag.on_mouse(ev, hit) {
             Did::Click(target) => {
-                let _ = self.dispatch(Request::Select { id: Some(target.shape_id().clone()) });
+                let id = target.shape_id().clone();
+                let _ = self.dispatch(Request::Select { id: Some(id.clone()) });
+                self.begin_edit(id);
             }
             Did::Lift(HitTarget::Resize(id, corner)) => {
                 if let Some(node) = self.canvas.node(&id) {
@@ -275,11 +309,14 @@ impl App {
                 x,
                 y,
             } => {
-                if let Some((target, _)) = self.hits.at(x, y) {
-                    let to = target.shape_id().clone();
-                    if to != from {
+                let to = self.hits.at(x, y).map(|(t, _)| t.shape_id().clone()).or_else(|| self.nearest_node(x, y));
+                match to {
+                    Some(to) if to != from => {
                         let _ = self.dispatch(Request::Connect { from, to });
+                        self.status.clear();
                     }
+                    Some(_) => self.status = "can't connect a box to itself".to_string(),
+                    None => self.status = "nothing to connect to".to_string(),
                 }
             }
             _ => {}
@@ -292,8 +329,7 @@ impl App {
             && let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x: px, y: py })
         {
             self.selected = Some(id.clone());
-            self.editing_text.clear();
-            self.mode = Mode::Editing(id);
+            self.begin_edit(id);
         }
     }
 
@@ -303,12 +339,8 @@ impl App {
         }
 
         match self.mode.clone() {
-            Mode::Editing(id) => match key.code {
-                KeyCode::Esc => {
-                    let text = std::mem::take(&mut self.editing_text);
-                    let _ = self.dispatch(Request::SetText { id, text });
-                    self.mode = Mode::Normal;
-                }
+            Mode::Editing(_) => match key.code {
+                KeyCode::Esc => self.commit_edit(),
                 KeyCode::Enter => self.editing_text.push('\n'),
                 KeyCode::Backspace => {
                     self.editing_text.pop();
@@ -322,14 +354,8 @@ impl App {
                     let _ = self.dispatch(Request::Save);
                 }
                 KeyCode::Enter => {
-                    if let Some(id) = self.selected.clone()
-                        && let Some(node) = self.canvas.node(&id)
-                    {
-                        self.editing_text = match &node.kind {
-                            crate::model::NodeKind::Text(t) => t.clone(),
-                            _ => String::new(),
-                        };
-                        self.mode = Mode::Editing(id);
+                    if let Some(id) = self.selected.clone() {
+                        self.begin_edit(id);
                     }
                 }
                 KeyCode::Char('c') => {
@@ -382,4 +408,21 @@ fn resized_rect(origin: Rect, corner: Corner, cx: u16, cy: u16, bounds: Rect) ->
     };
 
     Rect::new(new_left, new_top, new_right - new_left, new_bottom - new_top)
+}
+
+/// Cells from `(x, y)` to the nearest edge of `r`, 0 if inside it — the
+/// same measure ratatui-dnd's own `sort::Sortable` uses to let a drop
+/// just past a border still land.
+fn rect_distance(r: Rect, x: u16, y: u16) -> u32 {
+    let dx = if x < r.x {
+        r.x - x
+    } else {
+        x.saturating_sub(r.x + r.width.saturating_sub(1))
+    };
+    let dy = if y < r.y {
+        r.y - y
+    } else {
+        y.saturating_sub(r.y + r.height.saturating_sub(1))
+    };
+    dx as u32 + dy as u32
 }

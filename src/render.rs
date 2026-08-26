@@ -249,7 +249,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
     };
-    let hint = "click place/select · drag move · shift+drag connect · corner resize · enter edit · c color · d delete · s save · q quit";
+    let hint = "click to place/edit · drag move · shift+drag connect · corner resize · esc then c color / d delete · s save · q quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

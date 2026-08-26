@@ -197,33 +197,48 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
     frame.render_widget(Block::bordered().border_style(style), rect);
 }
 
-/// A rhombus outline, traced as its four straight edges — each one a
-/// constant slope from a corner to the mid-height point on the near
-/// side, so it's plain interpolation rather than a curve.
+/// A rhombus outline, its four straight edges each traced as a
+/// Bresenham line (so they stay 4-connected — a wide, short box makes
+/// for a shallow edge that steps several columns per row, and a single
+/// diagonal character per row leaves that run looking like scattered
+/// dots rather than a line) with a character per cell picked from that
+/// cell's own step direction: a run of same-row steps reads as '-', a
+/// run of same-column steps as '|', and only a cell that actually moved
+/// both ways is '/' or '\'.
 fn draw_diamond(frame: &mut Frame, rect: Rect, style: Style) {
     let (w, h) = (rect.width as i32, rect.height as i32);
     if w < 3 || h < 3 {
         frame.render_widget(Block::bordered().border_style(style), rect);
         return;
     }
-    let (x0, y0) = (rect.x as i32, rect.y as i32);
-    let (left, right, mid) = (0, w - 1, (w - 1) / 2);
-    let mid_row = (h - 1) / 2;
-    let lower_span = (h - 1 - mid_row).max(1);
+    let x0 = rect.x as i32;
+    let y0 = rect.y as i32;
+    let top = (x0 + (w - 1) / 2, y0);
+    let right = (x0 + w - 1, y0 + (h - 1) / 2);
+    let bottom = (x0 + (w - 1) / 2, y0 + h - 1);
+    let left = (x0, y0 + (h - 1) / 2);
 
-    for row in 0..=mid_row {
-        let t = if mid_row == 0 { 0.0 } else { row as f32 / mid_row as f32 };
-        let right_col = mid + ((right - mid) as f32 * t).round() as i32;
-        let left_col = mid - ((mid - left) as f32 * t).round() as i32;
-        put_char(frame, x0 + right_col, y0 + row, '\\', style);
-        put_char(frame, x0 + left_col, y0 + row, '/', style);
+    for &(a, b) in &[(top, right), (right, bottom), (bottom, left), (left, top)] {
+        draw_diamond_edge(frame, a, b, style);
     }
-    for row in mid_row..h {
-        let t = (row - mid_row) as f32 / lower_span as f32;
-        let right_col = right - ((right - mid) as f32 * t).round() as i32;
-        let left_col = left + ((mid - left) as f32 * t).round() as i32;
-        put_char(frame, x0 + right_col, y0 + row, '/', style);
-        put_char(frame, x0 + left_col, y0 + row, '\\', style);
+}
+
+fn draw_diamond_edge(frame: &mut Frame, from: (i32, i32), to: (i32, i32), style: Style) {
+    let cells = line_cells(from.0, from.1, to.0, to.1);
+    for i in 0..cells.len() {
+        let (x, y) = cells[i];
+        let (nx, ny) = cells[if i + 1 < cells.len() { i + 1 } else { i - 1 }];
+        let (dx, dy) = if i + 1 < cells.len() { (nx - x, ny - y) } else { (x - nx, y - ny) };
+        let ch = if dx == 0 {
+            '|'
+        } else if dy == 0 {
+            '-'
+        } else if (dx > 0) == (dy > 0) {
+            '\\'
+        } else {
+            '/'
+        };
+        put_char(frame, x, y, ch, style);
     }
 }
 

@@ -11,7 +11,12 @@ use crate::model::{Canvas, Color, ShapeId};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
+// A diamond needs room to slope in from a corner to the mid-height
+// point on each side; at the plain-rectangle minimum height it has
+// nothing to draw but four isolated corner dots.
+const MIN_DIAMOND_H: u16 = 5;
 const UNDO_LIMIT: usize = 100;
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Corner {
@@ -21,17 +26,31 @@ pub enum Corner {
     BottomRight,
 }
 
+/// Which end of a connector a `Reattach` handle is — a grab there redraws
+/// that end while the other stays put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    From,
+    To,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HitTarget {
     Move(ShapeId),
     Resize(ShapeId, Corner),
     Connect(ShapeId),
+    /// A small handle at a connector's own exit/entry point, not a box
+    /// at all — dragging it re-points that end at a different box.
+    Reattach(String, Endpoint),
 }
 
 impl HitTarget {
-    fn shape_id(&self) -> &ShapeId {
+    /// The node this hit belongs to — every variant but `Reattach`,
+    /// which belongs to an edge instead.
+    fn node_id(&self) -> Option<&ShapeId> {
         match self {
-            HitTarget::Move(id) | HitTarget::Connect(id) | HitTarget::Resize(id, _) => id,
+            HitTarget::Move(id) | HitTarget::Connect(id) | HitTarget::Resize(id, _) => Some(id),
+            HitTarget::Reattach(..) => None,
         }
     }
 }
@@ -77,6 +96,9 @@ pub enum Request {
     SetLabel { id: String, label: Option<String> },
     /// Remove a connector without touching the boxes it joined.
     DeleteEdge { id: String },
+    /// Re-point one end of a connector at a different box: `end` is
+    /// "from" or "to".
+    Reattach { id: String, end: String, node: ShapeId },
     /// Select a box or a connector, or clear the selection with `null`.
     Select { id: Option<Selected> },
     /// The whole board, as JSON Canvas.
@@ -181,6 +203,10 @@ pub struct App {
     resize_origin: Option<(ShapeId, Corner, Rect)>,
     press_on_empty: Option<(u16, u16)>,
     press_on_edge: Option<(String, u16, u16)>,
+    /// What was last clicked (not dragged) and when, so a second click
+    /// on the same thing within `DOUBLE_CLICK` opens it for editing
+    /// instead of just selecting it again.
+    last_click: Option<(Selected, std::time::Instant)>,
 }
 
 impl App {
@@ -220,7 +246,17 @@ impl App {
             resize_origin: None,
             press_on_empty: None,
             press_on_edge: None,
+            last_click: None,
         }
+    }
+
+    /// True the second time this is called for the same target within
+    /// `DOUBLE_CLICK` of the first.
+    fn is_double_click(&mut self, target: Selected) -> bool {
+        let now = std::time::Instant::now();
+        let is_double = matches!(&self.last_click, Some((prev, at)) if *prev == target && now.duration_since(*at) < DOUBLE_CLICK);
+        self.last_click = Some((target, now));
+        is_double
     }
 
     pub fn save(&mut self) {
@@ -296,8 +332,12 @@ impl App {
                 Ok(Response::Ok)
             }
             Request::SetShape { id, shape } => {
+                let shape = crate::model::Shape::parse(&shape);
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
-                node.shape = crate::model::Shape::parse(&shape);
+                node.shape = shape;
+                if shape == crate::model::Shape::Diamond && node.rect.height < MIN_DIAMOND_H {
+                    node.rect.height = MIN_DIAMOND_H;
+                }
                 Ok(Response::Ok)
             }
             Request::Connect { from, to } => {
@@ -322,6 +362,18 @@ impl App {
                 self.canvas.delete_edge(&id);
                 if self.selected == Some(Selected::Edge(id)) {
                     self.selected = None;
+                }
+                Ok(Response::Ok)
+            }
+            Request::Reattach { id, end, node } => {
+                self.canvas.node(&node).ok_or_else(|| format!("no such node: {node}"))?;
+                let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
+                match end.as_str() {
+                    "from" if edge.to == node => return Err("can't connect a box to itself".to_string()),
+                    "from" => edge.from = node,
+                    "to" if edge.from == node => return Err("can't connect a box to itself".to_string()),
+                    "to" => edge.to = node,
+                    other => return Err(format!("end must be \"from\" or \"to\", got {other:?}")),
                 }
                 Ok(Response::Ok)
             }
@@ -394,6 +446,13 @@ impl App {
         let _ = self.dispatch(Request::SetRect { id: id.clone(), x, y, w, h: needed.min(max_h) });
     }
 
+    /// Whatever box is registered at this cell right now, ignoring a
+    /// `Reattach` handle if that's what's actually there — a drop
+    /// target has to be a box, never another connector's own handle.
+    fn node_at(&self, x: u16, y: u16) -> Option<ShapeId> {
+        self.hits.at(x, y)?.0.node_id().cloned()
+    }
+
     /// The node closest to this cell — a drop that missed a box by a
     /// little should still connect, not silently do nothing.
     fn nearest_node(&self, x: u16, y: u16) -> Option<ShapeId> {
@@ -446,10 +505,19 @@ impl App {
         }
 
         match self.drag.on_mouse(ev, hit) {
-            Did::Click(target) => {
-                let selected = Selected::Node(target.shape_id().clone());
+            Did::Click(HitTarget::Reattach(edge_id, _)) => {
+                let selected = Selected::Edge(edge_id);
                 let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
-                self.begin_edit(selected);
+                if self.is_double_click(selected.clone()) {
+                    self.begin_edit(selected);
+                }
+            }
+            Did::Click(target) => {
+                let selected = Selected::Node(target.node_id().expect("only Reattach lacks a node").clone());
+                let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
+                if self.is_double_click(selected.clone()) {
+                    self.begin_edit(selected);
+                }
             }
             Did::Lift(HitTarget::Resize(id, corner)) => {
                 if let Some(node) = self.canvas.node(&id) {
@@ -488,7 +556,7 @@ impl App {
                 x,
                 y,
             } => {
-                let to = self.hits.at(x, y).map(|(t, _)| t.shape_id().clone()).or_else(|| self.nearest_node(x, y));
+                let to = self.node_at(x, y).or_else(|| self.nearest_node(x, y));
                 match to {
                     Some(to) if to != from => {
                         let _ = self.dispatch(Request::Connect { from, to });
@@ -496,6 +564,26 @@ impl App {
                     }
                     Some(_) => self.status = "can't connect a box to itself".to_string(),
                     None => self.status = "nothing to connect to".to_string(),
+                }
+            }
+            Did::Drop {
+                key: HitTarget::Reattach(id, end),
+                x,
+                y,
+            } => {
+                let node = self.node_at(x, y).or_else(|| self.nearest_node(x, y));
+                match node {
+                    Some(node) => {
+                        let end = match end {
+                            Endpoint::From => "from",
+                            Endpoint::To => "to",
+                        };
+                        match self.dispatch(Request::Reattach { id, end: end.to_string(), node }) {
+                            Ok(_) => self.status.clear(),
+                            Err(msg) => self.status = msg,
+                        }
+                    }
+                    None => self.status = "nothing to attach to".to_string(),
                 }
             }
             _ => {}
@@ -508,7 +596,9 @@ impl App {
             {
                 let selected = Selected::Edge(edge_id);
                 let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
-                self.begin_edit(selected);
+                if self.is_double_click(selected.clone()) {
+                    self.begin_edit(selected);
+                }
             } else if let Some((px, py)) = self.press_on_empty.take()
                 && px == ev.column
                 && py == ev.row

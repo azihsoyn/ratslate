@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, BorderType, Paragraph, Wrap},
 };
 
-use crate::app::{App, Corner, HitTarget, Mode, Selected};
+use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected};
 use crate::model::{Color, EdgeEnd, Node, NodeKind, Shape, Side};
 
 pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: Rect) {
@@ -29,7 +29,12 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         None
     };
 
-    draw_edges(frame, app, live_rect.as_ref());
+    let reattaching: Option<(String, Endpoint)> = match app.drag.moving() {
+        Some(HitTarget::Reattach(id, end)) => Some((id.clone(), *end)),
+        _ => None,
+    };
+
+    draw_edges(frame, app, live_rect.as_ref(), reattaching.as_ref());
 
     for node in &app.canvas.nodes {
         if hidden_id.as_deref() == Some(node.id.as_str()) {
@@ -63,6 +68,27 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         }
     }
 
+    // Dragging one end of an existing connector: a line from whichever
+    // end stayed put to the cursor, same look as drawing a brand new one.
+    if let Some((edge_id, end)) = &reattaching
+        && let Some((cx, cy)) = app.drag.cursor()
+        && let Some(edge) = app.canvas.edge(edge_id)
+        && let Some(anchor_id) = match end {
+            Endpoint::From => Some(&edge.to),
+            Endpoint::To => Some(&edge.from),
+        }
+        && let Some(anchor) = app.canvas.node(anchor_id)
+    {
+        let start = center(anchor.rect);
+        let end = (cx as i32, cy as i32);
+        let path = clipped_path(anchor.rect, anchor.rect, start, end);
+        let style = Style::default().fg(RColor::DarkGray);
+        draw_path(frame, &path, style);
+        if let Some(&(x, y)) = path.last() {
+            put_char(frame, x, y, arrow_char(end.0 - start.0, end.1 - start.1), style);
+        }
+    }
+
     draw_status(frame, app, status_area);
 }
 
@@ -73,8 +99,11 @@ fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, edit
         .map(ratatui_color)
         .map(|c| Style::default().fg(c))
         .unwrap_or_default();
+    // Bold-on-whatever-color-it-already-has is easy to miss, especially
+    // on a node with no color set at all — selection gets its own fixed
+    // color so it always reads clearly.
     let border_style = if selected {
-        base.add_modifier(Modifier::BOLD)
+        Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD)
     } else {
         base
     };
@@ -198,7 +227,7 @@ fn draw_diamond(frame: &mut Frame, rect: Rect, style: Style) {
     }
 }
 
-fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>) {
+fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>, reattaching: Option<&(String, Endpoint)>) {
     let rect_of = |id: &str| -> Option<Rect> {
         live.filter(|(live_id, _)| live_id == id)
             .map(|(_, r)| *r)
@@ -246,6 +275,9 @@ fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>) {
             (edge.color.clone(), edge.to_end, edge.from_end, edge.label.clone(), edge.id.clone())
         };
         let Some((from_rect, to_rect)) = rects[i] else { continue };
+        if reattaching.is_some_and(|(id, _)| id == &edge_id) {
+            continue;
+        }
         let selected = app.selected == Some(Selected::Edge(edge_id.clone()));
         let editing = matches!(&app.mode, Mode::Editing(Selected::Edge(id)) if id == &edge_id);
         let mut style = color
@@ -266,6 +298,12 @@ fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>) {
             put_char(frame, x, y, ch, style);
             app.edge_hits.put(rect_at(x, y), edge_id.clone());
         }
+        // Handles for dragging either end loose and re-pointing it —
+        // registered after the plain path cells so they win the hit
+        // test at their exact spot even though it's also on the line.
+        let last = waypoints.len() - 1;
+        app.hits.put(rect_at(waypoints[0].0, waypoints[0].1), HitTarget::Reattach(edge_id.clone(), Endpoint::From));
+        app.hits.put(rect_at(waypoints[last].0, waypoints[last].1), HitTarget::Reattach(edge_id.clone(), Endpoint::To));
 
         if to_end == EdgeEnd::Arrow {
             let last = waypoints.len() - 1;
@@ -490,7 +528,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
     };
-    let hint = "click box/connector to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "click to select · dbl-click to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

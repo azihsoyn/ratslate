@@ -83,13 +83,18 @@ pub enum Request {
     Save,
     /// Undo the last change that touched the board.
     Undo,
+    /// Redo the last change undo stepped back through.
+    Redo,
 }
 
 impl Request {
     /// Whether this changes the board in a way undo should be able to
-    /// step back through. Select/State/Save/Undo itself don't.
+    /// step back through. Select/State/Save/Undo/Redo themselves don't.
     fn mutates(&self) -> bool {
-        !matches!(self, Request::Select { .. } | Request::State | Request::Save | Request::Undo)
+        !matches!(
+            self,
+            Request::Select { .. } | Request::State | Request::Save | Request::Undo | Request::Redo
+        )
     }
 }
 
@@ -150,6 +155,7 @@ pub enum Response {
     State { board: FileRoot },
     Saved { path: String },
     Undone { done: bool },
+    Redone { done: bool },
 }
 
 pub struct App {
@@ -168,6 +174,7 @@ pub struct App {
     /// `on_key`.
     pub canvas_area: Rect,
     undo_stack: Vec<Canvas>,
+    redo_stack: Vec<Canvas>,
     grab_offset: (u16, u16),
     resize_origin: Option<(ShapeId, Corner, Rect)>,
     press_on_empty: Option<(u16, u16)>,
@@ -206,6 +213,7 @@ impl App {
             status,
             canvas_area: Rect::default(),
             undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             grab_offset: (0, 0),
             resize_origin: None,
             press_on_empty: None,
@@ -229,6 +237,7 @@ impl App {
         if self.undo_stack.len() > UNDO_LIMIT {
             self.undo_stack.remove(0);
         }
+        self.redo_stack.clear();
     }
 
     fn undo(&mut self) -> bool {
@@ -236,10 +245,22 @@ impl App {
             self.status = "nothing to undo".to_string();
             return false;
         };
-        self.canvas = prev;
+        self.redo_stack.push(std::mem::replace(&mut self.canvas, prev));
         self.selected = None;
         self.mode = Mode::Normal;
         self.status = "undone".to_string();
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            self.status = "nothing to redo".to_string();
+            return false;
+        };
+        self.undo_stack.push(std::mem::replace(&mut self.canvas, next));
+        self.selected = None;
+        self.mode = Mode::Normal;
+        self.status = "redone".to_string();
         true
     }
 
@@ -309,6 +330,7 @@ impl App {
                 })
             }
             Request::Undo => Ok(Response::Undone { done: self.undo() }),
+            Request::Redo => Ok(Response::Redone { done: self.redo() }),
         }
     }
 
@@ -500,12 +522,16 @@ impl App {
         match self.mode.clone() {
             Mode::Editing(target) => match key.code {
                 KeyCode::Esc => self.commit_edit(),
-                KeyCode::Enter => {
-                    self.editing_text.push('\n');
-                    if let Selected::Node(id) = &target {
+                // A box holds a note, where a newline is normal text; a
+                // connector's label is one line, so Enter there means
+                // "done" the way it does everywhere else in Normal mode.
+                KeyCode::Enter => match &target {
+                    Selected::Node(id) => {
+                        self.editing_text.push('\n');
                         self.grow_to_fit(id);
                     }
-                }
+                    Selected::Edge(_) => self.commit_edit(),
+                },
                 KeyCode::Backspace => {
                     self.editing_text.pop();
                 }
@@ -520,6 +546,13 @@ impl App {
             Mode::Normal => match key.code {
                 KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.undo();
+                }
+                // Ctrl+Shift+Z can't be told apart from Ctrl+Z over most
+                // terminals' legacy key encoding (no shift bit on a
+                // control byte), so redo gets its own key rather than a
+                // shift that will not arrive.
+                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.redo();
                 }
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('s') => {

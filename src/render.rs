@@ -248,7 +248,10 @@ fn route(from: Rect, to: Rect) -> Vec<(i32, i32)> {
     let (fcx, fcy) = center(from);
     let (tcx, tcy) = center(to);
     let exit_x = if tcx > fcx { fx1 } else { fx0 - 1 };
-    let enter_y = if tcy > fcy { ty0 } else { ty1 - 1 };
+    // One row past `to`'s border, not the border row itself — landing on
+    // the border let a box's own bordered widget, drawn right after
+    // edges, silently paint over the arrowhead.
+    let enter_y = if tcy > fcy { ty0 - 1 } else { ty1 };
     vec![(exit_x, fcy), (tcx, fcy), (tcx, enter_y)]
 }
 
@@ -385,7 +388,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
     };
-    let hint = "click box/connector to edit · drag move · shift+drag connect · corner resize · esc then c color / d delete · ctrl+z undo · s save · q/esc quit";
+    let hint = "click box/connector to edit · drag move · shift+drag connect · corner resize · esc then c color / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

@@ -39,11 +39,16 @@ pub enum Request {
     Save,
     /// Undo the last change that touched the document.
     Undo,
+    /// Redo the last change undo stepped back through.
+    Redo,
 }
 
 impl Request {
     fn mutates(&self) -> bool {
-        !matches!(self, Request::Select { .. } | Request::State | Request::Save | Request::Undo)
+        !matches!(
+            self,
+            Request::Select { .. } | Request::State | Request::Save | Request::Undo | Request::Redo
+        )
     }
 }
 
@@ -54,6 +59,7 @@ pub enum Response {
     State { roots: Vec<TreeNode> },
     Saved { path: String },
     Undone { done: bool },
+    Redone { done: bool },
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -90,6 +96,7 @@ pub struct MindApp {
     pub status: String,
     pub should_quit: bool,
     undo_stack: Vec<Vec<String>>,
+    redo_stack: Vec<Vec<String>>,
 }
 
 impl MindApp {
@@ -118,6 +125,7 @@ impl MindApp {
             status,
             should_quit: false,
             undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -126,6 +134,7 @@ impl MindApp {
         if self.undo_stack.len() > UNDO_LIMIT {
             self.undo_stack.remove(0);
         }
+        self.redo_stack.clear();
     }
 
     fn undo(&mut self) -> bool {
@@ -133,11 +142,24 @@ impl MindApp {
             self.status = "nothing to undo".to_string();
             return false;
         };
-        self.lines = prev;
+        self.redo_stack.push(std::mem::replace(&mut self.lines, prev));
         self.tree = mindmap::parse(&self.lines);
         self.selected = None;
         self.mode = Mode::Normal;
         self.status = "undone".to_string();
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            self.status = "nothing to redo".to_string();
+            return false;
+        };
+        self.undo_stack.push(std::mem::replace(&mut self.lines, next));
+        self.tree = mindmap::parse(&self.lines);
+        self.selected = None;
+        self.mode = Mode::Normal;
+        self.status = "redone".to_string();
         true
     }
 
@@ -198,6 +220,7 @@ impl MindApp {
                 Ok(Response::Saved { path: self.save_path.display().to_string() })
             }
             Request::Undo => Ok(Response::Undone { done: self.undo() }),
+            Request::Redo => Ok(Response::Redone { done: self.redo() }),
         }
     }
 
@@ -245,6 +268,9 @@ impl MindApp {
             Mode::Normal => match key.code {
                 KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.undo();
+                }
+                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.redo();
                 }
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('s') => {

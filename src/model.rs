@@ -37,6 +37,44 @@ impl std::fmt::Display for Color {
     }
 }
 
+/// A box's outline. Not part of JSON Canvas — carried as an extra
+/// `shape` field on text nodes that other readers (Obsidian included)
+/// just ignore, rather than a property any importer needs to know
+/// about to render the node at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Shape {
+    #[default]
+    Rectangle,
+    Rounded,
+    Diamond,
+}
+
+impl Shape {
+    pub fn cycle(self) -> Shape {
+        match self {
+            Shape::Rectangle => Shape::Rounded,
+            Shape::Rounded => Shape::Diamond,
+            Shape::Diamond => Shape::Rectangle,
+        }
+    }
+
+    pub fn parse(s: &str) -> Shape {
+        match s {
+            "rounded" => Shape::Rounded,
+            "diamond" => Shape::Diamond,
+            _ => Shape::Rectangle,
+        }
+    }
+
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            Shape::Rectangle => None,
+            Shape::Rounded => Some("rounded"),
+            Shape::Diamond => Some("diamond"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum NodeKind {
     Text(String),
@@ -57,10 +95,11 @@ pub struct Node {
     pub id: ShapeId,
     pub rect: Rect,
     pub color: Option<Color>,
+    pub shape: Shape,
     pub kind: NodeKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     Top,
     Right,
@@ -116,6 +155,7 @@ impl Canvas {
             id: id.clone(),
             rect: Rect::new(x, y, 16, 3),
             color: None,
+            shape: Shape::default(),
             kind: NodeKind::Text(String::new()),
         });
         id

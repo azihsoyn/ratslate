@@ -2,11 +2,11 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Color as RColor, Modifier, Style},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, BorderType, Paragraph, Wrap},
 };
 
 use crate::app::{App, Corner, HitTarget, Mode, Selected};
-use crate::model::{Color, EdgeEnd, Node, NodeKind};
+use crate::model::{Color, EdgeEnd, Node, NodeKind, Shape, Side};
 
 pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: Rect) {
     app.hits.clear();
@@ -78,9 +78,27 @@ fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, edit
     } else {
         base
     };
-    let block = Block::bordered().border_style(border_style);
-    let inner = block.inner(node.rect);
-    frame.render_widget(block, node.rect);
+
+    let inner = match node.shape {
+        Shape::Rectangle | Shape::Rounded => {
+            let mut block = Block::bordered().border_style(border_style);
+            if node.shape == Shape::Rounded {
+                block = block.border_type(BorderType::Rounded);
+            }
+            let inner = block.inner(node.rect);
+            frame.render_widget(block, node.rect);
+            inner
+        }
+        Shape::Diamond => {
+            draw_diamond(frame, node.rect, border_style);
+            Rect::new(
+                node.rect.x + 1,
+                node.rect.y + 1,
+                node.rect.width.saturating_sub(2),
+                node.rect.height.saturating_sub(2),
+            )
+        }
+    };
 
     let mut text = if editing { editing_text.to_string() } else { display_text(node) };
     if editing {
@@ -150,28 +168,84 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
     frame.render_widget(Block::bordered().border_style(style), rect);
 }
 
+/// A rhombus outline, traced as its four straight edges — each one a
+/// constant slope from a corner to the mid-height point on the near
+/// side, so it's plain interpolation rather than a curve.
+fn draw_diamond(frame: &mut Frame, rect: Rect, style: Style) {
+    let (w, h) = (rect.width as i32, rect.height as i32);
+    if w < 3 || h < 3 {
+        frame.render_widget(Block::bordered().border_style(style), rect);
+        return;
+    }
+    let (x0, y0) = (rect.x as i32, rect.y as i32);
+    let (left, right, mid) = (0, w - 1, (w - 1) / 2);
+    let mid_row = (h - 1) / 2;
+    let lower_span = (h - 1 - mid_row).max(1);
+
+    for row in 0..=mid_row {
+        let t = if mid_row == 0 { 0.0 } else { row as f32 / mid_row as f32 };
+        let right_col = mid + ((right - mid) as f32 * t).round() as i32;
+        let left_col = mid - ((mid - left) as f32 * t).round() as i32;
+        put_char(frame, x0 + right_col, y0 + row, '\\', style);
+        put_char(frame, x0 + left_col, y0 + row, '/', style);
+    }
+    for row in mid_row..h {
+        let t = (row - mid_row) as f32 / lower_span as f32;
+        let right_col = right - ((right - mid) as f32 * t).round() as i32;
+        let left_col = left + ((mid - left) as f32 * t).round() as i32;
+        put_char(frame, x0 + right_col, y0 + row, '/', style);
+        put_char(frame, x0 + left_col, y0 + row, '\\', style);
+    }
+}
+
 fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>) {
+    let rect_of = |id: &str| -> Option<Rect> {
+        live.filter(|(live_id, _)| live_id == id)
+            .map(|(_, r)| *r)
+            .or_else(|| app.canvas.node(id).map(|n| n.rect))
+    };
+
+    // Which side of `from` and of `to` each edge leaves/arrives on, so
+    // several edges leaving the same box on the same side can be spread
+    // across it instead of all riding the exact midpoint and overlapping
+    // for however far they travel together.
+    let rects: Vec<Option<(Rect, Rect)>> = app
+        .canvas
+        .edges
+        .iter()
+        .map(|e| Some((rect_of(&e.from)?, rect_of(&e.to)?)))
+        .collect();
+    let sides: Vec<Option<(Side, Side)>> = rects.iter().map(|r| r.map(|(f, t)| sides_for(f, t))).collect();
+
+    let mut from_frac = vec![0.5f32; app.canvas.edges.len()];
+    let mut to_frac = vec![0.5f32; app.canvas.edges.len()];
+    let mut from_groups: std::collections::HashMap<(String, Side), Vec<usize>> = std::collections::HashMap::new();
+    let mut to_groups: std::collections::HashMap<(String, Side), Vec<usize>> = std::collections::HashMap::new();
+    for (i, edge) in app.canvas.edges.iter().enumerate() {
+        if let Some((fs, ts)) = sides[i] {
+            from_groups.entry((edge.from.clone(), fs)).or_default().push(i);
+            to_groups.entry((edge.to.clone(), ts)).or_default().push(i);
+        }
+    }
+    for idxs in from_groups.into_values() {
+        let n = idxs.len();
+        for (k, i) in idxs.into_iter().enumerate() {
+            from_frac[i] = (k + 1) as f32 / (n + 1) as f32;
+        }
+    }
+    for idxs in to_groups.into_values() {
+        let n = idxs.len();
+        for (k, i) in idxs.into_iter().enumerate() {
+            to_frac[i] = (k + 1) as f32 / (n + 1) as f32;
+        }
+    }
+
     for i in 0..app.canvas.edges.len() {
-        let (from_id, to_id, color, to_end, from_end, label, edge_id) = {
+        let (color, to_end, from_end, label, edge_id) = {
             let edge = &app.canvas.edges[i];
-            (
-                edge.from.clone(),
-                edge.to.clone(),
-                edge.color.clone(),
-                edge.to_end,
-                edge.from_end,
-                edge.label.clone(),
-                edge.id.clone(),
-            )
+            (edge.color.clone(), edge.to_end, edge.from_end, edge.label.clone(), edge.id.clone())
         };
-        let rect_of = |id: &str| -> Option<Rect> {
-            live.filter(|(live_id, _)| live_id == id)
-                .map(|(_, r)| *r)
-                .or_else(|| app.canvas.node(id).map(|n| n.rect))
-        };
-        let (Some(from_rect), Some(to_rect)) = (rect_of(&from_id), rect_of(&to_id)) else {
-            continue;
-        };
+        let Some((from_rect, to_rect)) = rects[i] else { continue };
         let selected = app.selected == Some(Selected::Edge(edge_id.clone()));
         let editing = matches!(&app.mode, Mode::Editing(Selected::Edge(id)) if id == &edge_id);
         let mut style = color
@@ -182,7 +256,7 @@ fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>) {
         if selected {
             style = style.fg(RColor::Cyan).add_modifier(Modifier::BOLD);
         }
-        let waypoints = route(from_rect, to_rect);
+        let waypoints = route(from_rect, to_rect, from_frac[i], to_frac[i]);
         let glyphs: Vec<(i32, i32, char)> = route_glyphs(&waypoints)
             .into_iter()
             .filter(|&(x, y, _)| !inside(from_rect, x, y) && !inside(to_rect, x, y))
@@ -225,34 +299,62 @@ fn rect_at(x: i32, y: i32) -> Rect {
     Rect::new(x as u16, y as u16, 1, 1)
 }
 
-/// The corner-to-corner path a connector takes between two boxes: a
-/// straight line when they share a row or column, one right-angle bend
-/// otherwise — never the diagonal a straight cursor-to-cursor line would
-/// draw, which reads as noise rather than a wire between two boxes.
-fn route(from: Rect, to: Rect) -> Vec<(i32, i32)> {
+/// Which side of `from` an edge leaves on and which side of `to` it
+/// arrives on — the same three cases [`route`] draws, but usable before
+/// any actual coordinate is picked, so several edges sharing a side can
+/// be spread across it first.
+fn sides_for(from: Rect, to: Rect) -> (Side, Side) {
     let (fx0, fy0, fx1, fy1) = (from.x as i32, from.y as i32, from.right() as i32, from.bottom() as i32);
     let (tx0, ty0, tx1, ty1) = (to.x as i32, to.y as i32, to.right() as i32, to.bottom() as i32);
 
     let (oy0, oy1) = (fy0.max(ty0), fy1.min(ty1));
     if oy0 < oy1 {
-        let y = (oy0 + oy1 - 1) / 2;
+        return if fx0 <= tx0 { (Side::Right, Side::Left) } else { (Side::Left, Side::Right) };
+    }
+    let (ox0, ox1) = (fx0.max(tx0), fx1.min(tx1));
+    if ox0 < ox1 {
+        return if fy0 <= ty0 { (Side::Bottom, Side::Top) } else { (Side::Top, Side::Bottom) };
+    }
+    let (fcx, fcy) = center(from);
+    let (tcx, tcy) = center(to);
+    let from_side = if tcx > fcx { Side::Right } else { Side::Left };
+    let to_side = if tcy > fcy { Side::Top } else { Side::Bottom };
+    (from_side, to_side)
+}
+
+/// The corner-to-corner path a connector takes between two boxes: a
+/// straight line when they share a row or column, one right-angle bend
+/// otherwise — never the diagonal a straight cursor-to-cursor line would
+/// draw, which reads as noise rather than a wire between two boxes.
+/// `from_frac`/`to_frac` (0..1) place the attachment point along
+/// whichever side gets used, so edges sharing a box and a side don't
+/// all leave from its exact midpoint and overlap.
+fn route(from: Rect, to: Rect, from_frac: f32, to_frac: f32) -> Vec<(i32, i32)> {
+    let (fx0, fy0, fx1, fy1) = (from.x as i32, from.y as i32, from.right() as i32, from.bottom() as i32);
+    let (tx0, ty0, tx1, ty1) = (to.x as i32, to.y as i32, to.right() as i32, to.bottom() as i32);
+
+    let (oy0, oy1) = (fy0.max(ty0), fy1.min(ty1));
+    if oy0 < oy1 {
+        let y = oy0 + (from_frac * (oy1 - oy0 - 1).max(0) as f32).round() as i32;
         return if fx0 <= tx0 { vec![(fx1, y), (tx0 - 1, y)] } else { vec![(fx0 - 1, y), (tx1, y)] };
     }
 
     let (ox0, ox1) = (fx0.max(tx0), fx1.min(tx1));
     if ox0 < ox1 {
-        let x = (ox0 + ox1 - 1) / 2;
+        let x = ox0 + (from_frac * (ox1 - ox0 - 1).max(0) as f32).round() as i32;
         return if fy0 <= ty0 { vec![(x, fy1), (x, ty0 - 1)] } else { vec![(x, fy0 - 1), (x, ty1)] };
     }
 
     let (fcx, fcy) = center(from);
     let (tcx, tcy) = center(to);
     let exit_x = if tcx > fcx { fx1 } else { fx0 - 1 };
+    let exit_y = fy0 + (from_frac * (fy1 - fy0 - 1).max(0) as f32).round() as i32;
+    let enter_x = tx0 + (to_frac * (tx1 - tx0 - 1).max(0) as f32).round() as i32;
     // One row past `to`'s border, not the border row itself — landing on
     // the border let a box's own bordered widget, drawn right after
     // edges, silently paint over the arrowhead.
     let enter_y = if tcy > fcy { ty0 - 1 } else { ty1 };
-    vec![(exit_x, fcy), (tcx, fcy), (tcx, enter_y)]
+    vec![(exit_x, exit_y), (enter_x, exit_y), (enter_x, enter_y)]
 }
 
 /// Walks a waypoint path (each leg strictly horizontal or vertical) and
@@ -388,7 +490,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
     };
-    let hint = "click box/connector to edit · drag move · shift+drag connect · corner resize · esc then c color / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "click box/connector to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

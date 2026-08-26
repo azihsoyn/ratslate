@@ -67,6 +67,8 @@ pub enum Request {
     /// A JSON Canvas preset "1".."6", a hex string like "#ff8800", or
     /// null to clear it.
     SetColor { id: ShapeId, color: Option<String> },
+    /// "rectangle" (the default), "rounded", or "diamond".
+    SetShape { id: ShapeId, shape: String },
     /// Draw an arrow from one box to another.
     Connect { from: ShapeId, to: ShapeId },
     /// Remove a box and any connectors touching it.
@@ -291,6 +293,11 @@ impl App {
             Request::SetColor { id, color } => {
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
                 node.color = color.as_deref().map(Color::parse);
+                Ok(Response::Ok)
+            }
+            Request::SetShape { id, shape } => {
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                node.shape = crate::model::Shape::parse(&shape);
                 Ok(Response::Ok)
             }
             Request::Connect { from, to } => {
@@ -569,6 +576,15 @@ impl App {
                     {
                         let next = Color::cycle(node.color.as_ref());
                         let _ = self.dispatch(Request::SetColor { id, color: next.map(|c| c.to_string()) });
+                    }
+                }
+                KeyCode::Char('x') => {
+                    if let Some(Selected::Node(id)) = self.selected.clone()
+                        && let Some(node) = self.canvas.node(&id)
+                    {
+                        let next = node.shape.cycle();
+                        let shape = next.as_str().unwrap_or("rectangle").to_string();
+                        let _ = self.dispatch(Request::SetShape { id, shape });
                     }
                 }
                 KeyCode::Char('d') | KeyCode::Delete => match self.selected.clone() {

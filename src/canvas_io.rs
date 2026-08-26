@@ -5,21 +5,24 @@ use std::path::Path;
 
 use anyhow::Result;
 use ratatui::layout::Rect;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Canvas, Color, Edge, EdgeEnd, Node, NodeKind, Side};
 
-#[derive(Serialize, Deserialize, Default)]
-struct FileRoot {
+/// A board, in the shape https://jsoncanvas.org/spec/1.0/ describes on
+/// disk — also what `Request::State` hands back over `--api`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Default)]
+pub struct FileRoot {
     #[serde(default)]
-    nodes: Vec<FileNode>,
+    pub nodes: Vec<FileNode>,
     #[serde(default)]
-    edges: Vec<FileEdge>,
+    pub edges: Vec<FileEdge>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
-enum FileNode {
+pub enum FileNode {
     Text {
         id: String,
         x: i64,
@@ -72,25 +75,25 @@ enum FileNode {
     },
 }
 
-#[derive(Serialize, Deserialize)]
-struct FileEdge {
-    id: String,
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FileEdge {
+    pub id: String,
     #[serde(rename = "fromNode")]
-    from_node: String,
+    pub from_node: String,
     #[serde(rename = "fromSide", skip_serializing_if = "Option::is_none")]
-    from_side: Option<String>,
+    pub from_side: Option<String>,
     #[serde(rename = "fromEnd", skip_serializing_if = "Option::is_none")]
-    from_end: Option<String>,
+    pub from_end: Option<String>,
     #[serde(rename = "toNode")]
-    to_node: String,
+    pub to_node: String,
     #[serde(rename = "toSide", skip_serializing_if = "Option::is_none")]
-    to_side: Option<String>,
+    pub to_side: Option<String>,
     #[serde(rename = "toEnd", skip_serializing_if = "Option::is_none")]
-    to_end: Option<String>,
+    pub to_end: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    color: Option<String>,
+    pub color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    label: Option<String>,
+    pub label: Option<String>,
 }
 
 pub fn load(path: &Path) -> Result<Canvas> {
@@ -104,20 +107,6 @@ pub fn save(canvas: &Canvas, path: &Path) -> Result<()> {
     let data = serde_json::to_string_pretty(&root)?;
     std::fs::write(path, data)?;
     Ok(())
-}
-
-fn parse_color(s: &str) -> Color {
-    match s {
-        "1" | "2" | "3" | "4" | "5" | "6" => Color::Preset(s.parse().unwrap()),
-        hex => Color::Hex(hex.to_string()),
-    }
-}
-
-fn color_to_string(c: &Color) -> String {
-    match c {
-        Color::Preset(n) => n.to_string(),
-        Color::Hex(h) => h.clone(),
-    }
 }
 
 fn parse_side(s: &str) -> Option<Side> {
@@ -253,7 +242,7 @@ fn from_file(root: FileRoot) -> Canvas {
         canvas.nodes.push(Node {
             id,
             rect,
-            color: color.as_deref().map(parse_color),
+            color: color.as_deref().map(Color::parse),
             kind,
         });
     }
@@ -276,7 +265,7 @@ fn from_file(root: FileRoot) -> Canvas {
             } else {
                 EdgeEnd::Arrow
             },
-            color: fedge.color.as_deref().map(parse_color),
+            color: fedge.color.as_deref().map(Color::parse),
             label: fedge.label,
         });
     }
@@ -285,12 +274,12 @@ fn from_file(root: FileRoot) -> Canvas {
     canvas
 }
 
-fn to_file(canvas: &Canvas) -> FileRoot {
+pub fn to_file(canvas: &Canvas) -> FileRoot {
     let nodes = canvas
         .nodes
         .iter()
         .map(|n| {
-            let color = n.color.as_ref().map(color_to_string);
+            let color = n.color.as_ref().map(Color::to_string);
             let (x, y, width, height) = (
                 n.rect.x as i64,
                 n.rect.y as i64,
@@ -356,7 +345,7 @@ fn to_file(canvas: &Canvas) -> FileRoot {
             to_node: e.to.clone(),
             to_side: e.to_side.map(side_to_string).map(str::to_string),
             to_end: (e.to_end == EdgeEnd::None).then(|| "none".to_string()),
-            color: e.color.as_ref().map(color_to_string),
+            color: e.color.as_ref().map(Color::to_string),
             label: e.label.clone(),
         })
         .collect();

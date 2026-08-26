@@ -20,6 +20,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
 };
+use schemars::schema_for;
+use serde_json::Value;
 
 use app::App;
 use mind_app::MindApp;
@@ -27,13 +29,26 @@ use mind_app::MindApp;
 type Backend = CrosstermBackend<io::Stdout>;
 
 fn main() -> io::Result<()> {
-    let path = std::env::args().nth(1).map(PathBuf::from);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let path = args.first().cloned().map(PathBuf::from);
     let is_markdown = path.as_ref().is_some_and(|p| {
         matches!(
             p.extension().and_then(|e| e.to_str()),
             Some("md") | Some("markdown")
         )
     });
+
+    if args.iter().any(|a| a == "--schema") {
+        print_schema(is_markdown);
+        return Ok(());
+    }
+    if let Some(i) = args.iter().position(|a| a == "--api") {
+        let Some(json) = args.get(i + 1) else {
+            eprintln!("--api needs a JSON argument");
+            std::process::exit(2);
+        };
+        return run_api(path, is_markdown, json);
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -111,4 +126,69 @@ fn run_mind(terminal: &mut Terminal<Backend>, app: &mut MindApp) -> io::Result<(
         }
     }
     Ok(())
+}
+
+/// Headless: apply one request, or a batch of them, without a
+/// terminal. The exact same `dispatch` the TUI's mouse and key
+/// handlers call — this is not a second implementation of what a move
+/// or an edit means, just another way to name one.
+fn run_api(path: Option<PathBuf>, is_markdown: bool, json: &str) -> io::Result<()> {
+    let value: Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("{}", serde_json::json!({"id": "?", "error": {"message": e.to_string()}}));
+            return Ok(());
+        }
+    };
+    let is_batch = value.is_array();
+    let items: Vec<Value> = match value {
+        Value::Array(items) => items,
+        other => vec![other],
+    };
+
+    let mut results: Vec<Value> = Vec::with_capacity(items.len());
+    if is_markdown {
+        let mut app = MindApp::new(path.expect("mindmap mode needs a file"));
+        for item in items {
+            let kind = kind_of(&item);
+            results.push(mind_app::run_one(&mut app, &kind, item));
+        }
+    } else {
+        let mut app = App::new(path);
+        for item in items {
+            let kind = kind_of(&item);
+            results.push(app::run_one(&mut app, &kind, item));
+        }
+    }
+
+    let out = if is_batch {
+        serde_json::json!({"id": "batch", "result": results})
+    } else {
+        results.into_iter().next().unwrap_or_else(|| serde_json::json!({"id": "?", "error": {"message": "empty request"}}))
+    };
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    Ok(())
+}
+
+fn kind_of(v: &Value) -> String {
+    v.get("type").and_then(Value::as_str).unwrap_or("?").to_string()
+}
+
+fn print_schema(is_markdown: bool) {
+    let doc = if is_markdown {
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "ratslate --api (mindmap)",
+            "request": schema_for!(mind_app::Request),
+            "response": schema_for!(mind_app::Response),
+        })
+    } else {
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "ratslate --api (whiteboard)",
+            "request": schema_for!(app::Request),
+            "response": schema_for!(app::Response),
+        })
+    };
+    println!("{}", serde_json::to_string_pretty(&doc).unwrap());
 }

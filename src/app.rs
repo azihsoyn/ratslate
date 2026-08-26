@@ -3,8 +3,10 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui_dnd::{Did, Drag, Hits};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-use crate::canvas_io;
+use crate::canvas_io::{self, FileRoot};
 use crate::model::{Canvas, Color, ShapeId};
 
 const MIN_W: u16 = 5;
@@ -39,12 +41,50 @@ pub enum Mode {
     Editing(ShapeId),
 }
 
+/// Every way the board can change. The TUI's mouse and key handlers
+/// build one of these and hand it to [`App::dispatch`] just like
+/// `--api` does — one path, so a script and a drag can never disagree
+/// about what a move means.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Request {
+    /// Place a new text box, top-left at (x, y).
+    Place { x: u16, y: u16 },
+    /// Replace a box's text outright.
+    SetText { id: ShapeId, text: String },
+    /// Move and/or resize a box to an exact rectangle.
+    SetRect { id: ShapeId, x: u16, y: u16, w: u16, h: u16 },
+    /// A JSON Canvas preset "1".."6", a hex string like "#ff8800", or
+    /// null to clear it.
+    SetColor { id: ShapeId, color: Option<String> },
+    /// Draw an arrow from one box to another.
+    Connect { from: ShapeId, to: ShapeId },
+    /// Remove a box and any connectors touching it.
+    Delete { id: ShapeId },
+    /// Select a box, or clear the selection with `null`.
+    Select { id: Option<ShapeId> },
+    /// The whole board, as JSON Canvas.
+    State,
+    /// Write the board to the path given on the command line.
+    Save,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Response {
+    Placed { id: ShapeId },
+    Ok,
+    State { board: FileRoot },
+    Saved { path: String },
+}
+
 pub struct App {
     pub canvas: Canvas,
     pub drag: Drag<HitTarget>,
     pub hits: Hits<HitTarget>,
     pub selected: Option<ShapeId>,
     pub mode: Mode,
+    pub editing_text: String,
     pub should_quit: bool,
     pub save_path: Option<PathBuf>,
     pub status: String,
@@ -78,6 +118,7 @@ impl App {
             hits: Hits::new(),
             selected: None,
             mode: Mode::Normal,
+            editing_text: String::new(),
             should_quit: false,
             save_path,
             status,
@@ -95,6 +136,59 @@ impl App {
         match canvas_io::save(&self.canvas, &path) {
             Ok(()) => self.status = format!("saved {}", path.display()),
             Err(e) => self.status = format!("save failed: {e}"),
+        }
+    }
+
+    /// The single place every board mutation goes through, whether it
+    /// came from a mouse drag, a keystroke, or `--api`.
+    pub fn dispatch(&mut self, req: Request) -> Result<Response, String> {
+        match req {
+            Request::Place { x, y } => {
+                let id = self.canvas.place_text(x, y);
+                Ok(Response::Placed { id })
+            }
+            Request::SetText { id, text } => {
+                self.canvas.node(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                self.canvas.edit_text(&id, |t| {
+                    t.clear();
+                    t.push_str(&text);
+                });
+                Ok(Response::Ok)
+            }
+            Request::SetRect { id, x, y, w, h } => {
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                node.rect = Rect::new(x, y, w.max(1), h.max(1));
+                Ok(Response::Ok)
+            }
+            Request::SetColor { id, color } => {
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                node.color = color.as_deref().map(Color::parse);
+                Ok(Response::Ok)
+            }
+            Request::Connect { from, to } => {
+                self.canvas.node(&from).ok_or_else(|| format!("no such node: {from}"))?;
+                self.canvas.node(&to).ok_or_else(|| format!("no such node: {to}"))?;
+                self.canvas.connect(from, to);
+                Ok(Response::Ok)
+            }
+            Request::Delete { id } => {
+                self.canvas.delete(&id);
+                if self.selected.as_deref() == Some(id.as_str()) {
+                    self.selected = None;
+                }
+                Ok(Response::Ok)
+            }
+            Request::Select { id } => {
+                self.selected = id;
+                Ok(Response::Ok)
+            }
+            Request::State => Ok(Response::State { board: canvas_io::to_file(&self.canvas) }),
+            Request::Save => {
+                self.save();
+                Ok(Response::Saved {
+                    path: self.save_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                })
+            }
         }
     }
 
@@ -142,7 +236,7 @@ impl App {
 
         match self.drag.on_mouse(ev, hit) {
             Did::Click(target) => {
-                self.selected = Some(target.shape_id().clone());
+                let _ = self.dispatch(Request::Select { id: Some(target.shape_id().clone()) });
             }
             Did::Lift(HitTarget::Resize(id, corner)) => {
                 if let Some(node) = self.canvas.node(&id) {
@@ -154,17 +248,13 @@ impl App {
                 x,
                 y,
             } => {
-                if let Some(node) = self.canvas.node_mut(&id) {
-                    let max_x = canvas_area
-                        .right()
-                        .saturating_sub(node.rect.width)
-                        .max(canvas_area.x);
-                    let max_y = canvas_area
-                        .bottom()
-                        .saturating_sub(node.rect.height)
-                        .max(canvas_area.y);
-                    node.rect.x = x.saturating_sub(self.grab_offset.0).clamp(canvas_area.x, max_x);
-                    node.rect.y = y.saturating_sub(self.grab_offset.1).clamp(canvas_area.y, max_y);
+                if let Some(node) = self.canvas.node(&id) {
+                    let (w, h) = (node.rect.width, node.rect.height);
+                    let max_x = canvas_area.right().saturating_sub(w).max(canvas_area.x);
+                    let max_y = canvas_area.bottom().saturating_sub(h).max(canvas_area.y);
+                    let nx = x.saturating_sub(self.grab_offset.0).clamp(canvas_area.x, max_x);
+                    let ny = y.saturating_sub(self.grab_offset.1).clamp(canvas_area.y, max_y);
+                    let _ = self.dispatch(Request::SetRect { id, x: nx, y: ny, w, h });
                 }
             }
             Did::Drop {
@@ -175,9 +265,9 @@ impl App {
                 if let Some((origin_id, origin_corner, origin_rect)) = self.resize_origin.take()
                     && origin_id == id
                     && origin_corner == corner
-                    && let Some(node) = self.canvas.node_mut(&id)
                 {
-                    node.rect = resized_rect(origin_rect, corner, x, y, canvas_area);
+                    let r = resized_rect(origin_rect, corner, x, y, canvas_area);
+                    let _ = self.dispatch(Request::SetRect { id, x: r.x, y: r.y, w: r.width, h: r.height });
                 }
             }
             Did::Drop {
@@ -188,7 +278,7 @@ impl App {
                 if let Some((target, _)) = self.hits.at(x, y) {
                     let to = target.shape_id().clone();
                     if to != from {
-                        self.canvas.connect(from, to);
+                        let _ = self.dispatch(Request::Connect { from, to });
                     }
                 }
             }
@@ -199,9 +289,10 @@ impl App {
             && let Some((px, py)) = self.press_on_empty.take()
             && px == ev.column
             && py == ev.row
+            && let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x: px, y: py })
         {
-            let id = self.canvas.place_text(px, py);
             self.selected = Some(id.clone());
+            self.editing_text.clear();
             self.mode = Mode::Editing(id);
         }
     }
@@ -213,38 +304,66 @@ impl App {
 
         match self.mode.clone() {
             Mode::Editing(id) => match key.code {
-                KeyCode::Esc => self.mode = Mode::Normal,
-                KeyCode::Enter => self.canvas.edit_text(&id, |t| t.push('\n')),
-                KeyCode::Backspace => self.canvas.edit_text(&id, |t| {
-                    t.pop();
-                }),
-                KeyCode::Char(c) => self.canvas.edit_text(&id, |t| t.push(c)),
+                KeyCode::Esc => {
+                    let text = std::mem::take(&mut self.editing_text);
+                    let _ = self.dispatch(Request::SetText { id, text });
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Enter => self.editing_text.push('\n'),
+                KeyCode::Backspace => {
+                    self.editing_text.pop();
+                }
+                KeyCode::Char(c) => self.editing_text.push(c),
                 _ => {}
             },
             Mode::Normal => match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
-                KeyCode::Char('s') => self.save(),
+                KeyCode::Char('s') => {
+                    let _ = self.dispatch(Request::Save);
+                }
                 KeyCode::Enter => {
-                    if let Some(id) = self.selected.clone() {
+                    if let Some(id) = self.selected.clone()
+                        && let Some(node) = self.canvas.node(&id)
+                    {
+                        self.editing_text = match &node.kind {
+                            crate::model::NodeKind::Text(t) => t.clone(),
+                            _ => String::new(),
+                        };
                         self.mode = Mode::Editing(id);
                     }
                 }
                 KeyCode::Char('c') => {
                     if let Some(id) = self.selected.clone()
-                        && let Some(node) = self.canvas.node_mut(&id)
+                        && let Some(node) = self.canvas.node(&id)
                     {
-                        node.color = Color::cycle(node.color.as_ref());
+                        let next = Color::cycle(node.color.as_ref());
+                        let _ = self.dispatch(Request::SetColor { id, color: next.map(|c| c.to_string()) });
                     }
                 }
                 KeyCode::Char('d') | KeyCode::Delete => {
-                    if let Some(id) = self.selected.take() {
-                        self.canvas.delete(&id);
+                    if let Some(id) = self.selected.clone() {
+                        let _ = self.dispatch(Request::Delete { id });
                     }
                 }
-                KeyCode::Esc => self.selected = None,
+                KeyCode::Esc => {
+                    let _ = self.dispatch(Request::Select { id: None });
+                }
                 _ => {}
             },
         }
+    }
+}
+
+/// Parse and apply one `--api` request, already decoded from JSON. `kind`
+/// (the request's own `type` tag) labels the envelope so a batch reply
+/// can be matched back up.
+pub fn run_one(app: &mut App, kind: &str, value: serde_json::Value) -> serde_json::Value {
+    match serde_json::from_value::<Request>(value) {
+        Ok(req) => match app.dispatch(req) {
+            Ok(resp) => serde_json::json!({"id": kind, "result": resp}),
+            Err(message) => serde_json::json!({"id": kind, "error": {"message": message}}),
+        },
+        Err(e) => serde_json::json!({"id": kind, "error": {"message": e.to_string()}}),
     }
 }
 

@@ -18,6 +18,23 @@ impl Color {
             _ => None,
         }
     }
+
+    /// A JSON Canvas preset "1".."6", or any other string as a literal hex color.
+    pub fn parse(s: &str) -> Color {
+        match s {
+            "1" | "2" | "3" | "4" | "5" | "6" => Color::Preset(s.parse().unwrap()),
+            hex => Color::Hex(hex.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for Color {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Color::Preset(n) => write!(f, "{n}"),
+            Color::Hex(h) => write!(f, "{h}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

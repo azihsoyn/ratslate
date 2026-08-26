@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         }
         let selected = app.selected.as_deref() == Some(node.id.as_str());
         let editing = matches!(&app.mode, Mode::Editing(id) if id == &node.id);
-        draw_node(frame, node, selected, editing);
+        draw_node(frame, node, selected, editing, &app.editing_text);
     }
 
     if let Some((id, rect)) = app.resize_preview(canvas_area) {
@@ -59,7 +59,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
     draw_status(frame, app, status_area);
 }
 
-fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool) {
+fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, editing_text: &str) {
     let base = node
         .color
         .as_ref()
@@ -75,7 +75,7 @@ fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool) {
     let inner = block.inner(node.rect);
     frame.render_widget(block, node.rect);
 
-    let mut text = display_text(node);
+    let mut text = if editing { editing_text.to_string() } else { display_text(node) };
     if editing {
         text.push('▏');
     }

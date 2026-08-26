@@ -88,7 +88,7 @@ fn draw_status(frame: &mut Frame, app: &MindApp, area: Rect) {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc/Enter to leave)",
     };
-    let hint = "click select · drag reorder/re-parent · enter edit · s save · q quit";
+    let hint = "click select · drag reorder/re-parent · enter edit · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(Color::DarkGray)),

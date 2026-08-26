@@ -217,7 +217,11 @@ impl MindApp {
                     }
                 }
                 KeyCode::Esc => {
-                    let _ = self.dispatch(Request::Select { id: None });
+                    if self.selected.is_some() {
+                        let _ = self.dispatch(Request::Select { id: None });
+                    } else {
+                        self.should_quit = true;
+                    }
                 }
                 _ => {}
             },

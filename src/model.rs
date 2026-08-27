@@ -128,41 +128,33 @@ pub struct Edge {
 pub struct Canvas {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
-    next_id: u64,
+}
+
+/// A short id with enough randomness that two boards never mint the same
+/// one without having to coordinate. A plain incrementing counter looked
+/// fine single-process, but nodes and edges share this same id space and
+/// only nodes flow through the CRDT — two independent `--api` calls (or
+/// an `--api` call racing the TUI's own local counter) can each pick
+/// "the next number" without ever having seen the other's pick, and a
+/// collision there quietly merges two unrelated shapes into one. Eight
+/// hex digits is short enough to still type by hand and long enough
+/// (32 bits) that a collision within any one board's realistic lifetime
+/// isn't worth guarding against further; it's also long enough that it
+/// can never collide with the old sequential "n12"-style ids an older
+/// save file might still contain.
+fn fresh_id() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_err() {
+        buf = (std::process::id() ^ (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()))
+            .to_le_bytes();
+    }
+    format!("n{:08x}", u32::from_le_bytes(buf))
 }
 
 impl Canvas {
-    fn fresh_id(&mut self) -> String {
-        self.next_id += 1;
-        format!("n{}", self.next_id)
-    }
-
-    /// Bumps the id counter past whatever an imported file already used,
-    /// so newly placed shapes never collide with it.
-    pub fn set_next_id(&mut self, next: u64) {
-        if next > self.next_id {
-            self.next_id = next;
-        }
-    }
-
-    /// Bumps the id counter past whatever the current node set already
-    /// uses. Needed after replacing `nodes` wholesale from a CRDT
-    /// snapshot — those ids were minted by some other process's own
-    /// counter, which this one has no other way to know about, and
-    /// without this a freshly placed shape here can collide with one
-    /// that arrived through the merge.
-    pub fn bump_next_id_from_nodes(&mut self) {
-        let max = self
-            .nodes
-            .iter()
-            .filter_map(|n| n.id.strip_prefix('n')?.parse::<u64>().ok())
-            .max()
-            .unwrap_or(0);
-        self.set_next_id(max + 1);
-    }
-
     pub fn place_text(&mut self, x: u16, y: u16, w: Option<u16>, h: Option<u16>) -> ShapeId {
-        let id = self.fresh_id();
+        let id = fresh_id();
         self.nodes.push(Node {
             id: id.clone(),
             rect: Rect::new(x, y, w.unwrap_or(16), h.unwrap_or(3)),
@@ -182,7 +174,7 @@ impl Canvas {
     }
 
     pub fn connect(&mut self, from: ShapeId, to: ShapeId) {
-        let id = self.fresh_id();
+        let id = fresh_id();
         self.edges.push(Edge {
             id,
             from,

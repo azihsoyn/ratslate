@@ -266,7 +266,6 @@ impl App {
                 // JSON file, if changes landed through it since the
                 // last explicit save — so it wins for the node set.
                 canvas.nodes = snapshot.into_iter().map(|(id, f)| node_from_fields(id, f)).collect();
-                canvas.bump_next_id_from_nodes();
             }
         }
 
@@ -351,7 +350,6 @@ impl App {
         let snapshot = collab.snapshot();
         self.push_undo();
         self.canvas.nodes = snapshot.into_iter().map(|(id, f)| node_from_fields(id, f)).collect();
-        self.canvas.bump_next_id_from_nodes();
         if let Some(Selected::Node(id)) = &self.selected
             && !self.canvas.nodes.iter().any(|n| &n.id == id)
         {
@@ -360,12 +358,32 @@ impl App {
         self.status = "merged a change from another writer".to_string();
     }
 
-    /// Mirrors the current node set into the CRDT so another writer's
-    /// next pull sees it. Called after every mutating dispatch — most
-    /// of them only touch one node or none, but resyncing everything is
-    /// simple, correct, and cheap enough at the size these boards get.
-    fn resync_collab(&mut self) {
+    /// Mirrors one node's current field values into the CRDT so another
+    /// writer's next pull sees them — pulling first so this local
+    /// process's own possibly-stale view of *other* nodes never gets
+    /// blindly re-asserted over a concurrent change to them. A dispatch
+    /// only ever names the one node it just touched, so that's the only
+    /// key this needs to write; a wholesale re-mirror of every node on
+    /// every keystroke was what let a writer with a stale in-memory copy
+    /// stomp someone else's fresher edit to an unrelated (or the same)
+    /// box.
+    fn sync_node(&mut self, id: &ShapeId) {
         let Some(collab) = &mut self.collab else { return };
+        collab.pull();
+        match self.canvas.node(id) {
+            Some(node) => collab.set_node(id, &node_fields(node)),
+            None => collab.remove_node(id),
+        }
+    }
+
+    /// Mirrors the *entire* node set into the CRDT, overwriting whatever
+    /// any other node's entry currently holds. Only safe for undo/redo,
+    /// where the whole point is snapping every node back to this
+    /// process's own recorded snapshot; anywhere else, prefer
+    /// [`Self::sync_node`].
+    fn resync_collab_full(&mut self) {
+        let Some(collab) = &mut self.collab else { return };
+        collab.pull();
         let current: std::collections::HashSet<&str> = self.canvas.nodes.iter().map(|n| n.id.as_str()).collect();
         for node in &self.canvas.nodes {
             collab.set_node(&node.id, &node_fields(node));
@@ -423,7 +441,7 @@ impl App {
         self.mode = Mode::Normal;
         self.dirty = true;
         self.status = "undone".to_string();
-        self.resync_collab();
+        self.resync_collab_full();
         true
     }
 
@@ -437,7 +455,7 @@ impl App {
         self.mode = Mode::Normal;
         self.dirty = true;
         self.status = "redone".to_string();
-        self.resync_collab();
+        self.resync_collab_full();
         true
     }
 
@@ -449,9 +467,11 @@ impl App {
             self.push_undo();
             self.dirty = true;
         }
+        let mut touched: Option<ShapeId> = None;
         let result = match req {
             Request::Place { x, y, w, h } => {
                 let id = self.canvas.place_text(x, y, w, h);
+                touched = Some(id.clone());
                 Ok(Response::Placed { id })
             }
             Request::SetText { id, text } => {
@@ -460,21 +480,25 @@ impl App {
                     t.clear();
                     t.push_str(&text);
                 });
+                touched = Some(id);
                 Ok(Response::Ok)
             }
             Request::SetRect { id, x, y, w, h } => {
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
                 node.rect = Rect::new(x, y, w.max(1), h.max(1));
+                touched = Some(id);
                 Ok(Response::Ok)
             }
             Request::SetColor { id, color } => {
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
                 node.color = color.as_deref().map(Color::parse);
+                touched = Some(id);
                 Ok(Response::Ok)
             }
             Request::SetShape { id, shape } => {
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
                 node.shape = crate::model::Shape::parse(&shape);
+                touched = Some(id);
                 Ok(Response::Ok)
             }
             Request::Connect { from, to } => {
@@ -485,9 +509,10 @@ impl App {
             }
             Request::Delete { id } => {
                 self.canvas.delete(&id);
-                if self.selected == Some(Selected::Node(id)) {
+                if self.selected == Some(Selected::Node(id.clone())) {
                     self.selected = None;
                 }
+                touched = Some(id);
                 Ok(Response::Ok)
             }
             Request::SetLabel { id, label } => {
@@ -528,8 +553,8 @@ impl App {
             Request::Undo => Ok(Response::Undone { done: self.undo() }),
             Request::Redo => Ok(Response::Redone { done: self.redo() }),
         };
-        if mutates {
-            self.resync_collab();
+        if let (true, Some(id)) = (result.is_ok(), &touched) {
+            self.sync_node(id);
         }
         result
     }

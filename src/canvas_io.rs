@@ -137,17 +137,6 @@ fn clamp_u16(v: i64) -> u16 {
     v.clamp(0, u16::MAX as i64) as u16
 }
 
-/// Ids we mint ourselves look like `n<number>`; remember the highest one
-/// seen so freshly placed shapes never collide with an imported file.
-fn track_numeric_id(id: &str, max: &mut u64) {
-    if let Some(rest) = id.strip_prefix('n')
-        && let Ok(n) = rest.parse::<u64>()
-        && n > *max
-    {
-        *max = n;
-    }
-}
-
 fn file_node_pos(node: &FileNode) -> (i64, i64) {
     match node {
         FileNode::Text { x, y, .. }
@@ -172,8 +161,6 @@ fn from_file(root: FileRoot) -> Canvas {
     }
     let off_x = -min_x;
     let off_y = -min_y;
-
-    let mut max_numeric_id = 0u64;
 
     for fnode in root.nodes {
         let (id, x, y, w, h, color, shape, kind) = match fnode {
@@ -240,7 +227,6 @@ fn from_file(root: FileRoot) -> Canvas {
                 },
             ),
         };
-        track_numeric_id(&id, &mut max_numeric_id);
         let rect = Rect::new(
             clamp_u16(x + off_x),
             clamp_u16(y + off_y),
@@ -257,7 +243,6 @@ fn from_file(root: FileRoot) -> Canvas {
     }
 
     for fedge in root.edges {
-        track_numeric_id(&fedge.id, &mut max_numeric_id);
         canvas.edges.push(Edge {
             id: fedge.id,
             from: fedge.from_node,
@@ -279,7 +264,6 @@ fn from_file(root: FileRoot) -> Canvas {
         });
     }
 
-    canvas.set_next_id(max_numeric_id + 1);
     canvas
 }
 

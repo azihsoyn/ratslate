@@ -18,6 +18,24 @@ use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
 use yrs::{Any, Doc, In, Map, MapPrelim, MapRef, ReadTxn, StateVector, Transact, Update};
 
+/// yrs docs must never share a client id with another active peer, or
+/// merges silently corrupt (see `ClientID`'s own doc comment). `Doc::new`
+/// picks one via `fastrand`, which seeds itself from little more than
+/// the clock and reliably collides between our own short-lived `--api`
+/// processes when several launch within the same instant — so this
+/// pulls straight from the OS's own CSPRNG instead.
+fn random_client_id() -> u64 {
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let mut buf = [0u8; 8];
+        if f.read_exact(&mut buf).is_ok() {
+            // Client ids are 53-bit; yrs debug-asserts the high bits are clear.
+            return u64::from_le_bytes(buf) & ((1u64 << 53) - 1);
+        }
+    }
+    std::process::id() as u64
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeFields {
     pub x: i64,
@@ -50,7 +68,7 @@ impl Collab {
     /// Opens (or creates) the sidecar next to `canvas_path` and merges
     /// in whatever is already there.
     pub fn open(canvas_path: &Path) -> Self {
-        let doc = Doc::new();
+        let doc = Doc::with_client_id(random_client_id());
         let nodes = doc.get_or_insert_map("nodes");
         let mut collab = Collab { doc, nodes, path: crdt_path(canvas_path), mtime: None };
         collab.pull();

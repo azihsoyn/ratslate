@@ -214,12 +214,17 @@ pub struct App {
     /// on the same thing within `DOUBLE_CLICK` opens it for editing
     /// instead of just selecting it again.
     last_click: Option<(Selected, std::time::Instant)>,
+    /// The save file's mtime as of our own last read or write of it, so
+    /// a change from outside — a script, `--api`, another editor — can
+    /// be told apart from an echo of our own save.
+    file_mtime: Option<std::time::SystemTime>,
 }
 
 impl App {
     pub fn new(save_path: Option<PathBuf>) -> Self {
         let mut canvas = Canvas::default();
         let mut status = String::new();
+        let mut file_mtime = None;
 
         if let Some(path) = &save_path {
             if path.exists() {
@@ -227,6 +232,7 @@ impl App {
                     Ok(loaded) => {
                         canvas = loaded;
                         status = format!("loaded {}", path.display());
+                        file_mtime = mtime_of(path);
                     }
                     Err(e) => status = format!("failed to load {}: {e}", path.display()),
                 }
@@ -254,6 +260,34 @@ impl App {
             drawing: None,
             press_on_edge: None,
             last_click: None,
+            file_mtime,
+        }
+    }
+
+    /// Picks up a change made to the save file from outside this
+    /// process — another `--api` call, a script, a human editing it in
+    /// something else — the same way an undoable edit does, so it can
+    /// be Ctrl+Z'd away if it wasn't wanted. Skipped while anything is
+    /// mid-gesture, so an incoming change can't yank a box out from
+    /// under an active drag or a keystroke out of an active edit.
+    pub fn reload_if_changed(&mut self) {
+        let Some(path) = self.save_path.clone() else { return };
+        if self.mode != Mode::Normal || self.drag.moving().is_some() || self.drawing.is_some() {
+            return;
+        }
+        let Some(mtime) = mtime_of(&path) else { return };
+        if Some(mtime) == self.file_mtime {
+            return;
+        }
+        self.file_mtime = Some(mtime);
+        match canvas_io::load(&path) {
+            Ok(loaded) => {
+                self.push_undo();
+                self.canvas = loaded;
+                self.selected = None;
+                self.status = format!("reloaded {} (changed externally)", path.display());
+            }
+            Err(e) => self.status = format!("failed to reload {}: {e}", path.display()),
         }
     }
 
@@ -272,7 +306,10 @@ impl App {
             return;
         };
         match canvas_io::save(&self.canvas, &path) {
-            Ok(()) => self.status = format!("saved {}", path.display()),
+            Ok(()) => {
+                self.status = format!("saved {}", path.display());
+                self.file_mtime = mtime_of(&path);
+            }
             Err(e) => self.status = format!("save failed: {e}"),
         }
     }
@@ -785,4 +822,8 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         })
         .sum();
     content_lines.max(1) + 2
+}
+
+fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }

@@ -82,6 +82,8 @@ fn main() -> io::Result<()> {
 
 fn run_whiteboard(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
     loop {
+        app.reload_if_changed();
+
         let mut canvas_area = Rect::default();
         terminal.draw(|frame| {
             let full = frame.area();
@@ -107,6 +109,8 @@ fn run_whiteboard(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result
 
 fn run_mind(terminal: &mut Terminal<Backend>, app: &mut MindApp) -> io::Result<()> {
     loop {
+        app.reload_if_changed();
+
         terminal.draw(|frame| {
             let full = frame.area();
             let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(full);

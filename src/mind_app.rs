@@ -97,6 +97,10 @@ pub struct MindApp {
     pub should_quit: bool,
     undo_stack: Vec<Vec<String>>,
     redo_stack: Vec<Vec<String>>,
+    /// The save file's mtime as of our own last read or write of it, so
+    /// a change from outside — a script, `--api`, another editor — can
+    /// be told apart from an echo of our own save.
+    file_mtime: Option<std::time::SystemTime>,
 }
 
 impl MindApp {
@@ -113,6 +117,7 @@ impl MindApp {
             (Vec::new(), format!("new file {}", save_path.display()))
         };
         let tree = mindmap::parse(&lines);
+        let file_mtime = mtime_of(&save_path);
 
         Self {
             lines,
@@ -126,6 +131,33 @@ impl MindApp {
             should_quit: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            file_mtime,
+        }
+    }
+
+    /// Picks up a change made to the save file from outside this
+    /// process, the same way an undoable edit does, so it can be
+    /// Ctrl+Z'd away if it wasn't wanted. Skipped mid-gesture, so an
+    /// incoming change can't yank a node out from under an active drag
+    /// or a keystroke out of an active edit.
+    pub fn reload_if_changed(&mut self) {
+        if self.mode != Mode::Normal || self.sort.held().is_some() {
+            return;
+        }
+        let Some(mtime) = mtime_of(&self.save_path) else { return };
+        if Some(mtime) == self.file_mtime {
+            return;
+        }
+        self.file_mtime = Some(mtime);
+        match std::fs::read_to_string(&self.save_path) {
+            Ok(content) => {
+                self.push_undo();
+                self.lines = content.lines().map(String::from).collect();
+                self.tree = mindmap::parse(&self.lines);
+                self.selected = None;
+                self.status = format!("reloaded {} (changed externally)", self.save_path.display());
+            }
+            Err(e) => self.status = format!("failed to reload {}: {e}", self.save_path.display()),
         }
     }
 
@@ -170,7 +202,10 @@ impl MindApp {
             self.lines.join("\n") + "\n"
         };
         match std::fs::write(&self.save_path, content) {
-            Ok(()) => self.status = format!("saved {}", self.save_path.display()),
+            Ok(()) => {
+                self.status = format!("saved {}", self.save_path.display());
+                self.file_mtime = mtime_of(&self.save_path);
+            }
             Err(e) => self.status = format!("save failed: {e}"),
         }
     }
@@ -308,4 +343,8 @@ pub fn run_one(app: &mut MindApp, kind: &str, value: serde_json::Value) -> serde
         },
         Err(e) => serde_json::json!({"id": kind, "error": {"message": e.to_string()}}),
     }
+}
+
+fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }

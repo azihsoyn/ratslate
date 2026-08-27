@@ -1,5 +1,6 @@
 mod app;
 mod canvas_io;
+mod collab;
 mod mind_app;
 mod mind_render;
 mod mindmap;
@@ -82,6 +83,7 @@ fn main() -> io::Result<()> {
 
 fn run_whiteboard(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
     loop {
+        app.pull_collab();
         app.reload_if_changed();
 
         let mut canvas_area = Rect::default();

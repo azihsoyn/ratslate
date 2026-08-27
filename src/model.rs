@@ -145,6 +145,22 @@ impl Canvas {
         }
     }
 
+    /// Bumps the id counter past whatever the current node set already
+    /// uses. Needed after replacing `nodes` wholesale from a CRDT
+    /// snapshot — those ids were minted by some other process's own
+    /// counter, which this one has no other way to know about, and
+    /// without this a freshly placed shape here can collide with one
+    /// that arrived through the merge.
+    pub fn bump_next_id_from_nodes(&mut self) {
+        let max = self
+            .nodes
+            .iter()
+            .filter_map(|n| n.id.strip_prefix('n')?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        self.set_next_id(max + 1);
+    }
+
     pub fn place_text(&mut self, x: u16, y: u16, w: Option<u16>, h: Option<u16>) -> ShapeId {
         let id = self.fresh_id();
         self.nodes.push(Node {

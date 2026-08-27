@@ -7,7 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
-use crate::model::{Canvas, Color, ShapeId};
+use crate::collab::{Collab, NodeFields};
+use crate::model::{Canvas, Color, Node, NodeKind, Shape, ShapeId};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
@@ -223,6 +224,10 @@ pub struct App {
     /// racing a human's in-progress, not-yet-saved work would silently
     /// win.
     dirty: bool,
+    /// Boxes' live CRDT merge state, kept in lockstep with `canvas` —
+    /// every node-affecting dispatch mirrors into it too. `None` with
+    /// no save path (nothing to merge against).
+    collab: Option<Collab>,
 }
 
 impl App {
@@ -243,6 +248,25 @@ impl App {
                 }
             } else {
                 status = format!("new file {}", path.display());
+            }
+        }
+
+        let mut collab = save_path.as_deref().map(Collab::open);
+        if let Some(collab) = &mut collab {
+            let snapshot = collab.snapshot();
+            if snapshot.is_empty() {
+                // First run for this board: seed the CRDT from whatever
+                // the JSON file already had, so later merges have a
+                // common ancestor instead of starting from nothing.
+                for node in &canvas.nodes {
+                    collab.set_node(&node.id, &node_fields(node));
+                }
+            } else {
+                // The CRDT already has state — possibly ahead of the
+                // JSON file, if changes landed through it since the
+                // last explicit save — so it wins for the node set.
+                canvas.nodes = snapshot.into_iter().map(|(id, f)| node_from_fields(id, f)).collect();
+                canvas.bump_next_id_from_nodes();
             }
         }
 
@@ -267,6 +291,7 @@ impl App {
             last_click: None,
             file_mtime,
             dirty: false,
+            collab,
         }
     }
 
@@ -298,12 +323,61 @@ impl App {
         match canvas_io::load(&path) {
             Ok(loaded) => {
                 self.push_undo();
-                self.canvas = loaded;
+                // Nodes live in the CRDT now (merged separately, and
+                // safe to merge even while dirty); only edges still
+                // come from the plain JSON file.
+                self.canvas.edges = loaded.edges;
                 self.selected = None;
                 self.dirty = false;
                 self.status = format!("reloaded {} (changed externally)", path.display());
             }
             Err(e) => self.status = format!("failed to reload {}: {e}", path.display()),
+        }
+    }
+
+    /// Merges in any node changes another writer has made — safe to
+    /// call unconditionally, dirty or not, since CRDT merges never
+    /// discard a local change that hasn't reached disk yet. Skipped
+    /// only mid-gesture, so it can't yank a box out from under an
+    /// active drag.
+    pub fn pull_collab(&mut self) {
+        if self.drag.moving().is_some() || self.drawing.is_some() {
+            return;
+        }
+        let Some(collab) = &mut self.collab else { return };
+        if !collab.pull() {
+            return;
+        }
+        let snapshot = collab.snapshot();
+        self.push_undo();
+        self.canvas.nodes = snapshot.into_iter().map(|(id, f)| node_from_fields(id, f)).collect();
+        self.canvas.bump_next_id_from_nodes();
+        if let Some(Selected::Node(id)) = &self.selected
+            && !self.canvas.nodes.iter().any(|n| &n.id == id)
+        {
+            self.selected = None;
+        }
+        self.status = "merged a change from another writer".to_string();
+    }
+
+    /// Mirrors the current node set into the CRDT so another writer's
+    /// next pull sees it. Called after every mutating dispatch — most
+    /// of them only touch one node or none, but resyncing everything is
+    /// simple, correct, and cheap enough at the size these boards get.
+    fn resync_collab(&mut self) {
+        let Some(collab) = &mut self.collab else { return };
+        let current: std::collections::HashSet<&str> = self.canvas.nodes.iter().map(|n| n.id.as_str()).collect();
+        for node in &self.canvas.nodes {
+            collab.set_node(&node.id, &node_fields(node));
+        }
+        let stale: Vec<String> = collab
+            .snapshot()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| !current.contains(id.as_str()))
+            .collect();
+        for id in stale {
+            collab.remove_node(&id);
         }
     }
 
@@ -349,6 +423,7 @@ impl App {
         self.mode = Mode::Normal;
         self.dirty = true;
         self.status = "undone".to_string();
+        self.resync_collab();
         true
     }
 
@@ -362,17 +437,19 @@ impl App {
         self.mode = Mode::Normal;
         self.dirty = true;
         self.status = "redone".to_string();
+        self.resync_collab();
         true
     }
 
     /// The single place every board mutation goes through, whether it
     /// came from a mouse drag, a keystroke, or `--api`.
     pub fn dispatch(&mut self, req: Request) -> Result<Response, String> {
-        if req.mutates() {
+        let mutates = req.mutates();
+        if mutates {
             self.push_undo();
             self.dirty = true;
         }
-        match req {
+        let result = match req {
             Request::Place { x, y, w, h } => {
                 let id = self.canvas.place_text(x, y, w, h);
                 Ok(Response::Placed { id })
@@ -450,7 +527,11 @@ impl App {
             }
             Request::Undo => Ok(Response::Undone { done: self.undo() }),
             Request::Redo => Ok(Response::Redone { done: self.redo() }),
+        };
+        if mutates {
+            self.resync_collab();
         }
+        result
     }
 
     /// The rectangle a drag-to-place is currently outlining, clamped
@@ -846,4 +927,36 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
 
 fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn node_fields(node: &Node) -> NodeFields {
+    NodeFields {
+        x: node.rect.x as i64,
+        y: node.rect.y as i64,
+        w: node.rect.width as i64,
+        h: node.rect.height as i64,
+        text: match &node.kind {
+            NodeKind::Text(t) => t.clone(),
+            NodeKind::File { path, .. } => format!("[file] {path}"),
+            NodeKind::Link(url) => format!("[link] {url}"),
+            NodeKind::Group { label, .. } => label.clone().unwrap_or_default(),
+        },
+        color: node.color.as_ref().map(|c| c.to_string()),
+        shape: node.shape.as_str().unwrap_or("rectangle").to_string(),
+    }
+}
+
+fn node_from_fields(id: String, f: NodeFields) -> Node {
+    Node {
+        id,
+        rect: Rect::new(
+            f.x.clamp(0, u16::MAX as i64) as u16,
+            f.y.clamp(0, u16::MAX as i64) as u16,
+            f.w.clamp(1, u16::MAX as i64) as u16,
+            f.h.clamp(1, u16::MAX as i64) as u16,
+        ),
+        color: f.color.as_deref().map(Color::parse),
+        shape: Shape::parse(&f.shape),
+        kind: NodeKind::Text(f.text),
+    }
 }

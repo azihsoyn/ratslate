@@ -108,35 +108,12 @@ fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, edit
         base
     };
 
-    let inner = match node.shape {
-        Shape::Rectangle | Shape::Rounded => {
-            let mut block = Block::bordered().border_style(border_style);
-            if node.shape == Shape::Rounded {
-                block = block.border_type(BorderType::Rounded);
-            }
-            let inner = block.inner(node.rect);
-            frame.render_widget(block, node.rect);
-            inner
-        }
-        Shape::Dashed => {
-            draw_dashed(frame, node.rect, border_style);
-            Rect::new(
-                node.rect.x + 1,
-                node.rect.y + 1,
-                node.rect.width.saturating_sub(2),
-                node.rect.height.saturating_sub(2),
-            )
-        }
-        Shape::Note => {
-            draw_note(frame, node.rect, border_style);
-            Rect::new(
-                node.rect.x + 1,
-                node.rect.y + 1,
-                node.rect.width.saturating_sub(2),
-                node.rect.height.saturating_sub(2),
-            )
-        }
-    };
+    let mut block = Block::bordered().border_style(border_style);
+    if node.shape == Shape::Rounded {
+        block = block.border_type(BorderType::Rounded);
+    }
+    let inner = block.inner(node.rect);
+    frame.render_widget(block, node.rect);
 
     let mut text = if editing { editing_text.to_string() } else { display_text(node) };
     if editing {
@@ -204,65 +181,6 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
         .map(|c| Style::default().fg(c))
         .unwrap_or(Style::default().fg(RColor::DarkGray));
     frame.render_widget(Block::bordered().border_style(style), rect);
-}
-
-/// A rectangle with a dashed border — every other cell along each edge
-/// left blank. Corners stay solid so the shape still reads as a box at
-/// a glance.
-fn draw_dashed(frame: &mut Frame, rect: Rect, style: Style) {
-    if rect.width < 2 || rect.height < 2 {
-        frame.render_widget(Block::bordered().border_style(style), rect);
-        return;
-    }
-    let (x0, y0) = (rect.x as i32, rect.y as i32);
-    let (x1, y1) = (rect.right() as i32 - 1, rect.bottom() as i32 - 1);
-    put_char(frame, x0, y0, '┌', style);
-    put_char(frame, x1, y0, '┐', style);
-    put_char(frame, x0, y1, '└', style);
-    put_char(frame, x1, y1, '┘', style);
-    for x in (x0 + 1)..x1 {
-        if (x - x0) % 2 == 1 {
-            put_char(frame, x, y0, '─', style);
-            put_char(frame, x, y1, '─', style);
-        }
-    }
-    // Skipping whole rows can't make a finer dash than one row's worth
-    // of gap, and a cell is tall enough that even 2-on/1-off still read
-    // as sparse. '┊' carries its own dashes within a single cell's
-    // height, so every row gets one — finer than row-skipping could
-    // reach, without leaving the gaps row-skipping was fixing in the
-    // first place.
-    for y in (y0 + 1)..y1 {
-        put_char(frame, x0, y, '┊', style);
-        put_char(frame, x1, y, '┊', style);
-    }
-}
-
-/// A sticky note: a plain rectangle whose top-right corner is a filled
-/// triangle (◥, same diagonal as '\') instead of '┐' — replacing the
-/// corner outright, not cutting a separate cell next to it, so there's
-/// no gap for the fold to visually miss the two straight edges by, and
-/// solid rather than a bare line so it reads as an actual folded-over
-/// flap of paper.
-fn draw_note(frame: &mut Frame, rect: Rect, style: Style) {
-    if rect.width < 3 || rect.height < 2 {
-        frame.render_widget(Block::bordered().border_style(style), rect);
-        return;
-    }
-    let (x0, y0) = (rect.x as i32, rect.y as i32);
-    let (x1, y1) = (rect.right() as i32 - 1, rect.bottom() as i32 - 1);
-    put_char(frame, x0, y0, '┌', style);
-    put_char(frame, x0, y1, '└', style);
-    put_char(frame, x1, y1, '┘', style);
-    put_char(frame, x1, y0, '◥', style);
-    for x in (x0 + 1)..x1 {
-        put_char(frame, x, y0, '─', style);
-        put_char(frame, x, y1, '─', style);
-    }
-    for y in (y0 + 1)..y1 {
-        put_char(frame, x0, y, '│', style);
-        put_char(frame, x1, y, '│', style);
-    }
 }
 
 fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>, reattaching: Option<&(String, Endpoint)>) {

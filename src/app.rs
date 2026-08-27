@@ -82,7 +82,7 @@ pub enum Request {
     /// A JSON Canvas preset "1".."6", a hex string like "#ff8800", or
     /// null to clear it.
     SetColor { id: ShapeId, color: Option<String> },
-    /// "rectangle" (the default), "rounded", "dashed", or "note".
+    /// "rectangle" (the default) or "rounded".
     SetShape { id: ShapeId, shape: String },
     /// Draw an arrow from one box to another.
     Connect { from: ShapeId, to: ShapeId },

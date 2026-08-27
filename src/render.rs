@@ -54,6 +54,10 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         draw_ghost(frame, *rect, color);
     }
 
+    if let Some(rect) = app.drawing_preview() {
+        draw_ghost(frame, rect, None);
+    }
+
     if let Some(HitTarget::Connect(from)) = app.drag.moving()
         && let Some((cx, cy)) = app.drag.cursor()
         && let Some(from_node) = app.canvas.node(from)
@@ -484,7 +488,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
     };
-    let hint = "click to select · dbl-click to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · dbl-click to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

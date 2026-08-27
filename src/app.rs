@@ -73,8 +73,16 @@ pub enum Mode {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    /// Place a new text box, top-left at (x, y).
-    Place { x: u16, y: u16 },
+    /// Place a new text box, top-left at (x, y). `w`/`h` default to the
+    /// usual placed size if omitted.
+    Place {
+        x: u16,
+        y: u16,
+        #[serde(default)]
+        w: Option<u16>,
+        #[serde(default)]
+        h: Option<u16>,
+    },
     /// Replace a box's text outright.
     SetText { id: ShapeId, text: String },
     /// Move and/or resize a box to an exact rectangle.
@@ -197,7 +205,10 @@ pub struct App {
     redo_stack: Vec<Canvas>,
     grab_offset: (u16, u16),
     resize_origin: Option<(ShapeId, Corner, Rect)>,
-    press_on_empty: Option<(u16, u16)>,
+    /// A rectangle being dragged out on empty canvas: (press point,
+    /// point the cursor is at now). `Request::Place` fires on release,
+    /// sized from wherever the two ended up.
+    drawing: Option<((u16, u16), (u16, u16))>,
     press_on_edge: Option<(String, u16, u16)>,
     /// What was last clicked (not dragged) and when, so a second click
     /// on the same thing within `DOUBLE_CLICK` opens it for editing
@@ -240,7 +251,7 @@ impl App {
             redo_stack: Vec::new(),
             grab_offset: (0, 0),
             resize_origin: None,
-            press_on_empty: None,
+            drawing: None,
             press_on_edge: None,
             last_click: None,
         }
@@ -305,8 +316,8 @@ impl App {
             self.push_undo();
         }
         match req {
-            Request::Place { x, y } => {
-                let id = self.canvas.place_text(x, y);
+            Request::Place { x, y, w, h } => {
+                let id = self.canvas.place_text(x, y, w, h);
                 Ok(Response::Placed { id })
             }
             Request::SetText { id, text } => {
@@ -383,6 +394,17 @@ impl App {
             Request::Undo => Ok(Response::Undone { done: self.undo() }),
             Request::Redo => Ok(Response::Redone { done: self.redo() }),
         }
+    }
+
+    /// The rectangle a drag-to-place is currently outlining, clamped
+    /// the same way the box it creates on release will be.
+    pub fn drawing_preview(&self) -> Option<Rect> {
+        let (start, end) = self.drawing?;
+        let x = start.0.min(end.0);
+        let y = start.1.min(end.1);
+        let w = (start.0.max(end.0) - x + 1).max(MIN_W);
+        let h = (start.1.max(end.1) - y + 1).max(MIN_H);
+        Some(Rect::new(x, y, w, h))
     }
 
     /// Where a resize-in-progress would land, for the preview ghost.
@@ -475,25 +497,33 @@ impl App {
                         ev.column.saturating_sub(rect.x),
                         ev.row.saturating_sub(rect.y),
                     );
-                    self.press_on_empty = None;
+                    self.drawing = None;
                     self.press_on_edge = None;
                 }
                 Some(_) => {
-                    self.press_on_empty = None;
+                    self.drawing = None;
                     self.press_on_edge = None;
                 }
                 None => {
                     if let Some((edge_id, _)) = self.edge_hits.at(ev.column, ev.row) {
                         self.press_on_edge = Some((edge_id, ev.column, ev.row));
-                        self.press_on_empty = None;
+                        self.drawing = None;
                     } else {
                         self.press_on_edge = None;
-                        self.press_on_empty = canvas_area
+                        self.drawing = canvas_area
                             .contains(Position::new(ev.column, ev.row))
-                            .then_some((ev.column, ev.row));
+                            .then_some(((ev.column, ev.row), (ev.column, ev.row)));
                     }
                 }
             }
+        }
+
+        if let MouseEventKind::Drag(MouseButton::Left) = ev.kind
+            && let Some((start, _)) = self.drawing
+        {
+            let cx = ev.column.clamp(canvas_area.x, canvas_area.right().saturating_sub(1));
+            let cy = ev.row.clamp(canvas_area.y, canvas_area.bottom().saturating_sub(1));
+            self.drawing = Some((start, (cx, cy)));
         }
 
         match self.drag.on_mouse(ev, hit) {
@@ -591,14 +621,18 @@ impl App {
                 if self.is_double_click(selected.clone()) {
                     self.begin_edit(selected);
                 }
-            } else if let Some((px, py)) = self.press_on_empty.take()
-                && px == ev.column
-                && py == ev.row
-                && let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x: px, y: py })
+            } else if let Some((start, end)) = self.drawing.take()
+                && start != end
             {
-                let selected = Selected::Node(id);
-                self.selected = Some(selected.clone());
-                self.begin_edit(selected);
+                let x = start.0.min(end.0);
+                let y = start.1.min(end.1);
+                let w = (start.0.max(end.0) - x + 1).max(MIN_W);
+                let h = (start.1.max(end.1) - y + 1).max(MIN_H);
+                if let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x, y, w: Some(w), h: Some(h) }) {
+                    let selected = Selected::Node(id);
+                    self.selected = Some(selected.clone());
+                    self.begin_edit(selected);
+                }
             }
         }
     }

@@ -145,11 +145,11 @@ impl Canvas {
         }
     }
 
-    pub fn place_text(&mut self, x: u16, y: u16) -> ShapeId {
+    pub fn place_text(&mut self, x: u16, y: u16, w: Option<u16>, h: Option<u16>) -> ShapeId {
         let id = self.fresh_id();
         self.nodes.push(Node {
             id: id.clone(),
-            rect: Rect::new(x, y, 16, 3),
+            rect: Rect::new(x, y, w.unwrap_or(16), h.unwrap_or(3)),
             color: None,
             shape: Shape::default(),
             kind: NodeKind::Text(String::new()),

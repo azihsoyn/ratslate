@@ -11,10 +11,6 @@ use crate::model::{Canvas, Color, ShapeId};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
-// A diamond needs room to slope in from a corner to the mid-height
-// point on each side; at the plain-rectangle minimum height it has
-// nothing to draw but four isolated corner dots.
-const MIN_DIAMOND_H: u16 = 5;
 const UNDO_LIMIT: usize = 100;
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -86,7 +82,7 @@ pub enum Request {
     /// A JSON Canvas preset "1".."6", a hex string like "#ff8800", or
     /// null to clear it.
     SetColor { id: ShapeId, color: Option<String> },
-    /// "rectangle" (the default), "rounded", or "diamond".
+    /// "rectangle" (the default), "rounded", "dashed", or "note".
     SetShape { id: ShapeId, shape: String },
     /// Draw an arrow from one box to another.
     Connect { from: ShapeId, to: ShapeId },
@@ -332,12 +328,8 @@ impl App {
                 Ok(Response::Ok)
             }
             Request::SetShape { id, shape } => {
-                let shape = crate::model::Shape::parse(&shape);
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
-                node.shape = shape;
-                if shape == crate::model::Shape::Diamond && node.rect.height < MIN_DIAMOND_H {
-                    node.rect.height = MIN_DIAMOND_H;
-                }
+                node.shape = crate::model::Shape::parse(&shape);
                 Ok(Response::Ok)
             }
             Request::Connect { from, to } => {

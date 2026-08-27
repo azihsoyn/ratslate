@@ -46,22 +46,26 @@ pub enum Shape {
     #[default]
     Rectangle,
     Rounded,
-    Diamond,
+    Dashed,
+    /// A rectangle with its top-right corner cut off — a sticky note.
+    Note,
 }
 
 impl Shape {
     pub fn cycle(self) -> Shape {
         match self {
             Shape::Rectangle => Shape::Rounded,
-            Shape::Rounded => Shape::Diamond,
-            Shape::Diamond => Shape::Rectangle,
+            Shape::Rounded => Shape::Dashed,
+            Shape::Dashed => Shape::Note,
+            Shape::Note => Shape::Rectangle,
         }
     }
 
     pub fn parse(s: &str) -> Shape {
         match s {
             "rounded" => Shape::Rounded,
-            "diamond" => Shape::Diamond,
+            "dashed" => Shape::Dashed,
+            "note" => Shape::Note,
             _ => Shape::Rectangle,
         }
     }
@@ -70,7 +74,8 @@ impl Shape {
         match self {
             Shape::Rectangle => None,
             Shape::Rounded => Some("rounded"),
-            Shape::Diamond => Some("diamond"),
+            Shape::Dashed => Some("dashed"),
+            Shape::Note => Some("note"),
         }
     }
 }

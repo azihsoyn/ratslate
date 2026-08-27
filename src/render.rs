@@ -118,8 +118,17 @@ fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, edit
             frame.render_widget(block, node.rect);
             inner
         }
-        Shape::Diamond => {
-            draw_diamond(frame, node.rect, border_style);
+        Shape::Dashed => {
+            draw_dashed(frame, node.rect, border_style);
+            Rect::new(
+                node.rect.x + 1,
+                node.rect.y + 1,
+                node.rect.width.saturating_sub(2),
+                node.rect.height.saturating_sub(2),
+            )
+        }
+        Shape::Note => {
+            draw_note(frame, node.rect, border_style);
             Rect::new(
                 node.rect.x + 1,
                 node.rect.y + 1,
@@ -197,48 +206,56 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
     frame.render_widget(Block::bordered().border_style(style), rect);
 }
 
-/// A rhombus outline, its four straight edges each traced as a
-/// Bresenham line (so they stay 4-connected — a wide, short box makes
-/// for a shallow edge that steps several columns per row, and a single
-/// diagonal character per row leaves that run looking like scattered
-/// dots rather than a line) with a character per cell picked from that
-/// cell's own step direction: a run of same-row steps reads as '-', a
-/// run of same-column steps as '|', and only a cell that actually moved
-/// both ways is '/' or '\'.
-fn draw_diamond(frame: &mut Frame, rect: Rect, style: Style) {
-    let (w, h) = (rect.width as i32, rect.height as i32);
-    if w < 3 || h < 3 {
+/// A rectangle with a dashed border — every other cell along each edge
+/// left blank. Corners stay solid so the shape still reads as a box at
+/// a glance.
+fn draw_dashed(frame: &mut Frame, rect: Rect, style: Style) {
+    if rect.width < 2 || rect.height < 2 {
         frame.render_widget(Block::bordered().border_style(style), rect);
         return;
     }
-    let x0 = rect.x as i32;
-    let y0 = rect.y as i32;
-    let top = (x0 + (w - 1) / 2, y0);
-    let right = (x0 + w - 1, y0 + (h - 1) / 2);
-    let bottom = (x0 + (w - 1) / 2, y0 + h - 1);
-    let left = (x0, y0 + (h - 1) / 2);
-
-    for &(a, b) in &[(top, right), (right, bottom), (bottom, left), (left, top)] {
-        draw_diamond_edge(frame, a, b, style);
+    let (x0, y0) = (rect.x as i32, rect.y as i32);
+    let (x1, y1) = (rect.right() as i32 - 1, rect.bottom() as i32 - 1);
+    put_char(frame, x0, y0, '┌', style);
+    put_char(frame, x1, y0, '┐', style);
+    put_char(frame, x0, y1, '└', style);
+    put_char(frame, x1, y1, '┘', style);
+    for x in (x0 + 1)..x1 {
+        if (x - x0) % 2 == 1 {
+            put_char(frame, x, y0, '─', style);
+            put_char(frame, x, y1, '─', style);
+        }
+    }
+    for y in (y0 + 1)..y1 {
+        if (y - y0) % 2 == 1 {
+            put_char(frame, x0, y, '│', style);
+            put_char(frame, x1, y, '│', style);
+        }
     }
 }
 
-fn draw_diamond_edge(frame: &mut Frame, from: (i32, i32), to: (i32, i32), style: Style) {
-    let cells = line_cells(from.0, from.1, to.0, to.1);
-    for i in 0..cells.len() {
-        let (x, y) = cells[i];
-        let (nx, ny) = cells[if i + 1 < cells.len() { i + 1 } else { i - 1 }];
-        let (dx, dy) = if i + 1 < cells.len() { (nx - x, ny - y) } else { (x - nx, y - ny) };
-        let ch = if dx == 0 {
-            '|'
-        } else if dy == 0 {
-            '-'
-        } else if (dx > 0) == (dy > 0) {
-            '\\'
-        } else {
-            '/'
-        };
-        put_char(frame, x, y, ch, style);
+/// A sticky note: a plain rectangle with its top-right corner cut off
+/// by one diagonal cell, its own corner cell left blank — a fold that
+/// takes exactly one '/' to draw rather than a line at any real slope,
+/// so it can't run into the multi-cell-diagonal problem a diamond does.
+fn draw_note(frame: &mut Frame, rect: Rect, style: Style) {
+    if rect.width < 3 || rect.height < 2 {
+        frame.render_widget(Block::bordered().border_style(style), rect);
+        return;
+    }
+    let (x0, y0) = (rect.x as i32, rect.y as i32);
+    let (x1, y1) = (rect.right() as i32 - 1, rect.bottom() as i32 - 1);
+    put_char(frame, x0, y0, '┌', style);
+    put_char(frame, x0, y1, '└', style);
+    put_char(frame, x1, y1, '┘', style);
+    for x in (x0 + 1)..x1 {
+        put_char(frame, x, y0, '─', style);
+        put_char(frame, x, y1, '─', style);
+    }
+    put_char(frame, x1 - 1, y0, '/', style);
+    for y in (y0 + 1)..y1 {
+        put_char(frame, x0, y, '│', style);
+        put_char(frame, x1, y, '│', style);
     }
 }
 

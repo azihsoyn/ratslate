@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
 use crate::collab::{Collab, EdgeFields, NodeFields};
-use crate::mind_app::MindApp;
 use crate::model::{Canvas, Color, Edge, EdgeEnd, Node, NodeKind, Shape, ShapeId, Side};
 
 const MIN_W: u16 = 5;
@@ -66,10 +65,6 @@ pub enum Selected {
 pub enum Mode {
     Normal,
     Editing(Selected),
-    /// Typing a file box's path rather than a text box's contents — a
-    /// separate mode from `Editing` since committing it means something
-    /// different (`SetFilePath`, not `SetText`).
-    EditingPath(ShapeId),
 }
 
 /// Every way the board can change. The TUI's mouse and key handlers
@@ -79,10 +74,8 @@ pub enum Mode {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    /// Place a new box, top-left at (x, y). `w`/`h` default to the usual
-    /// placed size if omitted. Give `path` to place a file box (opens
-    /// the embedded markdown editor on double-click) instead of a plain
-    /// text one.
+    /// Place a new text box, top-left at (x, y). `w`/`h` default to the
+    /// usual placed size if omitted.
     Place {
         x: u16,
         y: u16,
@@ -90,16 +83,9 @@ pub enum Request {
         w: Option<u16>,
         #[serde(default)]
         h: Option<u16>,
-        #[serde(default)]
-        path: Option<String>,
     },
     /// Replace a box's text outright.
     SetText { id: ShapeId, text: String },
-    /// Turn a box into a file box pointing at `path` (relative to the
-    /// board's own save path), or retarget one that already is.
-    /// Double-clicking a file box opens `path` in the embedded markdown
-    /// editor instead of editing it as text.
-    SetFilePath { id: ShapeId, path: String },
     /// Move and/or resize a box to an exact rectangle.
     SetRect { id: ShapeId, x: u16, y: u16, w: u16, h: u16 },
     /// A JSON Canvas preset "1".."6", a hex string like "#ff8800", or
@@ -233,11 +219,6 @@ pub struct App {
     /// `canvas` — every node- or edge-affecting dispatch mirrors into
     /// it too. `None` with no save path (nothing to merge against).
     collab: Option<Collab>,
-    /// A file box opened for editing takes over the whole screen rather
-    /// than living in its own separate top-level mode — `Some` while
-    /// one's open, covering the canvas until it's closed (Esc) and
-    /// saved back to its own file.
-    pub fullscreen: Option<MindApp>,
 }
 
 impl App {
@@ -305,21 +286,6 @@ impl App {
             press_on_edge: None,
             last_click: None,
             collab,
-            fullscreen: None,
-        }
-    }
-
-    /// Where a file box's `path` points, resolved relative to the
-    /// board's own save location — the same convention JSON Canvas file
-    /// nodes use elsewhere (Obsidian included).
-    fn resolve_file_path(&self, path: &str) -> PathBuf {
-        let p = PathBuf::from(path);
-        if p.is_absolute() {
-            return p;
-        }
-        match self.save_path.as_ref().and_then(|s| s.parent()) {
-            Some(dir) => dir.join(p),
-            None => p,
         }
     }
 
@@ -482,13 +448,8 @@ impl App {
         let mut touched_edge: Option<String> = None;
         let mut removed_edges: Vec<String> = Vec::new();
         let result = match req {
-            Request::Place { x, y, w, h, path } => {
+            Request::Place { x, y, w, h } => {
                 let id = self.canvas.place_text(x, y, w, h);
-                if let Some(path) = path
-                    && let Some(node) = self.canvas.node_mut(&id)
-                {
-                    node.kind = NodeKind::File { path, subpath: None };
-                }
                 touched = Some(id.clone());
                 Ok(Response::Placed { id })
             }
@@ -498,12 +459,6 @@ impl App {
                     t.clear();
                     t.push_str(&text);
                 });
-                touched = Some(id);
-                Ok(Response::Ok)
-            }
-            Request::SetFilePath { id, path } => {
-                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
-                node.kind = NodeKind::File { path, subpath: None };
                 touched = Some(id);
                 Ok(Response::Ok)
             }
@@ -630,34 +585,16 @@ impl App {
     /// acted on, so clicking away from an edit-in-progress can never
     /// lose it the way jumping straight to a different mode used to.
     fn commit_edit(&mut self) {
-        match self.mode.clone() {
-            Mode::Editing(target) => {
-                let text = std::mem::take(&mut self.editing_text);
-                let _ = match target {
-                    Selected::Node(id) => self.dispatch(Request::SetText { id, text }),
-                    Selected::Edge(id) => self.dispatch(Request::SetLabel { id, label: Some(text) }),
-                };
-            }
-            Mode::EditingPath(id) => {
-                let path = std::mem::take(&mut self.editing_text);
-                let _ = self.dispatch(Request::SetFilePath { id, path });
-            }
-            Mode::Normal => return,
-        }
+        let Mode::Editing(target) = self.mode.clone() else { return };
+        let text = std::mem::take(&mut self.editing_text);
+        let _ = match target {
+            Selected::Node(id) => self.dispatch(Request::SetText { id, text }),
+            Selected::Edge(id) => self.dispatch(Request::SetLabel { id, label: Some(text) }),
+        };
         self.mode = Mode::Normal;
     }
 
     fn begin_edit(&mut self, target: Selected) {
-        if let Selected::Node(id) = &target
-            && let Some(NodeKind::File { path, .. }) = self.canvas.node(id).map(|n| &n.kind)
-        {
-            if path.is_empty() {
-                self.status = "no path set on this file box yet — press f to set one".to_string();
-                return;
-            }
-            self.fullscreen = Some(MindApp::new(self.resolve_file_path(path)));
-            return;
-        }
         self.editing_text = match &target {
             Selected::Node(id) => match self.canvas.node(id).map(|n| &n.kind) {
                 Some(NodeKind::Text(t)) => t.clone(),
@@ -851,9 +788,7 @@ impl App {
                 let y = start.1.min(end.1);
                 let w = (start.0.max(end.0) - x + 1).max(MIN_W);
                 let h = (start.1.max(end.1) - y + 1).max(MIN_H);
-                if let Ok(Response::Placed { id }) =
-                    self.dispatch(Request::Place { x, y, w: Some(w), h: Some(h), path: None })
-                {
+                if let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x, y, w: Some(w), h: Some(h) }) {
                     let selected = Selected::Node(id);
                     self.selected = Some(selected.clone());
                     self.begin_edit(selected);
@@ -888,20 +823,6 @@ impl App {
                     if let Selected::Node(id) = &target {
                         self.grow_to_fit(id);
                     }
-                }
-                _ => {}
-            },
-            Mode::EditingPath(id) => match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    let path = std::mem::take(&mut self.editing_text);
-                    let _ = self.dispatch(Request::SetFilePath { id, path });
-                    self.mode = Mode::Normal;
-                }
-                KeyCode::Backspace => {
-                    self.editing_text.pop();
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.editing_text.push(c);
                 }
                 _ => {}
             },
@@ -940,18 +861,6 @@ impl App {
                         let next = node.shape.cycle();
                         let shape = next.as_str().unwrap_or("rectangle").to_string();
                         let _ = self.dispatch(Request::SetShape { id, shape });
-                    }
-                }
-                // Sets (or edits) a file box's path. A plain text box
-                // becomes one; a file box that already has a path
-                // starts from it, so this doubles as "retarget".
-                KeyCode::Char('f') => {
-                    if let Some(Selected::Node(id)) = self.selected.clone() {
-                        self.editing_text = match self.canvas.node(&id).map(|n| &n.kind) {
-                            Some(NodeKind::File { path, .. }) => path.clone(),
-                            _ => String::new(),
-                        };
-                        self.mode = Mode::EditingPath(id);
                     }
                 }
                 KeyCode::Char('d') | KeyCode::Delete => match self.selected.clone() {

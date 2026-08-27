@@ -101,6 +101,11 @@ pub struct MindApp {
     /// a change from outside — a script, `--api`, another editor — can
     /// be told apart from an echo of our own save.
     file_mtime: Option<std::time::SystemTime>,
+    /// Whether the document has changed since it was last loaded or
+    /// saved — an external change must never overwrite this, or a
+    /// script racing a human's in-progress, not-yet-saved edit would
+    /// silently win.
+    dirty: bool,
 }
 
 impl MindApp {
@@ -132,6 +137,7 @@ impl MindApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             file_mtime,
+            dirty: false,
         }
     }
 
@@ -139,13 +145,22 @@ impl MindApp {
     /// process, the same way an undoable edit does, so it can be
     /// Ctrl+Z'd away if it wasn't wanted. Skipped mid-gesture, so an
     /// incoming change can't yank a node out from under an active drag
-    /// or a keystroke out of an active edit.
+    /// or a keystroke out of an active edit — and skipped outright, not
+    /// just deferred, while there are local changes not yet saved: an
+    /// outside change and an unsaved local one are a genuine conflict,
+    /// and silently picking the outside one would erase work the human
+    /// never got a chance to save.
     pub fn reload_if_changed(&mut self) {
         if self.mode != Mode::Normal || self.sort.held().is_some() {
             return;
         }
         let Some(mtime) = mtime_of(&self.save_path) else { return };
         if Some(mtime) == self.file_mtime {
+            return;
+        }
+        if self.dirty {
+            self.file_mtime = Some(mtime);
+            self.status = "external change waiting — save (s) first to keep your own edits".to_string();
             return;
         }
         self.file_mtime = Some(mtime);
@@ -155,6 +170,7 @@ impl MindApp {
                 self.lines = content.lines().map(String::from).collect();
                 self.tree = mindmap::parse(&self.lines);
                 self.selected = None;
+                self.dirty = false;
                 self.status = format!("reloaded {} (changed externally)", self.save_path.display());
             }
             Err(e) => self.status = format!("failed to reload {}: {e}", self.save_path.display()),
@@ -178,6 +194,7 @@ impl MindApp {
         self.tree = mindmap::parse(&self.lines);
         self.selected = None;
         self.mode = Mode::Normal;
+        self.dirty = true;
         self.status = "undone".to_string();
         true
     }
@@ -191,6 +208,7 @@ impl MindApp {
         self.tree = mindmap::parse(&self.lines);
         self.selected = None;
         self.mode = Mode::Normal;
+        self.dirty = true;
         self.status = "redone".to_string();
         true
     }
@@ -205,6 +223,7 @@ impl MindApp {
             Ok(()) => {
                 self.status = format!("saved {}", self.save_path.display());
                 self.file_mtime = mtime_of(&self.save_path);
+                self.dirty = false;
             }
             Err(e) => self.status = format!("save failed: {e}"),
         }
@@ -215,6 +234,7 @@ impl MindApp {
     pub fn dispatch(&mut self, req: Request) -> Result<Response, String> {
         if req.mutates() {
             self.push_undo();
+            self.dirty = true;
         }
         match req {
             Request::Move { id, parent, index } => {

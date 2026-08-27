@@ -218,6 +218,11 @@ pub struct App {
     /// a change from outside — a script, `--api`, another editor — can
     /// be told apart from an echo of our own save.
     file_mtime: Option<std::time::SystemTime>,
+    /// Whether the board has changed since it was last loaded or saved
+    /// — an external change must never overwrite this, or a script
+    /// racing a human's in-progress, not-yet-saved work would silently
+    /// win.
+    dirty: bool,
 }
 
 impl App {
@@ -261,6 +266,7 @@ impl App {
             press_on_edge: None,
             last_click: None,
             file_mtime,
+            dirty: false,
         }
     }
 
@@ -269,7 +275,11 @@ impl App {
     /// something else — the same way an undoable edit does, so it can
     /// be Ctrl+Z'd away if it wasn't wanted. Skipped while anything is
     /// mid-gesture, so an incoming change can't yank a box out from
-    /// under an active drag or a keystroke out of an active edit.
+    /// under an active drag or a keystroke out of an active edit — and
+    /// skipped outright, not just deferred, while there are local
+    /// changes not yet saved: an outside change and an unsaved local
+    /// one are a genuine conflict, and silently picking the outside one
+    /// would erase work the human never got a chance to save.
     pub fn reload_if_changed(&mut self) {
         let Some(path) = self.save_path.clone() else { return };
         if self.mode != Mode::Normal || self.drag.moving().is_some() || self.drawing.is_some() {
@@ -279,12 +289,18 @@ impl App {
         if Some(mtime) == self.file_mtime {
             return;
         }
+        if self.dirty {
+            self.file_mtime = Some(mtime);
+            self.status = "external change waiting — save (s) first to keep your own edits".to_string();
+            return;
+        }
         self.file_mtime = Some(mtime);
         match canvas_io::load(&path) {
             Ok(loaded) => {
                 self.push_undo();
                 self.canvas = loaded;
                 self.selected = None;
+                self.dirty = false;
                 self.status = format!("reloaded {} (changed externally)", path.display());
             }
             Err(e) => self.status = format!("failed to reload {}: {e}", path.display()),
@@ -309,6 +325,7 @@ impl App {
             Ok(()) => {
                 self.status = format!("saved {}", path.display());
                 self.file_mtime = mtime_of(&path);
+                self.dirty = false;
             }
             Err(e) => self.status = format!("save failed: {e}"),
         }
@@ -330,6 +347,7 @@ impl App {
         self.redo_stack.push(std::mem::replace(&mut self.canvas, prev));
         self.selected = None;
         self.mode = Mode::Normal;
+        self.dirty = true;
         self.status = "undone".to_string();
         true
     }
@@ -342,6 +360,7 @@ impl App {
         self.undo_stack.push(std::mem::replace(&mut self.canvas, next));
         self.selected = None;
         self.mode = Mode::Normal;
+        self.dirty = true;
         self.status = "redone".to_string();
         true
     }
@@ -351,6 +370,7 @@ impl App {
     pub fn dispatch(&mut self, req: Request) -> Result<Response, String> {
         if req.mutates() {
             self.push_undo();
+            self.dirty = true;
         }
         match req {
             Request::Place { x, y, w, h } => {

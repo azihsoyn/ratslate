@@ -226,18 +226,22 @@ fn draw_dashed(frame: &mut Frame, rect: Rect, style: Style) {
             put_char(frame, x, y1, '─', style);
         }
     }
+    // A cell is roughly twice as tall as it is wide, so a 1-on/1-off
+    // pattern that reads as an even dash horizontally leaves a much
+    // wider-looking gap running down the sides — 2-on/1-off keeps the
+    // vertical gaps closer to the same visual size.
     for y in (y0 + 1)..y1 {
-        if (y - y0) % 2 == 1 {
+        if (y - y0) % 3 != 0 {
             put_char(frame, x0, y, '│', style);
             put_char(frame, x1, y, '│', style);
         }
     }
 }
 
-/// A sticky note: a plain rectangle with its top-right corner cut off
-/// by one diagonal cell, its own corner cell left blank — a fold that
-/// takes exactly one '/' to draw rather than a line at any real slope,
-/// so it can't run into the multi-cell-diagonal problem a diamond does.
+/// A sticky note: a plain rectangle whose top-right corner is a '\'
+/// instead of '┐' — replacing the corner outright, not cutting a
+/// separate cell next to it, so there's no gap for the diagonal to
+/// visually miss the two straight edges by.
 fn draw_note(frame: &mut Frame, rect: Rect, style: Style) {
     if rect.width < 3 || rect.height < 2 {
         frame.render_widget(Block::bordered().border_style(style), rect);
@@ -248,11 +252,11 @@ fn draw_note(frame: &mut Frame, rect: Rect, style: Style) {
     put_char(frame, x0, y0, '┌', style);
     put_char(frame, x0, y1, '└', style);
     put_char(frame, x1, y1, '┘', style);
+    put_char(frame, x1, y0, '\\', style);
     for x in (x0 + 1)..x1 {
         put_char(frame, x, y0, '─', style);
         put_char(frame, x, y1, '─', style);
     }
-    put_char(frame, x1 - 1, y0, '/', style);
     for y in (y0 + 1)..y1 {
         put_char(frame, x0, y, '│', style);
         put_char(frame, x1, y, '│', style);

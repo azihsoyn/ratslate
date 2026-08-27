@@ -31,6 +31,10 @@ pub enum Request {
     },
     /// Replace a node's own text.
     SetText { id: NodeId, text: String },
+    /// Append a new, empty top-level list item — the only way to start
+    /// a document from nothing, since every other request needs a node
+    /// that already exists to act on.
+    AddItem,
     /// Select a node, or clear the selection with `null`.
     Select { id: Option<NodeId> },
     /// The whole tree.
@@ -56,6 +60,7 @@ impl Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Ok,
+    Added { id: NodeId },
     State { roots: Vec<TreeNode> },
     Saved { path: String },
     Undone { done: bool },
@@ -260,6 +265,13 @@ impl MindApp {
                 self.tree = mindmap::parse(&self.lines);
                 Ok(Response::Ok)
             }
+            Request::AddItem => {
+                self.lines.push("- ".to_string());
+                self.tree = mindmap::parse(&self.lines);
+                let id = *self.tree.roots.last().expect("just pushed a root list item");
+                self.selected = Some(id);
+                Ok(Response::Added { id })
+            }
             Request::Select { id } => {
                 self.selected = id;
                 Ok(Response::Ok)
@@ -330,6 +342,15 @@ impl MindApp {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('s') => {
                     let _ = self.dispatch(Request::Save);
+                }
+                // The only way to get a first node into an empty
+                // document — everything else acts on one that already
+                // exists.
+                KeyCode::Char('a') => {
+                    if let Ok(Response::Added { id }) = self.dispatch(Request::AddItem) {
+                        self.editing_text.clear();
+                        self.mode = Mode::Editing(id);
+                    }
                 }
                 KeyCode::Enter => {
                     if let Some(id) = self.selected

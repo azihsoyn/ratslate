@@ -7,8 +7,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
-use crate::collab::{Collab, NodeFields};
-use crate::model::{Canvas, Color, Node, NodeKind, Shape, ShapeId};
+use crate::collab::{Collab, EdgeFields, NodeFields};
+use crate::mind_app::MindApp;
+use crate::model::{Canvas, Color, Edge, EdgeEnd, Node, NodeKind, Shape, ShapeId, Side};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
@@ -65,6 +66,10 @@ pub enum Selected {
 pub enum Mode {
     Normal,
     Editing(Selected),
+    /// Typing a file box's path rather than a text box's contents — a
+    /// separate mode from `Editing` since committing it means something
+    /// different (`SetFilePath`, not `SetText`).
+    EditingPath(ShapeId),
 }
 
 /// Every way the board can change. The TUI's mouse and key handlers
@@ -74,8 +79,10 @@ pub enum Mode {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    /// Place a new text box, top-left at (x, y). `w`/`h` default to the
-    /// usual placed size if omitted.
+    /// Place a new box, top-left at (x, y). `w`/`h` default to the usual
+    /// placed size if omitted. Give `path` to place a file box (opens
+    /// the embedded markdown editor on double-click) instead of a plain
+    /// text one.
     Place {
         x: u16,
         y: u16,
@@ -83,9 +90,16 @@ pub enum Request {
         w: Option<u16>,
         #[serde(default)]
         h: Option<u16>,
+        #[serde(default)]
+        path: Option<String>,
     },
     /// Replace a box's text outright.
     SetText { id: ShapeId, text: String },
+    /// Turn a box into a file box pointing at `path` (relative to the
+    /// board's own save path), or retarget one that already is.
+    /// Double-clicking a file box opens `path` in the embedded markdown
+    /// editor instead of editing it as text.
+    SetFilePath { id: ShapeId, path: String },
     /// Move and/or resize a box to an exact rectangle.
     SetRect { id: ShapeId, x: u16, y: u16, w: u16, h: u16 },
     /// A JSON Canvas preset "1".."6", a hex string like "#ff8800", or
@@ -215,26 +229,21 @@ pub struct App {
     /// on the same thing within `DOUBLE_CLICK` opens it for editing
     /// instead of just selecting it again.
     last_click: Option<(Selected, std::time::Instant)>,
-    /// The save file's mtime as of our own last read or write of it, so
-    /// a change from outside — a script, `--api`, another editor — can
-    /// be told apart from an echo of our own save.
-    file_mtime: Option<std::time::SystemTime>,
-    /// Whether the board has changed since it was last loaded or saved
-    /// — an external change must never overwrite this, or a script
-    /// racing a human's in-progress, not-yet-saved work would silently
-    /// win.
-    dirty: bool,
-    /// Boxes' live CRDT merge state, kept in lockstep with `canvas` —
-    /// every node-affecting dispatch mirrors into it too. `None` with
-    /// no save path (nothing to merge against).
+    /// The board's live CRDT merge state, kept in lockstep with
+    /// `canvas` — every node- or edge-affecting dispatch mirrors into
+    /// it too. `None` with no save path (nothing to merge against).
     collab: Option<Collab>,
+    /// A file box opened for editing takes over the whole screen rather
+    /// than living in its own separate top-level mode — `Some` while
+    /// one's open, covering the canvas until it's closed (Esc) and
+    /// saved back to its own file.
+    pub fullscreen: Option<MindApp>,
 }
 
 impl App {
     pub fn new(save_path: Option<PathBuf>) -> Self {
         let mut canvas = Canvas::default();
         let mut status = String::new();
-        let mut file_mtime = None;
 
         if let Some(path) = &save_path {
             if path.exists() {
@@ -242,7 +251,6 @@ impl App {
                     Ok(loaded) => {
                         canvas = loaded;
                         status = format!("loaded {}", path.display());
-                        file_mtime = mtime_of(path);
                     }
                     Err(e) => status = format!("failed to load {}: {e}", path.display()),
                 }
@@ -253,8 +261,8 @@ impl App {
 
         let mut collab = save_path.as_deref().map(Collab::open);
         if let Some(collab) = &mut collab {
-            let snapshot = collab.snapshot();
-            if snapshot.is_empty() {
+            let nodes = collab.snapshot();
+            if nodes.is_empty() {
                 // First run for this board: seed the CRDT from whatever
                 // the JSON file already had, so later merges have a
                 // common ancestor instead of starting from nothing.
@@ -265,7 +273,15 @@ impl App {
                 // The CRDT already has state — possibly ahead of the
                 // JSON file, if changes landed through it since the
                 // last explicit save — so it wins for the node set.
-                canvas.nodes = snapshot.into_iter().map(|(id, f)| node_from_fields(id, f)).collect();
+                canvas.nodes = nodes.into_iter().map(|(id, f)| node_from_fields(id, f)).collect();
+            }
+            let edges = collab.snapshot_edges();
+            if edges.is_empty() {
+                for edge in &canvas.edges {
+                    collab.set_edge(&edge.id, &edge_fields(edge));
+                }
+            } else {
+                canvas.edges = edges.into_iter().map(|(id, f)| edge_from_fields(id, f)).collect();
             }
         }
 
@@ -288,71 +304,49 @@ impl App {
             drawing: None,
             press_on_edge: None,
             last_click: None,
-            file_mtime,
-            dirty: false,
             collab,
+            fullscreen: None,
         }
     }
 
-    /// Picks up a change made to the save file from outside this
-    /// process — another `--api` call, a script, a human editing it in
-    /// something else — the same way an undoable edit does, so it can
-    /// be Ctrl+Z'd away if it wasn't wanted. Skipped while anything is
-    /// mid-gesture, so an incoming change can't yank a box out from
-    /// under an active drag or a keystroke out of an active edit — and
-    /// skipped outright, not just deferred, while there are local
-    /// changes not yet saved: an outside change and an unsaved local
-    /// one are a genuine conflict, and silently picking the outside one
-    /// would erase work the human never got a chance to save.
-    pub fn reload_if_changed(&mut self) {
-        let Some(path) = self.save_path.clone() else { return };
-        if self.mode != Mode::Normal || self.drag.moving().is_some() || self.drawing.is_some() {
-            return;
+    /// Where a file box's `path` points, resolved relative to the
+    /// board's own save location — the same convention JSON Canvas file
+    /// nodes use elsewhere (Obsidian included).
+    fn resolve_file_path(&self, path: &str) -> PathBuf {
+        let p = PathBuf::from(path);
+        if p.is_absolute() {
+            return p;
         }
-        let Some(mtime) = mtime_of(&path) else { return };
-        if Some(mtime) == self.file_mtime {
-            return;
-        }
-        if self.dirty {
-            self.file_mtime = Some(mtime);
-            self.status = "external change waiting — save (s) first to keep your own edits".to_string();
-            return;
-        }
-        self.file_mtime = Some(mtime);
-        match canvas_io::load(&path) {
-            Ok(loaded) => {
-                self.push_undo();
-                // Nodes live in the CRDT now (merged separately, and
-                // safe to merge even while dirty); only edges still
-                // come from the plain JSON file.
-                self.canvas.edges = loaded.edges;
-                self.selected = None;
-                self.dirty = false;
-                self.status = format!("reloaded {} (changed externally)", path.display());
-            }
-            Err(e) => self.status = format!("failed to reload {}: {e}", path.display()),
+        match self.save_path.as_ref().and_then(|s| s.parent()) {
+            Some(dir) => dir.join(p),
+            None => p,
         }
     }
 
-    /// Merges in any node changes another writer has made — safe to
-    /// call unconditionally, dirty or not, since CRDT merges never
-    /// discard a local change that hasn't reached disk yet. Skipped
-    /// only mid-gesture, so it can't yank a box out from under an
-    /// active drag.
+    /// Merges in any node or edge changes another writer has made —
+    /// safe to call unconditionally, since CRDT merges never discard a
+    /// local change that hasn't reached disk yet. Skipped only
+    /// mid-gesture, so it can't yank a box out from under an active
+    /// drag or a keystroke out of an active edit.
     pub fn pull_collab(&mut self) {
-        if self.drag.moving().is_some() || self.drawing.is_some() {
+        if self.mode != Mode::Normal || self.drag.moving().is_some() || self.drawing.is_some() {
             return;
         }
         let Some(collab) = &mut self.collab else { return };
         if !collab.pull() {
             return;
         }
-        let snapshot = collab.snapshot();
+        let nodes = collab.snapshot();
+        let edges = collab.snapshot_edges();
         self.push_undo();
-        self.canvas.nodes = snapshot.into_iter().map(|(id, f)| node_from_fields(id, f)).collect();
-        if let Some(Selected::Node(id)) = &self.selected
-            && !self.canvas.nodes.iter().any(|n| &n.id == id)
-        {
+        self.canvas.nodes = nodes.into_iter().map(|(id, f)| node_from_fields(id, f)).collect();
+        self.canvas.edges = edges.into_iter().map(|(id, f)| edge_from_fields(id, f)).collect();
+        let selection_gone = match &self.selected {
+            Some(Selected::Node(id)) => !self.canvas.nodes.iter().any(|n| &n.id == id),
+            Some(Selected::Edge(id)) => !self.canvas.edges.iter().any(|e| &e.id == id),
+            None => false,
+        };
+        if selection_gone {
             self.selected = None;
         }
         self.status = "merged a change from another writer".to_string();
@@ -376,26 +370,50 @@ impl App {
         }
     }
 
-    /// Mirrors the *entire* node set into the CRDT, overwriting whatever
-    /// any other node's entry currently holds. Only safe for undo/redo,
-    /// where the whole point is snapping every node back to this
-    /// process's own recorded snapshot; anywhere else, prefer
-    /// [`Self::sync_node`].
+    /// Same as [`Self::sync_node`], for the one connector a dispatch
+    /// just touched.
+    fn sync_edge(&mut self, id: &str) {
+        let Some(collab) = &mut self.collab else { return };
+        collab.pull();
+        match self.canvas.edge(id) {
+            Some(edge) => collab.set_edge(id, &edge_fields(edge)),
+            None => collab.remove_edge(id),
+        }
+    }
+
+    /// Mirrors the *entire* node and edge set into the CRDT, overwriting
+    /// whatever any other entry currently holds. Only safe for
+    /// undo/redo, where the whole point is snapping everything back to
+    /// this process's own recorded snapshot; anywhere else, prefer
+    /// [`Self::sync_node`] / [`Self::sync_edge`].
     fn resync_collab_full(&mut self) {
         let Some(collab) = &mut self.collab else { return };
         collab.pull();
-        let current: std::collections::HashSet<&str> = self.canvas.nodes.iter().map(|n| n.id.as_str()).collect();
+        let current_nodes: std::collections::HashSet<&str> = self.canvas.nodes.iter().map(|n| n.id.as_str()).collect();
         for node in &self.canvas.nodes {
             collab.set_node(&node.id, &node_fields(node));
         }
-        let stale: Vec<String> = collab
+        let stale_nodes: Vec<String> = collab
             .snapshot()
             .into_iter()
             .map(|(id, _)| id)
-            .filter(|id| !current.contains(id.as_str()))
+            .filter(|id| !current_nodes.contains(id.as_str()))
             .collect();
-        for id in stale {
+        for id in stale_nodes {
             collab.remove_node(&id);
+        }
+        let current_edges: std::collections::HashSet<&str> = self.canvas.edges.iter().map(|e| e.id.as_str()).collect();
+        for edge in &self.canvas.edges {
+            collab.set_edge(&edge.id, &edge_fields(edge));
+        }
+        let stale_edges: Vec<String> = collab
+            .snapshot_edges()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| !current_edges.contains(id.as_str()))
+            .collect();
+        for id in stale_edges {
+            collab.remove_edge(&id);
         }
     }
 
@@ -414,11 +432,7 @@ impl App {
             return;
         };
         match canvas_io::save(&self.canvas, &path) {
-            Ok(()) => {
-                self.status = format!("saved {}", path.display());
-                self.file_mtime = mtime_of(&path);
-                self.dirty = false;
-            }
+            Ok(()) => self.status = format!("saved {}", path.display()),
             Err(e) => self.status = format!("save failed: {e}"),
         }
     }
@@ -439,7 +453,6 @@ impl App {
         self.redo_stack.push(std::mem::replace(&mut self.canvas, prev));
         self.selected = None;
         self.mode = Mode::Normal;
-        self.dirty = true;
         self.status = "undone".to_string();
         self.resync_collab_full();
         true
@@ -453,7 +466,6 @@ impl App {
         self.undo_stack.push(std::mem::replace(&mut self.canvas, next));
         self.selected = None;
         self.mode = Mode::Normal;
-        self.dirty = true;
         self.status = "redone".to_string();
         self.resync_collab_full();
         true
@@ -465,12 +477,18 @@ impl App {
         let mutates = req.mutates();
         if mutates {
             self.push_undo();
-            self.dirty = true;
         }
         let mut touched: Option<ShapeId> = None;
+        let mut touched_edge: Option<String> = None;
+        let mut removed_edges: Vec<String> = Vec::new();
         let result = match req {
-            Request::Place { x, y, w, h } => {
+            Request::Place { x, y, w, h, path } => {
                 let id = self.canvas.place_text(x, y, w, h);
+                if let Some(path) = path
+                    && let Some(node) = self.canvas.node_mut(&id)
+                {
+                    node.kind = NodeKind::File { path, subpath: None };
+                }
                 touched = Some(id.clone());
                 Ok(Response::Placed { id })
             }
@@ -480,6 +498,12 @@ impl App {
                     t.clear();
                     t.push_str(&text);
                 });
+                touched = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetFilePath { id, path } => {
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                node.kind = NodeKind::File { path, subpath: None };
                 touched = Some(id);
                 Ok(Response::Ok)
             }
@@ -504,10 +528,17 @@ impl App {
             Request::Connect { from, to } => {
                 self.canvas.node(&from).ok_or_else(|| format!("no such node: {from}"))?;
                 self.canvas.node(&to).ok_or_else(|| format!("no such node: {to}"))?;
-                self.canvas.connect(from, to);
+                touched_edge = Some(self.canvas.connect(from, to));
                 Ok(Response::Ok)
             }
             Request::Delete { id } => {
+                removed_edges = self
+                    .canvas
+                    .edges
+                    .iter()
+                    .filter(|e| e.from == id || e.to == id)
+                    .map(|e| e.id.clone())
+                    .collect();
                 self.canvas.delete(&id);
                 if self.selected == Some(Selected::Node(id.clone())) {
                     self.selected = None;
@@ -518,13 +549,15 @@ impl App {
             Request::SetLabel { id, label } => {
                 let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
                 edge.label = label.filter(|l| !l.is_empty());
+                touched_edge = Some(id);
                 Ok(Response::Ok)
             }
             Request::DeleteEdge { id } => {
                 self.canvas.delete_edge(&id);
-                if self.selected == Some(Selected::Edge(id)) {
+                if self.selected == Some(Selected::Edge(id.clone())) {
                     self.selected = None;
                 }
+                removed_edges.push(id);
                 Ok(Response::Ok)
             }
             Request::Reattach { id, end, node } => {
@@ -537,6 +570,7 @@ impl App {
                     "to" => edge.to = node,
                     other => return Err(format!("end must be \"from\" or \"to\", got {other:?}")),
                 }
+                touched_edge = Some(id);
                 Ok(Response::Ok)
             }
             Request::Select { id } => {
@@ -553,8 +587,16 @@ impl App {
             Request::Undo => Ok(Response::Undone { done: self.undo() }),
             Request::Redo => Ok(Response::Redone { done: self.redo() }),
         };
-        if let (true, Some(id)) = (result.is_ok(), &touched) {
-            self.sync_node(id);
+        if result.is_ok() {
+            if let Some(id) = &touched {
+                self.sync_node(id);
+            }
+            if let Some(id) = &touched_edge {
+                self.sync_edge(id);
+            }
+            for id in &removed_edges {
+                self.sync_edge(id);
+            }
         }
         result
     }
@@ -588,19 +630,37 @@ impl App {
     /// acted on, so clicking away from an edit-in-progress can never
     /// lose it the way jumping straight to a different mode used to.
     fn commit_edit(&mut self) {
-        let Mode::Editing(target) = self.mode.clone() else { return };
-        let text = std::mem::take(&mut self.editing_text);
-        let _ = match target {
-            Selected::Node(id) => self.dispatch(Request::SetText { id, text }),
-            Selected::Edge(id) => self.dispatch(Request::SetLabel { id, label: Some(text) }),
-        };
+        match self.mode.clone() {
+            Mode::Editing(target) => {
+                let text = std::mem::take(&mut self.editing_text);
+                let _ = match target {
+                    Selected::Node(id) => self.dispatch(Request::SetText { id, text }),
+                    Selected::Edge(id) => self.dispatch(Request::SetLabel { id, label: Some(text) }),
+                };
+            }
+            Mode::EditingPath(id) => {
+                let path = std::mem::take(&mut self.editing_text);
+                let _ = self.dispatch(Request::SetFilePath { id, path });
+            }
+            Mode::Normal => return,
+        }
         self.mode = Mode::Normal;
     }
 
     fn begin_edit(&mut self, target: Selected) {
+        if let Selected::Node(id) = &target
+            && let Some(NodeKind::File { path, .. }) = self.canvas.node(id).map(|n| &n.kind)
+        {
+            if path.is_empty() {
+                self.status = "no path set on this file box yet — press f to set one".to_string();
+                return;
+            }
+            self.fullscreen = Some(MindApp::new(self.resolve_file_path(path)));
+            return;
+        }
         self.editing_text = match &target {
             Selected::Node(id) => match self.canvas.node(id).map(|n| &n.kind) {
-                Some(crate::model::NodeKind::Text(t)) => t.clone(),
+                Some(NodeKind::Text(t)) => t.clone(),
                 _ => String::new(),
             },
             Selected::Edge(id) => self.canvas.edge(id).and_then(|e| e.label.clone()).unwrap_or_default(),
@@ -791,7 +851,9 @@ impl App {
                 let y = start.1.min(end.1);
                 let w = (start.0.max(end.0) - x + 1).max(MIN_W);
                 let h = (start.1.max(end.1) - y + 1).max(MIN_H);
-                if let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x, y, w: Some(w), h: Some(h) }) {
+                if let Ok(Response::Placed { id }) =
+                    self.dispatch(Request::Place { x, y, w: Some(w), h: Some(h), path: None })
+                {
                     let selected = Selected::Node(id);
                     self.selected = Some(selected.clone());
                     self.begin_edit(selected);
@@ -826,6 +888,20 @@ impl App {
                     if let Selected::Node(id) = &target {
                         self.grow_to_fit(id);
                     }
+                }
+                _ => {}
+            },
+            Mode::EditingPath(id) => match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    let path = std::mem::take(&mut self.editing_text);
+                    let _ = self.dispatch(Request::SetFilePath { id, path });
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Backspace => {
+                    self.editing_text.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.editing_text.push(c);
                 }
                 _ => {}
             },
@@ -864,6 +940,18 @@ impl App {
                         let next = node.shape.cycle();
                         let shape = next.as_str().unwrap_or("rectangle").to_string();
                         let _ = self.dispatch(Request::SetShape { id, shape });
+                    }
+                }
+                // Sets (or edits) a file box's path. A plain text box
+                // becomes one; a file box that already has a path
+                // starts from it, so this doubles as "retarget".
+                KeyCode::Char('f') => {
+                    if let Some(Selected::Node(id)) = self.selected.clone() {
+                        self.editing_text = match self.canvas.node(&id).map(|n| &n.kind) {
+                            Some(NodeKind::File { path, .. }) => path.clone(),
+                            _ => String::new(),
+                        };
+                        self.mode = Mode::EditingPath(id);
                     }
                 }
                 KeyCode::Char('d') | KeyCode::Delete => match self.selected.clone() {
@@ -950,28 +1038,34 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
     content_lines.max(1) + 2
 }
 
-fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).ok()?.modified().ok()
-}
-
 fn node_fields(node: &Node) -> NodeFields {
+    let (kind, text) = match &node.kind {
+        NodeKind::Text(t) => ("text", t.clone()),
+        // `subpath` doesn't round-trip — no board so far has used it,
+        // and it's not worth a ninth CRDT field until one does.
+        NodeKind::File { path, .. } => ("file", path.clone()),
+        NodeKind::Link(url) => ("link", url.clone()),
+        NodeKind::Group { label, .. } => ("group", label.clone().unwrap_or_default()),
+    };
     NodeFields {
         x: node.rect.x as i64,
         y: node.rect.y as i64,
         w: node.rect.width as i64,
         h: node.rect.height as i64,
-        text: match &node.kind {
-            NodeKind::Text(t) => t.clone(),
-            NodeKind::File { path, .. } => format!("[file] {path}"),
-            NodeKind::Link(url) => format!("[link] {url}"),
-            NodeKind::Group { label, .. } => label.clone().unwrap_or_default(),
-        },
+        text,
         color: node.color.as_ref().map(|c| c.to_string()),
         shape: node.shape.as_str().unwrap_or("rectangle").to_string(),
+        kind: kind.to_string(),
     }
 }
 
 fn node_from_fields(id: String, f: NodeFields) -> Node {
+    let kind = match f.kind.as_str() {
+        "file" => NodeKind::File { path: f.text, subpath: None },
+        "link" => NodeKind::Link(f.text),
+        "group" => NodeKind::Group { label: Some(f.text).filter(|s| !s.is_empty()), background: None, background_style: None },
+        _ => NodeKind::Text(f.text),
+    };
     Node {
         id,
         rect: Rect::new(
@@ -982,6 +1076,66 @@ fn node_from_fields(id: String, f: NodeFields) -> Node {
         ),
         color: f.color.as_deref().map(Color::parse),
         shape: Shape::parse(&f.shape),
-        kind: NodeKind::Text(f.text),
+        kind,
+    }
+}
+
+fn edge_fields(edge: &Edge) -> EdgeFields {
+    EdgeFields {
+        from: edge.from.clone(),
+        to: edge.to.clone(),
+        from_side: edge.from_side.map(side_to_string).map(str::to_string),
+        to_side: edge.to_side.map(side_to_string).map(str::to_string),
+        from_end: edge_end_to_string(edge.from_end).to_string(),
+        to_end: edge_end_to_string(edge.to_end).to_string(),
+        color: edge.color.as_ref().map(|c| c.to_string()),
+        label: edge.label.clone(),
+    }
+}
+
+fn edge_from_fields(id: String, f: EdgeFields) -> Edge {
+    Edge {
+        id,
+        from: f.from,
+        from_side: f.from_side.as_deref().and_then(parse_side),
+        from_end: parse_edge_end(&f.from_end),
+        to: f.to,
+        to_side: f.to_side.as_deref().and_then(parse_side),
+        to_end: parse_edge_end(&f.to_end),
+        color: f.color.as_deref().map(Color::parse),
+        label: f.label,
+    }
+}
+
+fn side_to_string(s: Side) -> &'static str {
+    match s {
+        Side::Top => "top",
+        Side::Right => "right",
+        Side::Bottom => "bottom",
+        Side::Left => "left",
+    }
+}
+
+fn parse_side(s: &str) -> Option<Side> {
+    match s {
+        "top" => Some(Side::Top),
+        "right" => Some(Side::Right),
+        "bottom" => Some(Side::Bottom),
+        "left" => Some(Side::Left),
+        _ => None,
+    }
+}
+
+fn edge_end_to_string(e: EdgeEnd) -> &'static str {
+    match e {
+        EdgeEnd::None => "none",
+        EdgeEnd::Arrow => "arrow",
+    }
+}
+
+fn parse_edge_end(s: &str) -> EdgeEnd {
+    match s {
+        "arrow" => EdgeEnd::Arrow,
+        _ => EdgeEnd::None,
     }
 }

@@ -1,14 +1,11 @@
-//! Boxes as a CRDT (yrs, the Rust port of Yjs), synced through a sidecar
-//! file next to the board's own `.canvas`. A human dragging a box in the
-//! TUI and an agent placing one through `--api` both mutate their own
-//! local `Doc` and persist its full state; either side picking up the
-//! other's file merges rather than overwrites, so two writers working
-//! on different boxes (or even different fields of the same box) never
-//! have to choose whose change wins the way a whole-file save would.
-//!
-//! Edges aren't part of this yet — they still go through the plain
-//! JSON-Canvas reload path, which refuses to clobber unsaved local
-//! work rather than merging it.
+//! Boxes and connectors as a CRDT (yrs, the Rust port of Yjs), synced
+//! through a sidecar file next to the board's own `.canvas`. A human
+//! dragging a box in the TUI and an agent placing one through `--api`
+//! both mutate their own local `Doc` and persist its full state; either
+//! side picking up the other's file merges rather than overwrites, so
+//! two writers working on different boxes (or even different fields of
+//! the same box) never have to choose whose change wins the way a
+//! whole-file save would.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,14 +39,32 @@ pub struct NodeFields {
     pub y: i64,
     pub w: i64,
     pub h: i64,
+    /// The node's own content — display text for a text box, a path for
+    /// a file box, a URL for a link, a label for a group. Which one
+    /// `kind` says.
     pub text: String,
     pub color: Option<String>,
     pub shape: String,
+    /// "text" | "file" | "link" | "group".
+    pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EdgeFields {
+    pub from: String,
+    pub to: String,
+    pub from_side: Option<String>,
+    pub to_side: Option<String>,
+    pub from_end: String,
+    pub to_end: String,
+    pub color: Option<String>,
+    pub label: Option<String>,
 }
 
 pub struct Collab {
     doc: Doc,
     nodes: MapRef,
+    edges: MapRef,
     path: PathBuf,
     mtime: Option<SystemTime>,
 }
@@ -70,7 +85,8 @@ impl Collab {
     pub fn open(canvas_path: &Path) -> Self {
         let doc = Doc::with_client_id(random_client_id());
         let nodes = doc.get_or_insert_map("nodes");
-        let mut collab = Collab { doc, nodes, path: crdt_path(canvas_path), mtime: None };
+        let edges = doc.get_or_insert_map("edges");
+        let mut collab = Collab { doc, nodes, edges, path: crdt_path(canvas_path), mtime: None };
         collab.pull();
         collab
     }
@@ -104,7 +120,7 @@ impl Collab {
             Some(c) => Any::String(Arc::from(c.as_str())),
             None => Any::Null,
         };
-        let entry: [(Arc<str>, In); 7] = [
+        let entry: [(Arc<str>, In); 8] = [
             (Arc::from("x"), In::Any(Any::BigInt(f.x))),
             (Arc::from("y"), In::Any(Any::BigInt(f.y))),
             (Arc::from("w"), In::Any(Any::BigInt(f.w))),
@@ -112,6 +128,7 @@ impl Collab {
             (Arc::from("text"), In::Any(Any::String(Arc::from(f.text.as_str())))),
             (Arc::from("color"), In::Any(color)),
             (Arc::from("shape"), In::Any(Any::String(Arc::from(f.shape.as_str())))),
+            (Arc::from("kind"), In::Any(Any::String(Arc::from(f.kind.as_str())))),
         ];
         {
             let mut txn = self.doc.transact_mut();
@@ -157,6 +174,69 @@ impl Collab {
                     text: get_str("text"),
                     color,
                     shape: get_str("shape"),
+                    kind: get_str("kind"),
+                },
+            ));
+        }
+        out
+    }
+
+    /// Upserts a connector's full field set as one map, then persists.
+    pub fn set_edge(&mut self, id: &str, f: &EdgeFields) {
+        let opt_string = |v: &Option<String>| match v {
+            Some(s) => Any::String(Arc::from(s.as_str())),
+            None => Any::Null,
+        };
+        let entry: [(Arc<str>, In); 8] = [
+            (Arc::from("from"), In::Any(Any::String(Arc::from(f.from.as_str())))),
+            (Arc::from("to"), In::Any(Any::String(Arc::from(f.to.as_str())))),
+            (Arc::from("from_side"), In::Any(opt_string(&f.from_side))),
+            (Arc::from("to_side"), In::Any(opt_string(&f.to_side))),
+            (Arc::from("from_end"), In::Any(Any::String(Arc::from(f.from_end.as_str())))),
+            (Arc::from("to_end"), In::Any(Any::String(Arc::from(f.to_end.as_str())))),
+            (Arc::from("color"), In::Any(opt_string(&f.color))),
+            (Arc::from("label"), In::Any(opt_string(&f.label))),
+        ];
+        {
+            let mut txn = self.doc.transact_mut();
+            self.edges.insert(&mut txn, id, MapPrelim::from(entry));
+        }
+        self.persist();
+    }
+
+    pub fn remove_edge(&mut self, id: &str) {
+        {
+            let mut txn = self.doc.transact_mut();
+            self.edges.remove(&mut txn, id);
+        }
+        self.persist();
+    }
+
+    /// The merged state of every connector right now.
+    pub fn snapshot_edges(&self) -> Vec<(String, EdgeFields)> {
+        let txn = self.doc.transact();
+        let mut out = Vec::new();
+        for (key, value) in self.edges.iter(&txn) {
+            let Any::Map(fields) = value.to_json(&txn) else { continue };
+            let get_str = |k: &str| match fields.get(k) {
+                Some(Any::String(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            let get_opt_str = |k: &str| match fields.get(k) {
+                Some(Any::String(s)) => Some(s.to_string()),
+                _ => None,
+            };
+            out.push((
+                key.to_string(),
+                EdgeFields {
+                    from: get_str("from"),
+                    to: get_str("to"),
+                    from_side: get_opt_str("from_side"),
+                    to_side: get_opt_str("to_side"),
+                    from_end: get_str("from_end"),
+                    to_end: get_str("to_end"),
+                    color: get_opt_str("color"),
+                    label: get_opt_str("label"),
                 },
             ));
         }

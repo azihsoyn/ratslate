@@ -84,21 +84,41 @@ fn main() -> io::Result<()> {
 fn run_whiteboard(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
     loop {
         app.pull_collab();
-        app.reload_if_changed();
+        if let Some(mind) = &mut app.fullscreen {
+            mind.reload_if_changed();
+        }
 
         let mut canvas_area = Rect::default();
         terminal.draw(|frame| {
             let full = frame.area();
             let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(full);
             canvas_area = chunks[0];
-            render::render(frame, app, chunks[0], chunks[1]);
+            match &mut app.fullscreen {
+                // A file box opened for editing covers the whole screen
+                // rather than living in its own separate top-level mode.
+                Some(mind) => mind_render::render(frame, mind, chunks[0], chunks[1]),
+                None => render::render(frame, app, chunks[0], chunks[1]),
+            }
         })?;
 
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => app.on_key(key),
-                Event::Mouse(mouse) => app.on_mouse(mouse, canvas_area),
-                _ => {}
+            let event = event::read()?;
+            if let Some(mind) = &mut app.fullscreen {
+                match event {
+                    Event::Key(key) => mind.on_key(key),
+                    Event::Mouse(mouse) => mind.on_mouse(mouse),
+                    _ => {}
+                }
+                if mind.should_quit {
+                    mind.save();
+                    app.fullscreen = None;
+                }
+            } else {
+                match event {
+                    Event::Key(key) => app.on_key(key),
+                    Event::Mouse(mouse) => app.on_mouse(mouse, canvas_area),
+                    _ => {}
+                }
             }
         }
 

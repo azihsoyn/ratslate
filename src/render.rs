@@ -45,7 +45,8 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             app.hits.put(rect, HitTarget::Resize(node.id.clone(), corner));
         }
         let selected = matches!(&app.selected, Some(Selected::Node(id)) if id == &node.id);
-        let editing = matches!(&app.mode, Mode::Editing(Selected::Node(id)) if id == &node.id);
+        let editing = matches!(&app.mode, Mode::Editing(Selected::Node(id)) if id == &node.id)
+            || matches!(&app.mode, Mode::EditingPath(id) if id == &node.id);
         draw_node(frame, node, selected, editing, &app.editing_text);
     }
 
@@ -487,8 +488,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let mode = match &app.mode {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
+        Mode::EditingPath(_) => "FILE PATH (Enter/Esc to set)",
     };
-    let hint = "drag empty space to place · click to select · dbl-click to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · dbl-click to edit (or open a file box) · drag move · shift+drag connect · corner resize · esc then c color / x shape / f file path / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

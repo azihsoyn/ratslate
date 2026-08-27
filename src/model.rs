@@ -173,10 +173,10 @@ impl Canvas {
         self.nodes.iter_mut().find(|n| n.id == id)
     }
 
-    pub fn connect(&mut self, from: ShapeId, to: ShapeId) {
+    pub fn connect(&mut self, from: ShapeId, to: ShapeId) -> String {
         let id = fresh_id();
         self.edges.push(Edge {
-            id,
+            id: id.clone(),
             from,
             from_side: None,
             from_end: EdgeEnd::None,
@@ -186,6 +186,7 @@ impl Canvas {
             color: None,
             label: None,
         });
+        id
     }
 
     pub fn delete(&mut self, id: &str) {

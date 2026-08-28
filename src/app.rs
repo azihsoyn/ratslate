@@ -219,6 +219,10 @@ pub struct App {
     /// be its own selected one, since the button that opens it only
     /// renders next to that one.
     pub color_picker: Option<ShapeId>,
+    /// The swatch the cursor is over right now, if any — its color
+    /// previews on the actual box while hovered, so picking one isn't
+    /// a guess. `Some((id, None))` previews clearing the color.
+    pub hover_swatch: Option<(ShapeId, Option<Color>)>,
     pub mode: Mode,
     pub editing_text: String,
     pub should_quit: bool,
@@ -299,6 +303,7 @@ impl App {
             edge_hits: Hits::new(),
             selected: None,
             color_picker: None,
+            hover_swatch: None,
             mode: Mode::Normal,
             editing_text: String::new(),
             should_quit: false,
@@ -685,6 +690,13 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, ev: MouseEvent, canvas_area: Rect) {
+        if let MouseEventKind::Moved = ev.kind {
+            self.hover_swatch = match self.hits.at(ev.column, ev.row) {
+                Some((HitTarget::ColorSwatch(id, color), _)) => Some((id, color.map(|c| Color::parse(&c)))),
+                _ => None,
+            };
+        }
+
         let mut hit = self.hits.at(ev.column, ev.row);
 
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
@@ -736,6 +748,7 @@ impl App {
         match self.drag.on_mouse(ev, hit) {
             Did::Click(HitTarget::Reattach(edge_id, _)) => {
                 self.color_picker = None;
+                self.hover_swatch = None;
                 let selected = Selected::Edge(edge_id);
                 let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
                 if self.is_double_click(selected.clone()) {
@@ -744,13 +757,16 @@ impl App {
             }
             Did::Click(HitTarget::ColorMenu(id)) => {
                 self.color_picker = if self.color_picker.as_ref() == Some(&id) { None } else { Some(id) };
+                self.hover_swatch = None;
             }
             Did::Click(HitTarget::ColorSwatch(id, color)) => {
                 let _ = self.dispatch(Request::SetColor { id, color });
                 self.color_picker = None;
+                self.hover_swatch = None;
             }
             Did::Click(target) => {
                 self.color_picker = None;
+                self.hover_swatch = None;
                 let selected = Selected::Node(target.node_id().expect("only Reattach lacks a node").clone());
                 let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
                 if self.is_double_click(selected.clone()) {
@@ -955,7 +971,7 @@ impl App {
                 },
                 KeyCode::Esc => {
                     if self.color_picker.take().is_some() {
-                        // just closes the picker
+                        self.hover_swatch = None;
                     } else if self.selected.is_some() {
                         let _ = self.dispatch(Request::Select { id: None });
                     } else {

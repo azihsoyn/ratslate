@@ -46,7 +46,12 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         }
         let selected = matches!(&app.selected, Some(Selected::Node(id)) if id == &node.id);
         let editing = matches!(&app.mode, Mode::Editing(Selected::Node(id)) if id == &node.id);
-        draw_node(frame, node, selected, editing, &app.editing_text);
+        let preview = app
+            .hover_swatch
+            .as_ref()
+            .filter(|(id, _)| id == &node.id)
+            .map(|(_, color)| color.as_ref().map(ratatui_color));
+        draw_node(frame, node, selected, editing, &app.editing_text, preview);
     }
 
     if let Some(Selected::Node(id)) = app.selected.clone()
@@ -56,7 +61,11 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         let button = Rect::new(bx, by, 1, 1).intersection(canvas_area);
         if !button.is_empty() {
             app.hits.put(button, HitTarget::ColorMenu(id.clone()));
-            frame.render_widget(Paragraph::new("▾").style(Style::default().fg(RColor::DarkGray)), button);
+            // Filled with the box's own color, so the button doubles as
+            // a preview of what's currently set — not just a dropdown
+            // that happens to sit there.
+            let dot_color = node.color.as_ref().map(ratatui_color).unwrap_or(RColor::White);
+            frame.render_widget(Paragraph::new("●").style(Style::default().fg(dot_color)), button);
         }
         if app.color_picker.as_deref() == Some(id.as_str()) {
             draw_color_picker(frame, app, &id, bx, by + 1, canvas_area);
@@ -110,18 +119,23 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
     draw_status(frame, app, status_area);
 }
 
-fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, editing_text: &str) {
-    let base = node
-        .color
-        .as_ref()
-        .map(ratatui_color)
-        .map(|c| Style::default().fg(c))
-        .unwrap_or_default();
+/// `preview`, while a color picker swatch is hovered, is the color it
+/// would apply — shown as if it already had, so picking one isn't a
+/// guess. `Some(None)` previews clearing the color; `None` (outer)
+/// means nothing's hovered, so the node's own color shows as normal.
+fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, editing_text: &str, preview: Option<Option<RColor>>) {
+    let shown = match preview {
+        Some(p) => p,
+        None => node.color.as_ref().map(ratatui_color),
+    };
+    let base = shown.map(|c| Style::default().fg(c)).unwrap_or_default();
     // Bold-on-whatever-color-it-already-has is easy to miss, especially
-    // on a node with no color set at all — selection gets its own fixed
-    // color so it always reads clearly.
+    // on a node with no color set at all — selection stays bold and
+    // falls back to its own fixed color only when the node has none,
+    // so picking a new color while still selected actually shows it
+    // instead of selection's own color masking it.
     let border_style = if selected {
-        Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD)
+        Style::default().fg(shown.unwrap_or(RColor::Cyan)).add_modifier(Modifier::BOLD)
     } else {
         base
     };

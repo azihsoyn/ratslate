@@ -34,7 +34,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         _ => None,
     };
 
-    draw_edges(frame, app, live_rect.as_ref(), reattaching.as_ref());
+    draw_edges(frame, app, live_rect.as_ref(), reattaching.as_ref(), canvas_area);
 
     for node in &app.canvas.nodes {
         if hidden_id.as_deref() == Some(node.id.as_str()) {
@@ -46,10 +46,11 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         }
         let selected = matches!(&app.selected, Some(Selected::Node(id)) if id == &node.id);
         let editing = matches!(&app.mode, Mode::Editing(Selected::Node(id)) if id == &node.id);
+        let target = Selected::Node(node.id.clone());
         let preview = app
             .hover_swatch
             .as_ref()
-            .filter(|(id, _)| id == &node.id)
+            .filter(|(t, _)| t == &target)
             .map(|(_, color)| color.as_ref().map(ratatui_color));
         draw_node(frame, node, selected, editing, &app.editing_text, preview);
     }
@@ -57,18 +58,19 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
     if let Some(Selected::Node(id)) = app.selected.clone()
         && let Some(node) = app.canvas.node(&id)
     {
+        let target = Selected::Node(id.clone());
         let (bx, by) = (node.rect.right(), node.rect.y);
         let button = Rect::new(bx, by, 1, 1).intersection(canvas_area);
         if !button.is_empty() {
-            app.hits.put(button, HitTarget::ColorMenu(id.clone()));
+            app.hits.put(button, HitTarget::ColorMenu(target.clone()));
             // Filled with the box's own color, so the button doubles as
             // a preview of what's currently set — not just a dropdown
             // that happens to sit there.
             let dot_color = node.color.as_ref().map(ratatui_color).unwrap_or(RColor::White);
             frame.render_widget(Paragraph::new("●").style(Style::default().fg(dot_color)), button);
         }
-        if app.color_picker.as_deref() == Some(id.as_str()) {
-            draw_color_picker(frame, app, &id, bx, by + 1, canvas_area);
+        if app.color_picker.as_ref() == Some(&target) {
+            draw_color_picker(frame, app, target, bx, by + 1, canvas_area);
         }
     }
 
@@ -179,13 +181,13 @@ const HEX_SWATCHES: [&str; 6] = ["#ffffff", "#000000", "#808080", "#ff69b4", "#3
 /// Two rows below the color menu button: clear + the 6 presets, then 6
 /// extra hex swatches. Each swatch is its own hit target, registered
 /// fresh every frame like everything else `render` draws.
-fn draw_color_picker(frame: &mut Frame, app: &mut App, id: &str, x: u16, y: u16, canvas_area: Rect) {
+fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16, y: u16, canvas_area: Rect) {
     let mut put_swatch = |cx: u16, cy: u16, label: &str, style: Style, color: Option<String>| {
         let rect = Rect::new(cx, cy, 2, 1).intersection(canvas_area);
         if rect.is_empty() {
             return;
         }
-        app.hits.put(rect, HitTarget::ColorSwatch(id.to_string(), color));
+        app.hits.put(rect, HitTarget::ColorSwatch(target.clone(), color));
         frame.render_widget(Paragraph::new(label).style(style), rect);
     };
 
@@ -246,7 +248,13 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
     frame.render_widget(Block::bordered().border_style(style), rect);
 }
 
-fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>, reattaching: Option<&(String, Endpoint)>) {
+fn draw_edges(
+    frame: &mut Frame,
+    app: &mut App,
+    live: Option<&(String, Rect)>,
+    reattaching: Option<&(String, Endpoint)>,
+    canvas_area: Rect,
+) {
     let rect_of = |id: &str| -> Option<Rect> {
         live.filter(|(live_id, _)| live_id == id)
             .map(|(_, r)| *r)
@@ -314,15 +322,21 @@ fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>, r
         if reattaching.is_some_and(|(id, _)| id == &edge_id) {
             continue;
         }
-        let selected = app.selected == Some(Selected::Edge(edge_id.clone()));
+        let target = Selected::Edge(edge_id.clone());
+        let selected = app.selected == Some(target.clone());
         let editing = matches!(&app.mode, Mode::Editing(Selected::Edge(id)) if id == &edge_id);
-        let mut style = color
+        let preview = app
+            .hover_swatch
             .as_ref()
-            .map(ratatui_color)
-            .map(|c| Style::default().fg(c))
-            .unwrap_or_default();
+            .filter(|(t, _)| t == &target)
+            .map(|(_, c)| c.as_ref().map(ratatui_color));
+        let shown_color = match preview {
+            Some(p) => p,
+            None => color.as_ref().map(ratatui_color),
+        };
+        let mut style = shown_color.map(|c| Style::default().fg(c)).unwrap_or_default();
         if selected {
-            style = style.fg(RColor::Cyan).add_modifier(Modifier::BOLD);
+            style = Style::default().fg(shown_color.unwrap_or(RColor::Cyan)).add_modifier(Modifier::BOLD);
         }
         let waypoints = route(from_rect, to_rect, from_frac[i], to_frac[i], explicit_sides);
         let glyphs: Vec<(i32, i32, char)> = route_glyphs(&waypoints)
@@ -351,16 +365,33 @@ fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>, r
             put_char(frame, waypoints[0].0, waypoints[0].1, arrow_char(dx, dy), style);
         }
 
+        let (mx, my) = glyphs.get(glyphs.len() / 2).map(|&(x, y, _)| (x, y)).unwrap_or(waypoints[0]);
+
         let shown = if editing {
             Some(format!("{}▏", app.editing_text))
         } else {
             label.filter(|l| !l.is_empty())
         };
-        if let Some(shown) = shown {
-            let (mx, my) = glyphs.get(glyphs.len() / 2).map(|&(x, y, _)| (x, y)).unwrap_or(waypoints[0]);
-            if mx >= 0 && my >= 0 {
-                let width = shown.chars().count().min(u16::MAX as usize) as u16;
-                frame.render_widget(Paragraph::new(shown).style(style), Rect::new(mx as u16, my as u16, width, 1));
+        if let Some(shown) = shown
+            && mx >= 0
+            && my >= 0
+        {
+            let width = shown.chars().count().min(u16::MAX as usize) as u16;
+            frame.render_widget(Paragraph::new(shown).style(style), Rect::new(mx as u16, my as u16, width, 1));
+        }
+
+        if selected && mx >= 0 && my > 0 {
+            let (bx, by) = (mx as u16, my as u16 - 1);
+            let button = Rect::new(bx, by, 1, 1).intersection(canvas_area);
+            if !button.is_empty() {
+                app.hits.put(button, HitTarget::ColorMenu(target.clone()));
+                let dot_color = color.as_ref().map(ratatui_color).unwrap_or(RColor::White);
+                frame.render_widget(Paragraph::new("●").style(Style::default().fg(dot_color)), button);
+            }
+            if app.color_picker.as_ref() == Some(&target) {
+                // Below the label line (if any), not the button's own
+                // row right above it, so a picker never covers either.
+                draw_color_picker(frame, app, target.clone(), bx, my as u16 + 1, canvas_area);
             }
         }
     }
@@ -607,7 +638,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
     };
-    let hint = "drag empty space to place · click to select · ▾ button color picker · dbl-click to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

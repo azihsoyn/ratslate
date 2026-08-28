@@ -39,25 +39,25 @@ pub enum HitTarget {
     /// A small handle at a connector's own exit/entry point, not a box
     /// at all — dragging it re-points that end at a different box.
     Reattach(String, Endpoint),
-    /// The small button next to a selected box that opens its color
-    /// picker — a `c` key with no mnemonic beyond "press it a few
-    /// times and see", so this is somewhere to actually look at the
+    /// The small button next to a selected box or connector that opens
+    /// its color picker — a `c` key with no mnemonic beyond "press it a
+    /// few times and see", so this is somewhere to actually look at the
     /// choices (hex ones included, which cycling `c` can't reach).
-    ColorMenu(ShapeId),
-    /// One swatch in an open color picker. `None` clears the box's
-    /// color; a preset is `Some("1")`..`Some("6")`; anything else is a
-    /// literal hex string.
-    ColorSwatch(ShapeId, Option<String>),
+    ColorMenu(Selected),
+    /// One swatch in an open color picker. `None` clears the color; a
+    /// preset is `Some("1")`..`Some("6")`; anything else is a literal
+    /// hex string.
+    ColorSwatch(Selected, Option<String>),
 }
 
 impl HitTarget {
-    /// The node this hit belongs to — every variant but `Reattach`,
-    /// which belongs to an edge instead.
+    /// The node this hit belongs to — every variant but `Reattach`
+    /// (always an edge) and `ColorMenu`/`ColorSwatch` (either), which
+    /// don't drive node-dragging logic and so don't need one.
     fn node_id(&self) -> Option<&ShapeId> {
         match self {
             HitTarget::Move(id) | HitTarget::Connect(id) | HitTarget::Resize(id, _) => Some(id),
-            HitTarget::ColorMenu(id) | HitTarget::ColorSwatch(id, _) => Some(id),
-            HitTarget::Reattach(..) => None,
+            HitTarget::Reattach(..) | HitTarget::ColorMenu(_) | HitTarget::ColorSwatch(..) => None,
         }
     }
 }
@@ -215,14 +215,15 @@ pub struct App {
     pub hits: Hits<HitTarget>,
     pub edge_hits: Hits<String>,
     pub selected: Option<Selected>,
-    /// Which box's color picker is open, if any — a box can only ever
-    /// be its own selected one, since the button that opens it only
-    /// renders next to that one.
-    pub color_picker: Option<ShapeId>,
+    /// Which box or connector's color picker is open, if any — always
+    /// the selected one, since the button that opens it only renders
+    /// next to that.
+    pub color_picker: Option<Selected>,
     /// The swatch the cursor is over right now, if any — its color
-    /// previews on the actual box while hovered, so picking one isn't
-    /// a guess. `Some((id, None))` previews clearing the color.
-    pub hover_swatch: Option<(ShapeId, Option<Color>)>,
+    /// previews on the actual box or connector while hovered, so
+    /// picking one isn't a guess. `Some((target, None))` previews
+    /// clearing the color.
+    pub hover_swatch: Option<(Selected, Option<Color>)>,
     pub mode: Mode,
     pub editing_text: String,
     pub should_quit: bool,
@@ -692,7 +693,7 @@ impl App {
     pub fn on_mouse(&mut self, ev: MouseEvent, canvas_area: Rect) {
         if let MouseEventKind::Moved = ev.kind {
             self.hover_swatch = match self.hits.at(ev.column, ev.row) {
-                Some((HitTarget::ColorSwatch(id, color), _)) => Some((id, color.map(|c| Color::parse(&c)))),
+                Some((HitTarget::ColorSwatch(target, color), _)) => Some((target, color.map(|c| Color::parse(&c)))),
                 _ => None,
             };
         }
@@ -755,12 +756,15 @@ impl App {
                     self.begin_edit(selected);
                 }
             }
-            Did::Click(HitTarget::ColorMenu(id)) => {
-                self.color_picker = if self.color_picker.as_ref() == Some(&id) { None } else { Some(id) };
+            Did::Click(HitTarget::ColorMenu(target)) => {
+                self.color_picker = if self.color_picker.as_ref() == Some(&target) { None } else { Some(target) };
                 self.hover_swatch = None;
             }
-            Did::Click(HitTarget::ColorSwatch(id, color)) => {
-                let _ = self.dispatch(Request::SetColor { id, color });
+            Did::Click(HitTarget::ColorSwatch(target, color)) => {
+                let _ = match target {
+                    Selected::Node(id) => self.dispatch(Request::SetColor { id, color }),
+                    Selected::Edge(id) => self.dispatch(Request::SetEdgeColor { id, color }),
+                };
                 self.color_picker = None;
                 self.hover_swatch = None;
             }
@@ -853,17 +857,23 @@ impl App {
                 if self.is_double_click(selected.clone()) {
                     self.begin_edit(selected);
                 }
-            } else if let Some((start, end)) = self.drawing.take()
-                && start != end
-            {
-                let x = start.0.min(end.0);
-                let y = start.1.min(end.1);
-                let w = (start.0.max(end.0) - x + 1).max(MIN_W);
-                let h = (start.1.max(end.1) - y + 1).max(MIN_H);
-                if let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x, y, w: Some(w), h: Some(h) }) {
-                    let selected = Selected::Node(id);
-                    self.selected = Some(selected.clone());
-                    self.begin_edit(selected);
+            } else if let Some((start, end)) = self.drawing.take() {
+                if start != end {
+                    let x = start.0.min(end.0);
+                    let y = start.1.min(end.1);
+                    let w = (start.0.max(end.0) - x + 1).max(MIN_W);
+                    let h = (start.1.max(end.1) - y + 1).max(MIN_H);
+                    if let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x, y, w: Some(w), h: Some(h) }) {
+                        let selected = Selected::Node(id);
+                        self.selected = Some(selected.clone());
+                        self.begin_edit(selected);
+                    }
+                } else if self.selected.is_some() {
+                    // A plain click (no drag) on otherwise-empty canvas —
+                    // clicking away to lose focus, the same as Esc does.
+                    let _ = self.dispatch(Request::Select { id: None });
+                    self.color_picker = None;
+                    self.hover_swatch = None;
                 }
             }
         }

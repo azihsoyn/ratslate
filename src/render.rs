@@ -49,6 +49,20 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         draw_node(frame, node, selected, editing, &app.editing_text);
     }
 
+    if let Some(Selected::Node(id)) = app.selected.clone()
+        && let Some(node) = app.canvas.node(&id)
+    {
+        let (bx, by) = (node.rect.right(), node.rect.y);
+        let button = Rect::new(bx, by, 1, 1).intersection(canvas_area);
+        if !button.is_empty() {
+            app.hits.put(button, HitTarget::ColorMenu(id.clone()));
+            frame.render_widget(Paragraph::new("▾").style(Style::default().fg(RColor::DarkGray)), button);
+        }
+        if app.color_picker.as_deref() == Some(id.as_str()) {
+            draw_color_picker(frame, app, &id, bx, by + 1, canvas_area);
+        }
+    }
+
     if let Some((id, rect)) = &live_rect {
         let color = app.canvas.node(id).and_then(|n| n.color.as_ref());
         draw_ghost(frame, *rect, color);
@@ -143,6 +157,37 @@ fn display_text(node: &Node) -> String {
     }
 }
 
+/// A handful of common colors beyond the six JSON Canvas presets — the
+/// whole reason for a picker instead of just cycling `c`, since a hex
+/// color is otherwise only reachable from `--api`.
+const HEX_SWATCHES: [&str; 6] = ["#ffffff", "#000000", "#808080", "#ff69b4", "#3b82f6", "#8b5a2b"];
+
+/// Two rows below the color menu button: clear + the 6 presets, then 6
+/// extra hex swatches. Each swatch is its own hit target, registered
+/// fresh every frame like everything else `render` draws.
+fn draw_color_picker(frame: &mut Frame, app: &mut App, id: &str, x: u16, y: u16, canvas_area: Rect) {
+    let mut put_swatch = |cx: u16, cy: u16, label: &str, style: Style, color: Option<String>| {
+        let rect = Rect::new(cx, cy, 2, 1).intersection(canvas_area);
+        if rect.is_empty() {
+            return;
+        }
+        app.hits.put(rect, HitTarget::ColorSwatch(id.to_string(), color));
+        frame.render_widget(Paragraph::new(label).style(style), rect);
+    };
+
+    put_swatch(x, y, "╳ ", Style::default(), None);
+    for preset in 1..=6u8 {
+        let cx = x + 2 * preset as u16;
+        let style = Style::default().bg(ratatui_color(&Color::Preset(preset)));
+        put_swatch(cx, y, "  ", style, Some(preset.to_string()));
+    }
+    for (i, hex) in HEX_SWATCHES.iter().enumerate() {
+        let cx = x + 2 * i as u16;
+        let style = Style::default().bg(ratatui_color(&Color::Hex((*hex).to_string())));
+        put_swatch(cx, y + 1, "  ", style, Some((*hex).to_string()));
+    }
+}
+
 fn ratatui_color(color: &Color) -> RColor {
     match color {
         Color::Preset(1) => RColor::Red,
@@ -204,7 +249,17 @@ fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>, r
         .iter()
         .map(|e| Some((rect_of(&e.from)?, rect_of(&e.to)?)))
         .collect();
-    let sides: Vec<Option<(Side, Side)>> = rects.iter().map(|r| r.map(|(f, t)| sides_for(f, t))).collect();
+    let sides: Vec<Option<(Side, Side)>> = rects
+        .iter()
+        .zip(&app.canvas.edges)
+        .map(|(r, edge)| {
+            let r = (*r)?;
+            match (edge.from_side, edge.to_side) {
+                (Some(fs), Some(ts)) => Some((fs, ts)),
+                _ => Some(sides_for(r.0, r.1)),
+            }
+        })
+        .collect();
 
     let mut from_frac = vec![0.5f32; app.canvas.edges.len()];
     let mut to_frac = vec![0.5f32; app.canvas.edges.len()];
@@ -230,9 +285,16 @@ fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>, r
     }
 
     for i in 0..app.canvas.edges.len() {
-        let (color, to_end, from_end, label, edge_id) = {
+        let (color, to_end, from_end, label, edge_id, explicit_sides) = {
             let edge = &app.canvas.edges[i];
-            (edge.color.clone(), edge.to_end, edge.from_end, edge.label.clone(), edge.id.clone())
+            (
+                edge.color.clone(),
+                edge.to_end,
+                edge.from_end,
+                edge.label.clone(),
+                edge.id.clone(),
+                edge.from_side.zip(edge.to_side),
+            )
         };
         let Some((from_rect, to_rect)) = rects[i] else { continue };
         if reattaching.is_some_and(|(id, _)| id == &edge_id) {
@@ -248,7 +310,7 @@ fn draw_edges(frame: &mut Frame, app: &mut App, live: Option<&(String, Rect)>, r
         if selected {
             style = style.fg(RColor::Cyan).add_modifier(Modifier::BOLD);
         }
-        let waypoints = route(from_rect, to_rect, from_frac[i], to_frac[i]);
+        let waypoints = route(from_rect, to_rect, from_frac[i], to_frac[i], explicit_sides);
         let glyphs: Vec<(i32, i32, char)> = route_glyphs(&waypoints)
             .into_iter()
             .filter(|&(x, y, _)| !inside(from_rect, x, y) && !inside(to_rect, x, y))
@@ -320,14 +382,57 @@ fn sides_for(from: Rect, to: Rect) -> (Side, Side) {
     (from_side, to_side)
 }
 
+/// Where a connector attaches on a given side of `rect`, `frac` (0..1)
+/// along it — one cell past the border, same convention `route`'s own
+/// auto-picked sides already use, so an arrowhead never lands on the
+/// border row/column a box's own widget redraws afterward.
+fn side_point(rect: Rect, side: Side, frac: f32) -> (i32, i32) {
+    let (x0, y0, x1, y1) = (rect.x as i32, rect.y as i32, rect.right() as i32, rect.bottom() as i32);
+    match side {
+        Side::Right => (x1, y0 + (frac * (y1 - y0 - 1).max(0) as f32).round() as i32),
+        Side::Left => (x0 - 1, y0 + (frac * (y1 - y0 - 1).max(0) as f32).round() as i32),
+        Side::Bottom => (x0 + (frac * (x1 - x0 - 1).max(0) as f32).round() as i32, y1),
+        Side::Top => (x0 + (frac * (x1 - x0 - 1).max(0) as f32).round() as i32, y0 - 1),
+    }
+}
+
+/// A connector's path when both ends name a specific side explicitly
+/// (set through `--api`, or loaded from a file another app wrote) — a
+/// straight bend between the two attachment points, on whichever axis
+/// fits their exit directions. Simpler than [`route`]'s own geometry
+/// (which picks the *shape* of the bend from box positions, not told
+/// which sides to use), but every leg still lands orthogonally.
+fn route_explicit(from: Rect, to: Rect, from_frac: f32, to_frac: f32, from_side: Side, to_side: Side) -> Vec<(i32, i32)> {
+    let e = side_point(from, from_side, from_frac);
+    let n = side_point(to, to_side, to_frac);
+    let horizontal = |s: Side| matches!(s, Side::Left | Side::Right);
+    match (horizontal(from_side), horizontal(to_side)) {
+        (true, true) => {
+            let mid_x = (e.0 + n.0) / 2;
+            vec![e, (mid_x, e.1), (mid_x, n.1), n]
+        }
+        (false, false) => {
+            let mid_y = (e.1 + n.1) / 2;
+            vec![e, (e.0, mid_y), (n.0, mid_y), n]
+        }
+        (true, false) => vec![e, (n.0, e.1), n],
+        (false, true) => vec![e, (e.0, n.1), n],
+    }
+}
+
 /// The corner-to-corner path a connector takes between two boxes: a
 /// straight line when they share a row or column, one right-angle bend
 /// otherwise — never the diagonal a straight cursor-to-cursor line would
 /// draw, which reads as noise rather than a wire between two boxes.
 /// `from_frac`/`to_frac` (0..1) place the attachment point along
 /// whichever side gets used, so edges sharing a box and a side don't
-/// all leave from its exact midpoint and overlap.
-fn route(from: Rect, to: Rect, from_frac: f32, to_frac: f32) -> Vec<(i32, i32)> {
+/// all leave from its exact midpoint and overlap. `sides`, when both
+/// ends name one explicitly, routes between exactly those instead of
+/// picking automatically from where the boxes happen to sit.
+fn route(from: Rect, to: Rect, from_frac: f32, to_frac: f32, sides: Option<(Side, Side)>) -> Vec<(i32, i32)> {
+    if let Some((fs, ts)) = sides {
+        return route_explicit(from, to, from_frac, to_frac, fs, ts);
+    }
     let (fx0, fy0, fx1, fy1) = (from.x as i32, from.y as i32, from.right() as i32, from.bottom() as i32);
     let (tx0, ty0, tx1, ty1) = (to.x as i32, to.y as i32, to.right() as i32, to.bottom() as i32);
 
@@ -488,7 +593,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
     };
-    let hint = "drag empty space to place · click to select · dbl-click to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ▾ button color picker · dbl-click to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

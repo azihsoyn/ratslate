@@ -39,6 +39,15 @@ pub enum HitTarget {
     /// A small handle at a connector's own exit/entry point, not a box
     /// at all — dragging it re-points that end at a different box.
     Reattach(String, Endpoint),
+    /// The small button next to a selected box that opens its color
+    /// picker — a `c` key with no mnemonic beyond "press it a few
+    /// times and see", so this is somewhere to actually look at the
+    /// choices (hex ones included, which cycling `c` can't reach).
+    ColorMenu(ShapeId),
+    /// One swatch in an open color picker. `None` clears the box's
+    /// color; a preset is `Some("1")`..`Some("6")`; anything else is a
+    /// literal hex string.
+    ColorSwatch(ShapeId, Option<String>),
 }
 
 impl HitTarget {
@@ -47,6 +56,7 @@ impl HitTarget {
     fn node_id(&self) -> Option<&ShapeId> {
         match self {
             HitTarget::Move(id) | HitTarget::Connect(id) | HitTarget::Resize(id, _) => Some(id),
+            HitTarget::ColorMenu(id) | HitTarget::ColorSwatch(id, _) => Some(id),
             HitTarget::Reattach(..) => None,
         }
     }
@@ -99,6 +109,18 @@ pub enum Request {
     Delete { id: ShapeId },
     /// Label a connector, or clear its label with `null`.
     SetLabel { id: String, label: Option<String> },
+    /// Same color grammar as a box's `SetColor`.
+    SetEdgeColor { id: String, color: Option<String> },
+    /// Which ends carry an arrowhead: "none" or "arrow", for each end.
+    SetEdgeEnds { id: String, from_end: String, to_end: String },
+    /// Which side of each box a connector leaves from/arrives at —
+    /// "top" / "right" / "bottom" / "left", or `null` to go back to
+    /// picking automatically based on where the boxes actually sit.
+    SetEdgeSides {
+        id: String,
+        from_side: Option<String>,
+        to_side: Option<String>,
+    },
     /// Remove a connector without touching the boxes it joined.
     DeleteEdge { id: String },
     /// Re-point one end of a connector at a different box: `end` is
@@ -193,6 +215,10 @@ pub struct App {
     pub hits: Hits<HitTarget>,
     pub edge_hits: Hits<String>,
     pub selected: Option<Selected>,
+    /// Which box's color picker is open, if any — a box can only ever
+    /// be its own selected one, since the button that opens it only
+    /// renders next to that one.
+    pub color_picker: Option<ShapeId>,
     pub mode: Mode,
     pub editing_text: String,
     pub should_quit: bool,
@@ -272,6 +298,7 @@ impl App {
             hits: Hits::new(),
             edge_hits: Hits::new(),
             selected: None,
+            color_picker: None,
             mode: Mode::Normal,
             editing_text: String::new(),
             should_quit: false,
@@ -507,6 +534,26 @@ impl App {
                 touched_edge = Some(id);
                 Ok(Response::Ok)
             }
+            Request::SetEdgeColor { id, color } => {
+                let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
+                edge.color = color.as_deref().map(Color::parse);
+                touched_edge = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetEdgeEnds { id, from_end, to_end } => {
+                let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
+                edge.from_end = parse_edge_end(&from_end);
+                edge.to_end = parse_edge_end(&to_end);
+                touched_edge = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetEdgeSides { id, from_side, to_side } => {
+                let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
+                edge.from_side = from_side.as_deref().and_then(parse_side);
+                edge.to_side = to_side.as_deref().and_then(parse_side);
+                touched_edge = Some(id);
+                Ok(Response::Ok)
+            }
             Request::DeleteEdge { id } => {
                 self.canvas.delete_edge(&id);
                 if self.selected == Some(Selected::Edge(id.clone())) {
@@ -688,13 +735,22 @@ impl App {
 
         match self.drag.on_mouse(ev, hit) {
             Did::Click(HitTarget::Reattach(edge_id, _)) => {
+                self.color_picker = None;
                 let selected = Selected::Edge(edge_id);
                 let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
                 if self.is_double_click(selected.clone()) {
                     self.begin_edit(selected);
                 }
             }
+            Did::Click(HitTarget::ColorMenu(id)) => {
+                self.color_picker = if self.color_picker.as_ref() == Some(&id) { None } else { Some(id) };
+            }
+            Did::Click(HitTarget::ColorSwatch(id, color)) => {
+                let _ = self.dispatch(Request::SetColor { id, color });
+                self.color_picker = None;
+            }
             Did::Click(target) => {
+                self.color_picker = None;
                 let selected = Selected::Node(target.node_id().expect("only Reattach lacks a node").clone());
                 let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
                 if self.is_double_click(selected.clone()) {
@@ -846,23 +902,48 @@ impl App {
                         self.begin_edit(target);
                     }
                 }
-                KeyCode::Char('c') => {
-                    if let Some(Selected::Node(id)) = self.selected.clone()
-                        && let Some(node) = self.canvas.node(&id)
-                    {
-                        let next = Color::cycle(node.color.as_ref());
-                        let _ = self.dispatch(Request::SetColor { id, color: next.map(|c| c.to_string()) });
+                KeyCode::Char('c') => match self.selected.clone() {
+                    Some(Selected::Node(id)) => {
+                        if let Some(node) = self.canvas.node(&id) {
+                            let next = Color::cycle(node.color.as_ref());
+                            let _ = self.dispatch(Request::SetColor { id, color: next.map(|c| c.to_string()) });
+                        }
                     }
-                }
-                KeyCode::Char('x') => {
-                    if let Some(Selected::Node(id)) = self.selected.clone()
-                        && let Some(node) = self.canvas.node(&id)
-                    {
-                        let next = node.shape.cycle();
-                        let shape = next.as_str().unwrap_or("rectangle").to_string();
-                        let _ = self.dispatch(Request::SetShape { id, shape });
+                    Some(Selected::Edge(id)) => {
+                        if let Some(edge) = self.canvas.edge(&id) {
+                            let next = Color::cycle(edge.color.as_ref());
+                            let _ = self.dispatch(Request::SetEdgeColor { id, color: next.map(|c| c.to_string()) });
+                        }
                     }
-                }
+                    None => {}
+                },
+                KeyCode::Char('x') => match self.selected.clone() {
+                    Some(Selected::Node(id)) => {
+                        if let Some(node) = self.canvas.node(&id) {
+                            let next = node.shape.cycle();
+                            let shape = next.as_str().unwrap_or("rectangle").to_string();
+                            let _ = self.dispatch(Request::SetShape { id, shape });
+                        }
+                    }
+                    // Cycles which end(s) carry an arrowhead: forward,
+                    // both, neither, backward, then around again.
+                    Some(Selected::Edge(id)) => {
+                        if let Some(edge) = self.canvas.edge(&id) {
+                            let (from_end, to_end) = match (edge.from_end, edge.to_end) {
+                                (EdgeEnd::None, EdgeEnd::Arrow) => (EdgeEnd::Arrow, EdgeEnd::Arrow),
+                                (EdgeEnd::Arrow, EdgeEnd::Arrow) => (EdgeEnd::None, EdgeEnd::None),
+                                (EdgeEnd::None, EdgeEnd::None) => (EdgeEnd::Arrow, EdgeEnd::None),
+                                _ => (EdgeEnd::None, EdgeEnd::Arrow),
+                            };
+                            let _ = self.dispatch(Request::SetEdgeEnds {
+                                id,
+                                from_end: edge_end_to_string(from_end).to_string(),
+                                to_end: edge_end_to_string(to_end).to_string(),
+                            });
+                        }
+                    }
+                    None => {}
+                },
                 KeyCode::Char('d') | KeyCode::Delete => match self.selected.clone() {
                     Some(Selected::Node(id)) => {
                         let _ = self.dispatch(Request::Delete { id });
@@ -873,7 +954,9 @@ impl App {
                     None => {}
                 },
                 KeyCode::Esc => {
-                    if self.selected.is_some() {
+                    if self.color_picker.take().is_some() {
+                        // just closes the picker
+                    } else if self.selected.is_some() {
                         let _ = self.dispatch(Request::Select { id: None });
                     } else {
                         self.should_quit = true;

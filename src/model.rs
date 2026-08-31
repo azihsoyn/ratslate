@@ -109,15 +109,29 @@ pub enum EdgeEnd {
     Arrow,
 }
 
+/// Which row and/or column of a table box a connector end lines up
+/// with — not part of JSON Canvas at all (it has no notion of a point
+/// inside a node), carried as an extra field an unrecognized reader
+/// just ignores, landing on that node's ordinary side/midpoint instead.
+/// Either field alone anchors to a whole row or column; both together
+/// anchor to one cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CellAnchor {
+    pub row: Option<usize>,
+    pub col: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Edge {
     pub id: String,
     pub from: ShapeId,
     pub from_side: Option<Side>,
     pub from_end: EdgeEnd,
+    pub from_anchor: Option<CellAnchor>,
     pub to: ShapeId,
     pub to_side: Option<Side>,
     pub to_end: EdgeEnd,
+    pub to_anchor: Option<CellAnchor>,
     pub color: Option<Color>,
     pub label: Option<String>,
 }
@@ -180,9 +194,11 @@ impl Canvas {
             from,
             from_side: None,
             from_end: EdgeEnd::None,
+            from_anchor: None,
             to,
             to_side: None,
             to_end: EdgeEnd::Arrow,
+            to_anchor: None,
             color: None,
             label: None,
         });

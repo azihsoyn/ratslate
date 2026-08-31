@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
 use crate::collab::{Collab, EdgeFields, NodeFields};
-use crate::model::{Canvas, Color, Edge, EdgeEnd, Node, NodeKind, Shape, ShapeId, Side};
+use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, ShapeId, Side};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
@@ -35,7 +35,11 @@ pub enum Endpoint {
 pub enum HitTarget {
     Move(ShapeId),
     Resize(ShapeId, Corner),
-    Connect(ShapeId),
+    /// A connector being drawn from this box — carrying a `CellAnchor`
+    /// when the drag started on a specific table cell rather than the
+    /// box's plain body, through to the drop so the new edge can be
+    /// anchored to it.
+    Connect(ShapeId, Option<CellAnchor>),
     /// A small handle at a connector's own exit/entry point, not a box
     /// at all — dragging it re-points that end at a different box.
     Reattach(String, Endpoint),
@@ -57,6 +61,11 @@ pub enum HitTarget {
     /// table is already open for editing, a double-click (matching any
     /// other box's own open gesture) if it isn't yet.
     TableCell(ShapeId, usize, usize),
+    /// A row or column anchor's own preview dot. Unlike grabbing a
+    /// plain cell (which also means "move" or "open for editing", so
+    /// Shift is what says "no, draw a connector instead"), a dot has no
+    /// other job — a plain drag here always draws one.
+    AnchorDot(ShapeId, CellAnchor),
 }
 
 /// What one of a table's row/column buttons does, always relative to
@@ -69,18 +78,33 @@ pub enum TableOp {
     DelRow,
 }
 
+/// Which anchor grabbing (or dropping on) `(row, col)` names — the
+/// header row stands for its whole column, the first column stands for
+/// its whole row (the corner cell, being both, reads as the column:
+/// it's a header first), and anywhere else names that one cell alone.
+pub(crate) fn cell_anchor_for(row: usize, col: usize) -> CellAnchor {
+    if row == 0 {
+        CellAnchor { row: None, col: Some(col) }
+    } else if col == 0 {
+        CellAnchor { row: Some(row), col: None }
+    } else {
+        CellAnchor { row: Some(row), col: Some(col) }
+    }
+}
+
 impl HitTarget {
     /// The node this hit belongs to — every variant but `Reattach`
     /// (always an edge) and `ColorMenu`/`ColorSwatch` (either), which
     /// don't drive node-dragging logic and so don't need one.
-    fn node_id(&self) -> Option<&ShapeId> {
+    pub(crate) fn node_id(&self) -> Option<&ShapeId> {
         match self {
-            HitTarget::Move(id) | HitTarget::Connect(id) | HitTarget::Resize(id, _) => Some(id),
+            HitTarget::Move(id) | HitTarget::Connect(id, _) | HitTarget::Resize(id, _) => Some(id),
             HitTarget::Reattach(..)
             | HitTarget::ColorMenu(_)
             | HitTarget::ColorSwatch(..)
             | HitTarget::TableMenu(..)
-            | HitTarget::TableCell(..) => None,
+            | HitTarget::TableCell(..)
+            | HitTarget::AnchorDot(..) => None,
         }
     }
 }
@@ -147,6 +171,18 @@ pub enum Request {
         id: String,
         from_side: Option<String>,
         to_side: Option<String>,
+    },
+    /// Line a connector end up with a specific row and/or column of a
+    /// table box instead of the node's plain midpoint — row alone
+    /// anchors to that whole row, col alone to that whole column, both
+    /// to one cell. Not part of JSON Canvas; ignored by any other
+    /// reader, which just sees the node's ordinary side/midpoint.
+    SetEdgeAnchor {
+        id: String,
+        from_row: Option<usize>,
+        from_col: Option<usize>,
+        to_row: Option<usize>,
+        to_col: Option<usize>,
     },
     /// Remove a connector without touching the boxes it joined.
     DeleteEdge { id: String },
@@ -229,6 +265,7 @@ impl JsonSchema for Selected {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Placed { id: ShapeId },
+    Connected { id: String },
     Ok,
     State { board: FileRoot },
     Saved { path: String },
@@ -251,6 +288,13 @@ pub struct App {
     /// picking one isn't a guess. `Some((target, None))` previews
     /// clearing the color.
     pub hover_swatch: Option<(Selected, Option<Color>)>,
+    /// The table cell the cursor is over right now, if any — its own
+    /// row's and column's candidate anchor points preview while it's
+    /// hovered (just those, not every row and column of the table, so
+    /// a big table doesn't ring itself in dots). A hovered anchor dot
+    /// counts too, as the single axis it stands for, so the preview
+    /// survives the cursor actually reaching what it showed.
+    pub hover_cell: Option<(ShapeId, CellAnchor)>,
     pub mode: Mode,
     pub editing_text: String,
     /// The whole grid staged for `Mode::EditingCell`, `editing_text`
@@ -336,6 +380,7 @@ impl App {
             selected: None,
             color_picker: None,
             hover_swatch: None,
+            hover_cell: None,
             mode: Mode::Normal,
             editing_text: String::new(),
             editing_table: Vec::new(),
@@ -548,8 +593,9 @@ impl App {
             Request::Connect { from, to } => {
                 self.canvas.node(&from).ok_or_else(|| format!("no such node: {from}"))?;
                 self.canvas.node(&to).ok_or_else(|| format!("no such node: {to}"))?;
-                touched_edge = Some(self.canvas.connect(from, to));
-                Ok(Response::Ok)
+                let id = self.canvas.connect(from, to);
+                touched_edge = Some(id.clone());
+                Ok(Response::Connected { id })
             }
             Request::Delete { id } => {
                 removed_edges = self
@@ -592,6 +638,13 @@ impl App {
                 touched_edge = Some(id);
                 Ok(Response::Ok)
             }
+            Request::SetEdgeAnchor { id, from_row, from_col, to_row, to_col } => {
+                let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
+                edge.from_anchor = (from_row.is_some() || from_col.is_some()).then_some(CellAnchor { row: from_row, col: from_col });
+                edge.to_anchor = (to_row.is_some() || to_col.is_some()).then_some(CellAnchor { row: to_row, col: to_col });
+                touched_edge = Some(id);
+                Ok(Response::Ok)
+            }
             Request::DeleteEdge { id } => {
                 self.canvas.delete_edge(&id);
                 if self.selected == Some(Selected::Edge(id.clone())) {
@@ -603,11 +656,22 @@ impl App {
             Request::Reattach { id, end, node } => {
                 self.canvas.node(&node).ok_or_else(|| format!("no such node: {node}"))?;
                 let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
+                // A row/column anchor names a cell in the node this end
+                // *was* pointing at — re-pointing it at a different box
+                // entirely without clearing that would leave it aimed
+                // at whatever unrelated cell happens to share that
+                // index, if the new box is even a table at all.
                 match end.as_str() {
                     "from" if edge.to == node => return Err("can't connect a box to itself".to_string()),
-                    "from" => edge.from = node,
+                    "from" => {
+                        edge.from = node;
+                        edge.from_anchor = None;
+                    }
                     "to" if edge.from == node => return Err("can't connect a box to itself".to_string()),
-                    "to" => edge.to = node,
+                    "to" => {
+                        edge.to = node;
+                        edge.to_anchor = None;
+                    }
                     other => return Err(format!("end must be \"from\" or \"to\", got {other:?}")),
                 }
                 touched_edge = Some(id);
@@ -878,6 +942,18 @@ impl App {
         self.hits.at(x, y)?.0.node_id().cloned()
     }
 
+    /// Same lookup as `node_at`, but keeping the anchor a `TableCell`
+    /// hit implies instead of throwing it away — a connector dropped on
+    /// a specific cell anchors to it.
+    fn node_and_anchor_at(&self, x: u16, y: u16) -> (Option<ShapeId>, Option<CellAnchor>) {
+        match self.hits.at(x, y) {
+            Some((HitTarget::TableCell(id, row, col), _)) => (Some(id), Some(cell_anchor_for(row, col))),
+            Some((HitTarget::AnchorDot(id, anchor), _)) => (Some(id), Some(anchor)),
+            Some((target, _)) => (target.node_id().cloned(), None),
+            None => (None, None),
+        }
+    }
+
     /// The node closest to this cell — a drop that missed a box by a
     /// little should still connect, not silently do nothing.
     fn nearest_node(&self, x: u16, y: u16) -> Option<ShapeId> {
@@ -914,12 +990,26 @@ impl App {
                 self.commit_edit();
             }
 
+            // A dot's own drag always draws a connector — unlike a plain
+            // cell or box body, which doubles as a move/edit target and
+            // needs Shift to say "no, a connector instead", a dot has
+            // no other job at all.
+            if let Some((HitTarget::AnchorDot(id, anchor), rect)) = &hit {
+                hit = Some((HitTarget::Connect(id.clone(), Some(*anchor)), *rect));
+            }
+
             // Shift turns a grab on a box into a connector draw instead
-            // of a move — the same body hit, reinterpreted.
-            if ev.modifiers.contains(KeyModifiers::SHIFT)
-                && let Some((HitTarget::Move(id), rect)) = &hit
-            {
-                hit = Some((HitTarget::Connect(id.clone()), *rect));
+            // of a move — the same body hit, reinterpreted. Starting
+            // from a table cell instead carries the anchor it implies
+            // along, so the new edge can anchor to it once it lands.
+            if ev.modifiers.contains(KeyModifiers::SHIFT) {
+                hit = match &hit {
+                    Some((HitTarget::Move(id), rect)) => Some((HitTarget::Connect(id.clone(), None), *rect)),
+                    Some((HitTarget::TableCell(id, row, col), rect)) => {
+                        Some((HitTarget::Connect(id.clone(), Some(cell_anchor_for(*row, *col))), *rect))
+                    }
+                    _ => hit,
+                };
             }
 
             match &hit {
@@ -1051,14 +1141,26 @@ impl App {
                 }
             }
             Did::Drop {
-                key: HitTarget::Connect(from),
+                key: HitTarget::Connect(from, from_anchor),
                 x,
                 y,
             } => {
-                let to = self.node_at(x, y).or_else(|| self.nearest_node(x, y));
+                let (hit_to, hit_anchor) = self.node_and_anchor_at(x, y);
+                let to = hit_to.clone().or_else(|| self.nearest_node(x, y));
+                let to_anchor = if hit_to.is_some() { hit_anchor } else { None };
                 match to {
                     Some(to) if to != from => {
-                        let _ = self.dispatch(Request::Connect { from, to });
+                        if let Ok(Response::Connected { id }) = self.dispatch(Request::Connect { from, to })
+                            && (from_anchor.is_some() || to_anchor.is_some())
+                        {
+                            let _ = self.dispatch(Request::SetEdgeAnchor {
+                                id,
+                                from_row: from_anchor.and_then(|a| a.row),
+                                from_col: from_anchor.and_then(|a| a.col),
+                                to_row: to_anchor.and_then(|a| a.row),
+                                to_col: to_anchor.and_then(|a| a.col),
+                            });
+                        }
                         self.status.clear();
                     }
                     Some(_) => self.status = "can't connect a box to itself".to_string(),
@@ -1117,6 +1219,28 @@ impl App {
                     self.hover_swatch = None;
                 }
             }
+        }
+
+        // Which table cell the cursor is on right now — tracked through
+        // plain movement, and through the held-button drag of a
+        // connector (those arrive as `Drag`, never `Moved`), so the
+        // destination cell's candidate anchors can preview while aiming
+        // at it. Other drags (moving/resizing a box) deliberately don't
+        // update it: candidates popping up under a box being dragged
+        // past would just be noise. Last, after the drag state machine
+        // has seen this event, so the very first motion of a fresh
+        // connector drag already counts as one.
+        let is_connect_drag = matches!(self.drag.moving(), Some(HitTarget::Connect(..)));
+        if matches!(ev.kind, MouseEventKind::Moved)
+            || (is_connect_drag && matches!(ev.kind, MouseEventKind::Drag(MouseButton::Left)))
+        {
+            self.hover_cell = match self.hits.at(ev.column, ev.row) {
+                Some((HitTarget::TableCell(id, row, col), _)) => {
+                    Some((id, CellAnchor { row: Some(row), col: Some(col) }))
+                }
+                Some((HitTarget::AnchorDot(id, anchor), _)) => Some((id, anchor)),
+                _ => None,
+            };
         }
     }
 
@@ -1385,9 +1509,20 @@ fn edge_fields(edge: &Edge) -> EdgeFields {
         to_side: edge.to_side.map(side_to_string).map(str::to_string),
         from_end: edge_end_to_string(edge.from_end).to_string(),
         to_end: edge_end_to_string(edge.to_end).to_string(),
+        from_row: edge.from_anchor.and_then(|a| a.row).map(|n| n as i64),
+        from_col: edge.from_anchor.and_then(|a| a.col).map(|n| n as i64),
+        to_row: edge.to_anchor.and_then(|a| a.row).map(|n| n as i64),
+        to_col: edge.to_anchor.and_then(|a| a.col).map(|n| n as i64),
         color: edge.color.as_ref().map(|c| c.to_string()),
         label: edge.label.clone(),
     }
+}
+
+fn anchor_from_fields(row: Option<i64>, col: Option<i64>) -> Option<CellAnchor> {
+    if row.is_none() && col.is_none() {
+        return None;
+    }
+    Some(CellAnchor { row: row.map(|n| n.max(0) as usize), col: col.map(|n| n.max(0) as usize) })
 }
 
 fn edge_from_fields(id: String, f: EdgeFields) -> Edge {
@@ -1396,9 +1531,11 @@ fn edge_from_fields(id: String, f: EdgeFields) -> Edge {
         from: f.from,
         from_side: f.from_side.as_deref().and_then(parse_side),
         from_end: parse_edge_end(&f.from_end),
+        from_anchor: anchor_from_fields(f.from_row, f.from_col),
         to: f.to,
         to_side: f.to_side.as_deref().and_then(parse_side),
         to_end: parse_edge_end(&f.to_end),
+        to_anchor: anchor_from_fields(f.to_row, f.to_col),
         color: f.color.as_deref().map(Color::parse),
         label: f.label,
     }

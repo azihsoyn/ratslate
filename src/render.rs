@@ -8,8 +8,8 @@ use ratatui::{
 
 use ratatui_dnd::Hits;
 
-use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected, TableOp};
-use crate::model::{Color, EdgeEnd, Node, NodeKind, Shape, Side};
+use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected, TableOp, cell_anchor_for};
+use crate::model::{CellAnchor, Color, EdgeEnd, Node, NodeKind, Shape, Side};
 use crate::table::Table;
 
 pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: Rect) {
@@ -37,6 +37,36 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         Some(HitTarget::Reattach(id, end)) => Some((id.clone(), *end)),
         _ => None,
     };
+
+    // The hovered cell's own candidate anchor points, dim `○` — just
+    // its column (top and bottom) and its row (left and right), not
+    // every row and column of the table, so a big table doesn't ring
+    // itself in dots. Visible while the cursor is on that cell,
+    // hovering plainly or mid-drag aiming at it as the destination.
+    // Drawn before `draw_edges` so an end actually anchored at one of
+    // these spots shows its own `●` on top instead.
+    if let Some((id, hovered)) = app.hover_cell.clone()
+        && let Some(node) = app.canvas.node(&id)
+        && let Some(table) = crate::table::parse(&display_text(node))
+    {
+        let dim = Style::default().fg(RColor::DarkGray);
+        if let Some(c) = hovered.col
+            && let Some(frac) = crate::table::col_center_frac(&table, c, node.rect.width)
+        {
+            for side in [Side::Top, Side::Bottom] {
+                let (x, y) = side_point(node.rect, side, frac);
+                put_char(frame, x, y, '○', dim);
+            }
+        }
+        if let Some(r) = hovered.row
+            && let Some(frac) = crate::table::row_center_frac(&table, r, node.rect.height)
+        {
+            for side in [Side::Left, Side::Right] {
+                let (x, y) = side_point(node.rect, side, frac);
+                put_char(frame, x, y, '○', dim);
+            }
+        }
+    }
 
     draw_edges(frame, app, live_rect.as_ref(), reattaching.as_ref(), canvas_area);
 
@@ -106,18 +136,24 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         draw_ghost(frame, rect, None);
     }
 
-    if let Some(HitTarget::Connect(from)) = app.drag.moving()
+    if let Some(HitTarget::Connect(from, anchor)) = app.drag.moving()
         && let Some((cx, cy)) = app.drag.cursor()
         && let Some(from_node) = app.canvas.node(from)
     {
-        let start = center(from_node.rect);
-        let end = (cx as i32, cy as i32);
-        let path = clipped_path(from_node.rect, from_node.rect, start, end);
-        let style = Style::default().fg(RColor::DarkGray);
-        draw_path(frame, &path, style);
-        if let Some(&(x, y)) = path.last() {
-            put_char(frame, x, y, arrow_char(end.0 - start.0, end.1 - start.1), style);
-        }
+        // The cursor hovering another box's own table cell or dot
+        // previews the far end's anchor too — aiming at a destination
+        // row/column should be visible before the drop that commits it.
+        let hover_target = match app.hits.at(cx, cy) {
+            Some((HitTarget::TableCell(id, row, col), _)) if &id != from => {
+                app.canvas.node(&id).map(|n| (n, Some(cell_anchor_for(row, col))))
+            }
+            Some((HitTarget::AnchorDot(id, dot_anchor), _)) if &id != from => {
+                app.canvas.node(&id).map(|n| (n, Some(dot_anchor)))
+            }
+            Some((target, _)) => target.node_id().filter(|id| *id != from).and_then(|id| app.canvas.node(id)).map(|n| (n, None)),
+            None => None,
+        };
+        draw_drag_preview(frame, from_node, *anchor, (cx, cy), hover_target);
     }
 
     // Dragging one end of an existing connector: a line from whichever
@@ -129,16 +165,9 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             Endpoint::From => Some(&edge.to),
             Endpoint::To => Some(&edge.from),
         }
-        && let Some(anchor) = app.canvas.node(anchor_id)
+        && let Some(anchor_node) = app.canvas.node(anchor_id)
     {
-        let start = center(anchor.rect);
-        let end = (cx as i32, cy as i32);
-        let path = clipped_path(anchor.rect, anchor.rect, start, end);
-        let style = Style::default().fg(RColor::DarkGray);
-        draw_path(frame, &path, style);
-        if let Some(&(x, y)) = path.last() {
-            put_char(frame, x, y, arrow_char(end.0 - start.0, end.1 - start.1), style);
-        }
+        draw_drag_preview(frame, anchor_node, None, (cx, cy), None);
     }
 
     draw_status(frame, app, status_area);
@@ -375,6 +404,39 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
             cell.set_symbol("┤");
         }
     }
+
+    // Every column/row anchor's own grab point gets a real hit target
+    // here, registered unconditionally — nothing is drawn there unless
+    // a connector is actually anchored to it (an unattached candidate
+    // dot on every row/column of every table read as clutter, not a
+    // hint), but the spot has to be reachable before that's true, or a
+    // drag could never land on it to begin with. It sits one row above
+    // the border, on the other side of a gap the border itself has no
+    // hit at all across.
+    // Wider than the single cell the dot is actually drawn on, and
+    // stretched back in to cover the border cell right next to it too
+    // — a dot is a real mouse target, not just a render position, and a
+    // single terminal cell is a hard thing to land a real cursor on.
+    for (c, _) in widths.iter().enumerate() {
+        if let Some(frac) = crate::table::col_center_frac(table, c, node.rect.width) {
+            let anchor = CellAnchor { row: None, col: Some(c) };
+            for side in [Side::Top, Side::Bottom] {
+                let (x, y) = side_point(node.rect, side, frac);
+                let hit_y = if side == Side::Bottom { y - 1 } else { y };
+                hits.put(rect_span(x - 1, hit_y, 3, 2), HitTarget::AnchorDot(node.id.clone(), anchor));
+            }
+        }
+    }
+    for r in 0..table.len() {
+        if let Some(frac) = crate::table::row_center_frac(table, r, node.rect.height) {
+            let anchor = CellAnchor { row: Some(r), col: None };
+            for side in [Side::Left, Side::Right] {
+                let (x, y) = side_point(node.rect, side, frac);
+                let hit_x = if side == Side::Right { x - 1 } else { x };
+                hits.put(rect_span(hit_x, y - 1, 2, 3), HitTarget::AnchorDot(node.id.clone(), anchor));
+            }
+        }
+    }
 }
 
 /// Row/column buttons for an open table editor, one row below the box
@@ -515,7 +577,12 @@ fn draw_edges(
             let r = (*r)?;
             match (edge.from_side, edge.to_side) {
                 (Some(fs), Some(ts)) => Some((fs, ts)),
-                _ => Some(sides_for(r.0, r.1)),
+                _ => {
+                    let (auto_fs, auto_ts) = sides_for(r.0, r.1);
+                    let fs = forced_vertical(edge.from_anchor).map(|v| side_toward(r.0, r.1, v)).unwrap_or(auto_fs);
+                    let ts = forced_vertical(edge.to_anchor).map(|v| side_toward(r.1, r.0, v)).unwrap_or(auto_ts);
+                    Some((fs, ts))
+                }
             }
         })
         .collect();
@@ -543,8 +610,70 @@ fn draw_edges(
         }
     }
 
+    // A row/column anchor overrides the fan-out spacing above with the
+    // exact position that row or column sits at — only meaningful on
+    // the axis the resolved exit side actually varies along (a column
+    // anchor on a side that leaves top/bottom, a row anchor on one that
+    // leaves left/right); the other axis's anchor, if any, is silently
+    // unusable for this edge's current side and falls back to it.
+    let table_of = |id: &str| match &app.canvas.node(id)?.kind {
+        NodeKind::Text(t) => crate::table::parse(t),
+        _ => None,
+    };
+    // `route`'s own automatic geometry draws one straight line through
+    // wherever the two boxes' extents happen to overlap on the shared
+    // axis — a real spot to put a line, but not necessarily anywhere
+    // near the anchored row/column, and that overlap can be a single
+    // row wide or none at all. An anchored edge routes like an
+    // explicit-sides one instead: each end's own point, independently,
+    // joined by a bend if they don't already line up.
+    let mut anchored = vec![false; app.canvas.edges.len()];
+    for (i, edge) in app.canvas.edges.iter().enumerate() {
+        let Some((from_rect, to_rect)) = rects[i] else { continue };
+        let Some((fs, ts)) = sides[i] else { continue };
+        let mut from_anchored = None;
+        let mut to_anchored = None;
+        if let Some(anchor) = edge.from_anchor
+            && let Some(table) = table_of(&edge.from)
+        {
+            from_anchored = match fs {
+                Side::Top | Side::Bottom => anchor.col.and_then(|c| crate::table::col_center_frac(&table, c, from_rect.width)),
+                Side::Left | Side::Right => anchor.row.and_then(|r| crate::table::row_center_frac(&table, r, from_rect.height)),
+            };
+        }
+        if let Some(anchor) = edge.to_anchor
+            && let Some(table) = table_of(&edge.to)
+        {
+            to_anchored = match ts {
+                Side::Top | Side::Bottom => anchor.col.and_then(|c| crate::table::col_center_frac(&table, c, to_rect.width)),
+                Side::Left | Side::Right => anchor.row.and_then(|r| crate::table::row_center_frac(&table, r, to_rect.height)),
+            };
+        }
+        // When the two boxes line up on an axis, `route`'s own straight
+        // line collapses both ends onto one shared coordinate — read
+        // only from `from_frac`, `to_frac` silently unused. Mirroring a
+        // lone anchor onto the other slot covers that case too, since
+        // whichever slot `route` actually reads then already holds it.
+        match (from_anchored, to_anchored) {
+            (Some(f), None) => {
+                from_frac[i] = f;
+                to_frac[i] = f;
+            }
+            (None, Some(t)) => {
+                from_frac[i] = t;
+                to_frac[i] = t;
+            }
+            (Some(f), Some(t)) => {
+                from_frac[i] = f;
+                to_frac[i] = t;
+            }
+            (None, None) => {}
+        }
+        anchored[i] = from_anchored.is_some() || to_anchored.is_some();
+    }
+
     for i in 0..app.canvas.edges.len() {
-        let (color, to_end, from_end, label, edge_id, explicit_sides) = {
+        let (color, to_end, from_end, label, edge_id, explicit_sides, has_from_anchor, has_to_anchor) = {
             let edge = &app.canvas.edges[i];
             (
                 edge.color.clone(),
@@ -552,7 +681,9 @@ fn draw_edges(
                 edge.from_end,
                 edge.label.clone(),
                 edge.id.clone(),
-                edge.from_side.zip(edge.to_side),
+                edge.from_side.zip(edge.to_side).or(if anchored[i] { sides[i] } else { None }),
+                edge.from_anchor.is_some(),
+                edge.to_anchor.is_some(),
             )
         };
         let Some((from_rect, to_rect)) = rects[i] else { continue };
@@ -591,15 +722,47 @@ fn draw_edges(
         let last = waypoints.len() - 1;
         app.hits.put(rect_at(waypoints[0].0, waypoints[0].1), HitTarget::Reattach(edge_id.clone(), Endpoint::From));
         app.hits.put(rect_at(waypoints[last].0, waypoints[last].1), HitTarget::Reattach(edge_id.clone(), Endpoint::To));
-
+        // The direction an end is entered/left from — read against the
+        // nearest waypoint that actually differs, not just the
+        // adjacent one: a bend that degenerates onto the endpoint (the
+        // straight-line case) leaves a zero-length final leg, and a
+        // direction of (0, 0) both picks a junk arrow glyph and makes
+        // the anchored-arrow step-back below a no-op, parking the
+        // arrow under the `●` that then paints over it.
+        let dir_into = |end: usize, inward: &mut dyn Iterator<Item = usize>| {
+            inward
+                .map(|j| waypoints[j])
+                .find(|&w| w != waypoints[end])
+                .map(|w| (waypoints[end].0 - w.0, waypoints[end].1 - w.1))
+                .unwrap_or((0, 0))
+        };
+        // An anchored end shows both its `●` (on the attachment point
+        // itself) and the arrowhead — one cell can't hold two glyphs,
+        // so the arrow steps back one cell along its own final leg to
+        // make room, rather than either one painting over the other.
         if to_end == EdgeEnd::Arrow {
-            let last = waypoints.len() - 1;
-            let (dx, dy) = (waypoints[last].0 - waypoints[last - 1].0, waypoints[last].1 - waypoints[last - 1].1);
-            put_char(frame, waypoints[last].0, waypoints[last].1, arrow_char(dx, dy), style);
+            let (dx, dy) = dir_into(last, &mut (0..last).rev());
+            let (mut ax, mut ay) = waypoints[last];
+            if has_to_anchor {
+                ax -= dx.signum();
+                ay -= dy.signum();
+            }
+            put_char(frame, ax, ay, arrow_char(dx, dy), style);
         }
         if from_end == EdgeEnd::Arrow {
-            let (dx, dy) = (waypoints[0].0 - waypoints[1].0, waypoints[0].1 - waypoints[1].1);
-            put_char(frame, waypoints[0].0, waypoints[0].1, arrow_char(dx, dy), style);
+            let (dx, dy) = dir_into(0, &mut (1..waypoints.len()));
+            let (mut ax, mut ay) = waypoints[0];
+            if has_from_anchor {
+                ax -= dx.signum();
+                ay -= dy.signum();
+            }
+            put_char(frame, ax, ay, arrow_char(dx, dy), style);
+        }
+        if has_from_anchor {
+            put_char(frame, waypoints[0].0, waypoints[0].1, '●', style);
+        }
+        if has_to_anchor {
+            put_char(frame, waypoints[last].0, waypoints[last].1, '●', style);
         }
 
         let (mx, my) = glyphs.get(glyphs.len() / 2).map(|&(x, y, _)| (x, y)).unwrap_or(waypoints[0]);
@@ -639,6 +802,48 @@ fn rect_at(x: i32, y: i32) -> Rect {
         return Rect::default();
     }
     Rect::new(x as u16, y as u16, 1, 1)
+}
+
+/// Same as `rect_at`, but `w`x`h` instead of a single cell — for a hit
+/// target that needs real room for an imprecise cursor, not just a
+/// render position.
+fn rect_span(x: i32, y: i32, w: u16, h: u16) -> Rect {
+    if x < 0 || y < 0 || x > u16::MAX as i32 || y > u16::MAX as i32 {
+        return Rect::default();
+    }
+    Rect::new(x as u16, y as u16, w, h)
+}
+
+/// Whether a table anchor pins a connector end to leave from the top
+/// or bottom (a column, `true`) or the left or right (a row, `false`)
+/// — `None` for a full cell (row and column both), which doesn't pin a
+/// single axis on its own, or no anchor at all. Forcing the axis here,
+/// not just the position along whichever side gets picked, is what
+/// keeps "attached to this column" true after either box moves: the
+/// ordinary automatic side pick answers a different question (which
+/// side do these two boxes' *current positions* suggest), and moving
+/// one can flip it right off the axis the anchor actually names.
+fn forced_vertical(anchor: Option<CellAnchor>) -> Option<bool> {
+    match anchor {
+        Some(CellAnchor { col: Some(_), row: None }) => Some(true),
+        Some(CellAnchor { row: Some(_), col: None }) => Some(false),
+        _ => None,
+    }
+}
+
+/// The specific top/bottom or left/right side of `this` that faces
+/// `other` — `sides_for`'s own tie-break, reused so a forced axis still
+/// picks whichever concrete side actually points toward the other box.
+fn side_toward(this: Rect, other: Rect, vertical: bool) -> Side {
+    let (tcx, tcy) = center(this);
+    let (ocx, ocy) = center(other);
+    if vertical {
+        if ocy > tcy { Side::Bottom } else { Side::Top }
+    } else if ocx > tcx {
+        Side::Right
+    } else {
+        Side::Left
+    }
 }
 
 /// Which side of `from` an edge leaves on and which side of `to` it
@@ -688,6 +893,7 @@ fn route_explicit(from: Rect, to: Rect, from_frac: f32, to_frac: f32, from_side:
     let e = side_point(from, from_side, from_frac);
     let n = side_point(to, to_side, to_frac);
     let horizontal = |s: Side| matches!(s, Side::Left | Side::Right);
+    let clips = |x: i32, y: i32| inside(from, x, y) || inside(to, x, y);
     match (horizontal(from_side), horizontal(to_side)) {
         (true, true) => {
             let mid_x = (e.0 + n.0) / 2;
@@ -697,8 +903,19 @@ fn route_explicit(from: Rect, to: Rect, from_frac: f32, to_frac: f32, from_side:
             let mid_y = (e.1 + n.1) / 2;
             vec![e, (e.0, mid_y), (n.0, mid_y), n]
         }
-        (true, false) => vec![e, (n.0, e.1), n],
-        (false, true) => vec![e, (e.0, n.1), n],
+        // Two ways to bend between a horizontal exit and a vertical
+        // one — cut across at the source's own row/column first, or
+        // travel out along the source's own exit line first. Forcing
+        // a side against what the boxes' plain positions would've
+        // picked (an anchor's whole point) can make the "cut across
+        // first" order run straight underneath a box sitting in the
+        // way — so it's only used when it actually doesn't.
+        (true, false) => {
+            if clips(n.0, e.1) { vec![e, (e.0, n.1), n] } else { vec![e, (n.0, e.1), n] }
+        }
+        (false, true) => {
+            if clips(e.0, n.1) { vec![e, (n.0, e.1), n] } else { vec![e, (e.0, n.1), n] }
+        }
     }
 }
 
@@ -810,37 +1027,67 @@ fn inside(rect: Rect, x: i32, y: i32) -> bool {
         && y < rect.y as i32 + rect.height as i32
 }
 
-fn clipped_path(from: Rect, to: Rect, start: (i32, i32), end: (i32, i32)) -> Vec<(i32, i32)> {
-    line_cells(start.0, start.1, end.0, end.1)
-        .into_iter()
-        .filter(|&(x, y)| !inside(from, x, y) && !inside(to, x, y))
-        .collect()
+/// A row/column anchor's own position along whichever side it forces —
+/// `None` when there's no table to measure, no anchor on that axis, or
+/// no anchor at all, in which case the caller's own default (a plain
+/// box's own midpoint) stands.
+fn anchor_frac(table: Option<&Table>, anchor: Option<CellAnchor>, vertical: bool, rect: Rect) -> Option<f32> {
+    let table = table?;
+    if vertical {
+        crate::table::col_center_frac(table, anchor?.col?, rect.width)
+    } else {
+        crate::table::row_center_frac(table, anchor?.row?, rect.height)
+    }
 }
 
-/// Bresenham's line algorithm, cell by cell.
-fn line_cells(mut x0: i32, mut y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
-    let mut cells = Vec::new();
-    let dx = (x1 - x0).abs();
-    let dy = -(y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    loop {
-        cells.push((x0, y0));
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
-        }
+/// While a connector's still being dragged, previews it with the exact
+/// same orthogonal-bend routing a landed one gets, rather than a raw
+/// diagonal line toward the pointer that never looked like what
+/// letting go would actually draw. `from_anchor`, when the drag
+/// started on a row/column dot, forces the same exit axis and position
+/// the final edge would end up with. `hover_target`, when the cursor
+/// is currently over another box (and, if that box is a table, the
+/// anchor a drop right there would carry), previews the far end the
+/// same way — so aiming at a specific row/column doesn't just work at
+/// the source, it can be seen and aimed at the destination too, before
+/// ever letting go.
+fn draw_drag_preview(
+    frame: &mut Frame,
+    from_node: &Node,
+    from_anchor: Option<CellAnchor>,
+    cursor: (u16, u16),
+    hover_target: Option<(&Node, Option<CellAnchor>)>,
+) {
+    let from_rect = from_node.rect;
+    let from_table = crate::table::parse(&display_text(from_node));
+    let (to_rect, to_anchor, to_table) = match hover_target {
+        Some((node, anchor)) => (node.rect, anchor, crate::table::parse(&display_text(node))),
+        None => (Rect::new(cursor.0, cursor.1, 1, 1), None, None),
+    };
+
+    let (auto_fs, auto_ts) = sides_for(from_rect, to_rect);
+    let from_vertical = forced_vertical(from_anchor);
+    let to_vertical = forced_vertical(to_anchor);
+    let fs = from_vertical.map(|v| side_toward(from_rect, to_rect, v)).unwrap_or(auto_fs);
+    let ts = to_vertical.map(|v| side_toward(to_rect, from_rect, v)).unwrap_or(auto_ts);
+    let from_frac = from_vertical.and_then(|v| anchor_frac(from_table.as_ref(), from_anchor, v, from_rect)).unwrap_or(0.5);
+    let to_frac = to_vertical.and_then(|v| anchor_frac(to_table.as_ref(), to_anchor, v, to_rect)).unwrap_or(0.5);
+    let sides = (from_vertical.is_some() || to_vertical.is_some()).then_some((fs, ts));
+
+    let waypoints = route(from_rect, to_rect, from_frac, to_frac, sides);
+    let style = Style::default().fg(RColor::DarkGray);
+    let glyphs: Vec<(i32, i32, char)> = route_glyphs(&waypoints)
+        .into_iter()
+        .filter(|&(x, y, _)| !inside(from_rect, x, y) && !inside(to_rect, x, y))
+        .collect();
+    for &(x, y, ch) in &glyphs {
+        put_char(frame, x, y, ch, style);
     }
-    cells
+    if waypoints.len() >= 2 {
+        let last = waypoints.len() - 1;
+        let (dx, dy) = (waypoints[last].0 - waypoints[last - 1].0, waypoints[last].1 - waypoints[last - 1].1);
+        put_char(frame, waypoints[last].0, waypoints[last].1, arrow_char(dx, dy), style);
+    }
 }
 
 fn arrow_char(dx: i32, dy: i32) -> char {
@@ -850,12 +1097,6 @@ fn arrow_char(dx: i32, dy: i32) -> char {
         'v'
     } else {
         '^'
-    }
-}
-
-fn draw_path(frame: &mut Frame, path: &[(i32, i32)], style: Style) {
-    for &(x, y) in path {
-        put_char(frame, x, y, '·', style);
     }
 }
 

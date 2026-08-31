@@ -153,3 +153,52 @@ pub fn render_size(table: &Table) -> (u16, u16) {
     let height = (content_lines + seps + 2).max(4) as u16;
     (width, height)
 }
+
+/// Where a column's own center sits, as a 0..1 fraction of a box this
+/// wide — the same padding/border layout `render_size`/the grid
+/// renderer already use, so a connector anchored to a column lines up
+/// with it exactly rather than approximately.
+pub fn col_center_frac(table: &Table, col: usize, box_width: u16) -> Option<f32> {
+    let widths = col_widths(table);
+    if col >= widths.len() {
+        return None;
+    }
+    if box_width < 2 {
+        return Some(0.5);
+    }
+    let mut x = 1u32; // the left border
+    for (i, &cw) in widths.iter().enumerate() {
+        let seg = cw as u32 + 2; // one padding space each side
+        if i == col {
+            let center = x as f32 + seg as f32 / 2.0;
+            return Some((center / box_width as f32).clamp(0.0, 1.0));
+        }
+        x += seg + 1; // + the divider before the next column
+    }
+    None
+}
+
+/// Where a row's own center sits, as a 0..1 fraction of a box this
+/// tall — mirrors `col_center_frac`, accounting for the one grid line
+/// under the header and any row that's taller than one line.
+pub fn row_center_frac(table: &Table, row: usize, box_height: u16) -> Option<f32> {
+    if row >= table.len() {
+        return None;
+    }
+    if box_height < 2 {
+        return Some(0.5);
+    }
+    let mut y = 1u32; // the top border
+    for (i, r) in table.iter().enumerate() {
+        let rh = row_height(r) as u32;
+        if i == row {
+            let center = y as f32 + rh as f32 / 2.0;
+            return Some((center / box_height as f32).clamp(0.0, 1.0));
+        }
+        y += rh;
+        if i == 0 && table.len() > 1 {
+            y += 1; // the header's own grid line
+        }
+    }
+    None
+}

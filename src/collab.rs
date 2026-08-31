@@ -57,6 +57,10 @@ pub struct EdgeFields {
     pub to_side: Option<String>,
     pub from_end: String,
     pub to_end: String,
+    pub from_row: Option<i64>,
+    pub from_col: Option<i64>,
+    pub to_row: Option<i64>,
+    pub to_col: Option<i64>,
     pub color: Option<String>,
     pub label: Option<String>,
 }
@@ -187,13 +191,21 @@ impl Collab {
             Some(s) => Any::String(Arc::from(s.as_str())),
             None => Any::Null,
         };
-        let entry: [(Arc<str>, In); 8] = [
+        let opt_int = |v: Option<i64>| match v {
+            Some(n) => Any::BigInt(n),
+            None => Any::Null,
+        };
+        let entry: [(Arc<str>, In); 12] = [
             (Arc::from("from"), In::Any(Any::String(Arc::from(f.from.as_str())))),
             (Arc::from("to"), In::Any(Any::String(Arc::from(f.to.as_str())))),
             (Arc::from("from_side"), In::Any(opt_string(&f.from_side))),
             (Arc::from("to_side"), In::Any(opt_string(&f.to_side))),
             (Arc::from("from_end"), In::Any(Any::String(Arc::from(f.from_end.as_str())))),
             (Arc::from("to_end"), In::Any(Any::String(Arc::from(f.to_end.as_str())))),
+            (Arc::from("from_row"), In::Any(opt_int(f.from_row))),
+            (Arc::from("from_col"), In::Any(opt_int(f.from_col))),
+            (Arc::from("to_row"), In::Any(opt_int(f.to_row))),
+            (Arc::from("to_col"), In::Any(opt_int(f.to_col))),
             (Arc::from("color"), In::Any(opt_string(&f.color))),
             (Arc::from("label"), In::Any(opt_string(&f.label))),
         ];
@@ -226,6 +238,11 @@ impl Collab {
                 Some(Any::String(s)) => Some(s.to_string()),
                 _ => None,
             };
+            let get_opt_int = |k: &str| match fields.get(k) {
+                Some(Any::BigInt(n)) => Some(*n),
+                Some(Any::Number(n)) => Some(*n as i64),
+                _ => None,
+            };
             out.push((
                 key.to_string(),
                 EdgeFields {
@@ -235,6 +252,10 @@ impl Collab {
                     to_side: get_opt_str("to_side"),
                     from_end: get_str("from_end"),
                     to_end: get_str("to_end"),
+                    from_row: get_opt_int("from_row"),
+                    from_col: get_opt_int("from_col"),
+                    to_row: get_opt_int("to_row"),
+                    to_col: get_opt_int("to_col"),
                     color: get_opt_str("color"),
                     label: get_opt_str("label"),
                 },

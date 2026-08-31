@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Canvas, Color, Edge, EdgeEnd, Node, NodeKind, Shape, Side};
+use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, Side};
 
 /// A board, in the shape https://jsoncanvas.org/spec/1.0/ describes on
 /// disk — also what `Request::State` hands back over `--api`.
@@ -80,6 +80,19 @@ pub enum FileNode {
     },
 }
 
+/// Which row and/or column of a table box a connector end lines up
+/// with. Not part of the JSON Canvas spec — a `ratslate`-prefixed field
+/// so it can never collide with a future official one, and so an
+/// unrecognized reader's "ignore what I don't know" behavior is
+/// unambiguously the right call rather than an accident of naming.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+pub struct FileAnchor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub col: Option<usize>,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FileEdge {
     pub id: String,
@@ -89,12 +102,16 @@ pub struct FileEdge {
     pub from_side: Option<String>,
     #[serde(rename = "fromEnd", skip_serializing_if = "Option::is_none")]
     pub from_end: Option<String>,
+    #[serde(rename = "ratslateFromAnchor", skip_serializing_if = "Option::is_none")]
+    pub from_anchor: Option<FileAnchor>,
     #[serde(rename = "toNode")]
     pub to_node: String,
     #[serde(rename = "toSide", skip_serializing_if = "Option::is_none")]
     pub to_side: Option<String>,
     #[serde(rename = "toEnd", skip_serializing_if = "Option::is_none")]
     pub to_end: Option<String>,
+    #[serde(rename = "ratslateToAnchor", skip_serializing_if = "Option::is_none")]
+    pub to_anchor: Option<FileAnchor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,6 +269,7 @@ fn from_file(root: FileRoot) -> Canvas {
             } else {
                 EdgeEnd::None
             },
+            from_anchor: fedge.from_anchor.map(|a| CellAnchor { row: a.row, col: a.col }),
             to: fedge.to_node,
             to_side: fedge.to_side.as_deref().and_then(parse_side),
             to_end: if fedge.to_end.as_deref() == Some("none") {
@@ -259,6 +277,7 @@ fn from_file(root: FileRoot) -> Canvas {
             } else {
                 EdgeEnd::Arrow
             },
+            to_anchor: fedge.to_anchor.map(|a| CellAnchor { row: a.row, col: a.col }),
             color: fedge.color.as_deref().map(Color::parse),
             label: fedge.label,
         });
@@ -336,9 +355,11 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
             from_node: e.from.clone(),
             from_side: e.from_side.map(side_to_string).map(str::to_string),
             from_end: (e.from_end == EdgeEnd::Arrow).then(|| "arrow".to_string()),
+            from_anchor: e.from_anchor.map(|a| FileAnchor { row: a.row, col: a.col }),
             to_node: e.to.clone(),
             to_side: e.to_side.map(side_to_string).map(str::to_string),
             to_end: (e.to_end == EdgeEnd::None).then(|| "none".to_string()),
+            to_anchor: e.to_anchor.map(|a| FileAnchor { row: a.row, col: a.col }),
             color: e.color.as_ref().map(Color::to_string),
             label: e.label.clone(),
         })

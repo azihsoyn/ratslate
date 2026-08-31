@@ -48,6 +48,25 @@ pub enum HitTarget {
     /// preset is `Some("1")`..`Some("6")`; anything else is a literal
     /// hex string.
     ColorSwatch(Selected, Option<String>),
+    /// A row/column button on an open table editor — `Ctrl`+arrow does
+    /// the same thing, but plenty of terminals never forward that
+    /// combination at all, so this is the reliable way to reach it.
+    TableMenu(ShapeId, TableOp),
+    /// One rendered cell of a table box. A click here jumps straight to
+    /// that cell instead of always landing on `(0, 0)` — direct if the
+    /// table is already open for editing, a double-click (matching any
+    /// other box's own open gesture) if it isn't yet.
+    TableCell(ShapeId, usize, usize),
+}
+
+/// What one of a table's row/column buttons does, always relative to
+/// whichever cell is currently open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableOp {
+    AddCol,
+    DelCol,
+    AddRow,
+    DelRow,
 }
 
 impl HitTarget {
@@ -57,7 +76,11 @@ impl HitTarget {
     fn node_id(&self) -> Option<&ShapeId> {
         match self {
             HitTarget::Move(id) | HitTarget::Connect(id) | HitTarget::Resize(id, _) => Some(id),
-            HitTarget::Reattach(..) | HitTarget::ColorMenu(_) | HitTarget::ColorSwatch(..) => None,
+            HitTarget::Reattach(..)
+            | HitTarget::ColorMenu(_)
+            | HitTarget::ColorSwatch(..)
+            | HitTarget::TableMenu(..)
+            | HitTarget::TableCell(..) => None,
         }
     }
 }
@@ -75,6 +98,10 @@ pub enum Selected {
 pub enum Mode {
     Normal,
     Editing(Selected),
+    /// A table box's grid, open for editing one cell (row, col) at a
+    /// time — `editing_table` holds the whole staged grid, committed
+    /// back to the box's text as one GFM table on Esc.
+    EditingCell(ShapeId, usize, usize),
 }
 
 /// Every way the board can change. The TUI's mouse and key handlers
@@ -226,6 +253,10 @@ pub struct App {
     pub hover_swatch: Option<(Selected, Option<Color>)>,
     pub mode: Mode,
     pub editing_text: String,
+    /// The whole grid staged for `Mode::EditingCell`, `editing_text`
+    /// mirroring whichever one cell is live right now. Empty outside
+    /// that mode.
+    pub editing_table: crate::table::Table,
     pub should_quit: bool,
     pub save_path: Option<PathBuf>,
     pub status: String,
@@ -307,6 +338,7 @@ impl App {
             hover_swatch: None,
             mode: Mode::Normal,
             editing_text: String::new(),
+            editing_table: Vec::new(),
             should_quit: false,
             save_path,
             status,
@@ -638,12 +670,22 @@ impl App {
     /// acted on, so clicking away from an edit-in-progress can never
     /// lose it the way jumping straight to a different mode used to.
     fn commit_edit(&mut self) {
-        let Mode::Editing(target) = self.mode.clone() else { return };
-        let text = std::mem::take(&mut self.editing_text);
-        let _ = match target {
-            Selected::Node(id) => self.dispatch(Request::SetText { id, text }),
-            Selected::Edge(id) => self.dispatch(Request::SetLabel { id, label: Some(text) }),
-        };
+        match self.mode.clone() {
+            Mode::Editing(target) => {
+                let text = std::mem::take(&mut self.editing_text);
+                let _ = match target {
+                    Selected::Node(id) => self.dispatch(Request::SetText { id, text }),
+                    Selected::Edge(id) => self.dispatch(Request::SetLabel { id, label: Some(text) }),
+                };
+            }
+            Mode::EditingCell(id, row, col) => {
+                self.sync_cell(row, col);
+                let text = crate::table::format(&self.editing_table);
+                self.editing_table = Vec::new();
+                let _ = self.dispatch(Request::SetText { id, text });
+            }
+            Mode::Normal => return,
+        }
         self.mode = Mode::Normal;
     }
 
@@ -656,6 +698,162 @@ impl App {
             Selected::Edge(id) => self.canvas.edge(id).and_then(|e| e.label.clone()).unwrap_or_default(),
         };
         self.mode = Mode::Editing(target);
+    }
+
+    /// Opens a box's content as a grid — parsed as a GFM table if it
+    /// already is one, or a fresh one-header-one-row blank if it isn't
+    /// (or is empty), so `t` always lands somewhere editable.
+    fn begin_table_edit(&mut self, id: ShapeId) {
+        self.begin_table_edit_at(id, 0, 0);
+    }
+
+    /// Same as `begin_table_edit`, but opens straight on `(row, col)`
+    /// instead of always `(0, 0)` — a double-click on a specific cell of
+    /// a table that isn't open for editing yet should land right there.
+    fn begin_table_edit_at(&mut self, id: ShapeId, row: usize, col: usize) {
+        let current = match self.canvas.node(&id).map(|n| &n.kind) {
+            Some(NodeKind::Text(t)) => t.clone(),
+            _ => return,
+        };
+        self.editing_table = crate::table::parse(&current).unwrap_or_else(crate::table::blank);
+        let (rows, cols) = self.table_dims();
+        let r = row.min(rows.saturating_sub(1));
+        let c = col.min(cols.saturating_sub(1));
+        self.table_goto(id, r, c);
+    }
+
+    fn table_dims(&self) -> (usize, usize) {
+        let rows = self.editing_table.len();
+        let cols = self.editing_table.first().map(Vec::len).unwrap_or(0);
+        (rows, cols)
+    }
+
+    fn sync_cell(&mut self, row: usize, col: usize) {
+        if let Some(cell) = self.editing_table.get_mut(row).and_then(|r| r.get_mut(col)) {
+            *cell = crate::table::encode_break(&std::mem::take(&mut self.editing_text));
+        }
+    }
+
+    /// Loads `(row, col)`'s content into the scratch buffer and makes
+    /// it the live cell — the tail end of every table navigation key.
+    fn table_goto(&mut self, id: ShapeId, row: usize, col: usize) {
+        let stored = self.editing_table.get(row).and_then(|r| r.get(col)).map(String::as_str).unwrap_or("");
+        self.editing_text = crate::table::decode_break(stored);
+        self.table_grow_to_fit(&id, row, col);
+        self.mode = Mode::EditingCell(id, row, col);
+    }
+
+    /// Grows (never shrinks) the box being edited so the grid always
+    /// has room for every column and row — checked on every table nav
+    /// key, since that's when the row/column count can have changed,
+    /// and on every line break typed into the live cell, since that
+    /// changes row height without any navigation at all. `editing_text`
+    /// isn't written back to `editing_table` until the cell is left, so
+    /// this patches a scratch copy the same way the renderer does —
+    /// measuring the stale table would leave a growing cell clipped
+    /// until the next Tab/Enter synced it.
+    fn table_grow_to_fit(&mut self, id: &ShapeId, row: usize, col: usize) {
+        let Some(node) = self.canvas.node(id) else { return };
+        let mut patched = self.editing_table.clone();
+        if let Some(cell) = patched.get_mut(row).and_then(|r| r.get_mut(col)) {
+            *cell = crate::table::encode_break(&self.editing_text);
+        }
+        let (needed_w, needed_h) = crate::table::render_size(&patched);
+        let (w, h) = (needed_w.max(node.rect.width), needed_h.max(node.rect.height));
+        if w == node.rect.width && h == node.rect.height {
+            return;
+        }
+        let (x, y) = (node.rect.x, node.rect.y);
+        let max_w = self.canvas_area.right().saturating_sub(x).max(w);
+        let max_h = self.canvas_area.bottom().saturating_sub(y).max(h);
+        let _ = self.dispatch(Request::SetRect { id: id.clone(), x, y, w: w.min(max_w), h: h.min(max_h) });
+    }
+
+    /// `Tab`/`Shift+Tab`: across, wrapping to the next or previous row.
+    /// Tabbing past the last cell of the last row grows the table by
+    /// one row — the usual way a spreadsheet keeps a table growing.
+    fn table_tab(&mut self, id: ShapeId, row: usize, col: usize, backward: bool) {
+        self.sync_cell(row, col);
+        let (rows, cols) = self.table_dims();
+        let (r, c) = if backward {
+            if col == 0 {
+                if row == 0 { (row, col) } else { (row - 1, cols.saturating_sub(1)) }
+            } else {
+                (row, col - 1)
+            }
+        } else if col + 1 >= cols {
+            if row + 1 >= rows {
+                self.editing_table.push(vec![String::new(); cols]);
+            }
+            (row + 1, 0)
+        } else {
+            (row, col + 1)
+        };
+        self.table_goto(id, r, c);
+    }
+
+    /// `Enter`: down within the same column, growing a new row at the
+    /// end the same way `Tab` does — the fast way to fill one column
+    /// down a whole table.
+    fn table_enter(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.sync_cell(row, col);
+        let (rows, cols) = self.table_dims();
+        if row + 1 >= rows {
+            self.editing_table.push(vec![String::new(); cols]);
+        }
+        self.table_goto(id, row + 1, col);
+    }
+
+    /// Arrow keys: plain navigation, clamped to the grid's own bounds —
+    /// unlike `Tab`/`Enter`, never grows it.
+    fn table_move(&mut self, id: ShapeId, row: usize, col: usize, dr: i32, dc: i32) {
+        self.sync_cell(row, col);
+        let (rows, cols) = self.table_dims();
+        let r = (row as i32 + dr).clamp(0, rows as i32 - 1) as usize;
+        let c = (col as i32 + dc).clamp(0, cols as i32 - 1) as usize;
+        self.table_goto(id, r, c);
+    }
+
+    fn table_insert_col(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.sync_cell(row, col);
+        for r in &mut self.editing_table {
+            r.insert(col + 1, String::new());
+        }
+        self.table_goto(id, row, col + 1);
+    }
+
+    /// A no-op with the grid's last column, rather than emptying the
+    /// table entirely — there's always at least one column to type
+    /// into.
+    fn table_delete_col(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.sync_cell(row, col);
+        let (_, cols) = self.table_dims();
+        if cols > 1 {
+            for r in &mut self.editing_table {
+                r.remove(col);
+            }
+        }
+        let (_, cols) = self.table_dims();
+        self.table_goto(id, row, col.min(cols - 1));
+    }
+
+    fn table_insert_row(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.sync_cell(row, col);
+        let (_, cols) = self.table_dims();
+        self.editing_table.insert(row + 1, vec![String::new(); cols]);
+        self.table_goto(id, row + 1, col);
+    }
+
+    /// A no-op on the header row, or once only the header and one data
+    /// row are left — a table always keeps both.
+    fn table_delete_row(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.sync_cell(row, col);
+        let (rows, _) = self.table_dims();
+        if row != 0 && rows > 2 {
+            self.editing_table.remove(row);
+        }
+        let (rows, _) = self.table_dims();
+        self.table_goto(id, row.min(rows - 1), col);
     }
 
     /// Grows the box being edited so a newline, or text wrapping past
@@ -701,7 +899,20 @@ impl App {
         let mut hit = self.hits.at(ev.column, ev.row);
 
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            self.commit_edit();
+            // A table's own +/- buttons, and a click on another cell of
+            // the very table already open, both act on the edit in
+            // progress — committing (and so leaving `EditingCell`)
+            // before either click is even handled would make them
+            // silently no-op instead of landing where they're aimed.
+            let stays_in_same_table = match &hit {
+                Some((HitTarget::TableMenu(id, _), _)) | Some((HitTarget::TableCell(id, _, _), _)) => {
+                    matches!(&self.mode, Mode::EditingCell(mode_id, ..) if mode_id == id)
+                }
+                _ => false,
+            };
+            if !stays_in_same_table {
+                self.commit_edit();
+            }
 
             // Shift turns a grab on a box into a connector draw instead
             // of a move — the same body hit, reinterpreted.
@@ -767,6 +978,36 @@ impl App {
                 };
                 self.color_picker = None;
                 self.hover_swatch = None;
+            }
+            Did::Click(HitTarget::TableCell(id, row, col)) => {
+                self.color_picker = None;
+                self.hover_swatch = None;
+                if let Mode::EditingCell(mode_id, cur_row, cur_col) = self.mode.clone()
+                    && mode_id == id
+                {
+                    // Already open for editing — a click on any other
+                    // cell just jumps the cursor straight there.
+                    self.sync_cell(cur_row, cur_col);
+                    self.table_goto(id, row, col);
+                } else {
+                    let selected = Selected::Node(id.clone());
+                    let _ = self.dispatch(Request::Select { id: Some(selected.clone()) });
+                    if self.is_double_click(selected.clone()) {
+                        self.begin_table_edit_at(id, row, col);
+                    }
+                }
+            }
+            Did::Click(HitTarget::TableMenu(id, op)) => {
+                if let Mode::EditingCell(mode_id, row, col) = self.mode.clone()
+                    && mode_id == id
+                {
+                    match op {
+                        TableOp::AddCol => self.table_insert_col(id, row, col),
+                        TableOp::DelCol => self.table_delete_col(id, row, col),
+                        TableOp::AddRow => self.table_insert_row(id, row, col),
+                        TableOp::DelRow => self.table_delete_row(id, row, col),
+                    }
+                }
             }
             Did::Click(target) => {
                 self.color_picker = None;
@@ -908,6 +1149,35 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::EditingCell(id, row, col) => match key.code {
+                KeyCode::Esc => self.commit_edit(),
+                KeyCode::Tab => self.table_tab(id, row, col, false),
+                KeyCode::BackTab => self.table_tab(id, row, col, true),
+                // Plain Enter moves down a row, spreadsheet-style — a
+                // line break within a cell needs its own key, same
+                // reasoning as a connector's one-line label vs a box's
+                // own free-form Enter.
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.editing_text.push('\n');
+                    self.table_grow_to_fit(&id, row, col);
+                }
+                KeyCode::Enter => self.table_enter(id, row, col),
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => self.table_insert_col(id, row, col),
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => self.table_delete_col(id, row, col),
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => self.table_insert_row(id, row, col),
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => self.table_delete_row(id, row, col),
+                KeyCode::Left => self.table_move(id, row, col, 0, -1),
+                KeyCode::Right => self.table_move(id, row, col, 0, 1),
+                KeyCode::Up => self.table_move(id, row, col, -1, 0),
+                KeyCode::Down => self.table_move(id, row, col, 1, 0),
+                KeyCode::Backspace => {
+                    self.editing_text.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.editing_text.push(c);
+                }
+                _ => {}
+            },
             Mode::Normal => match key.code {
                 KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.undo();
@@ -970,6 +1240,15 @@ impl App {
                     }
                     None => {}
                 },
+                // Opens the selected box's content as a grid — a GFM
+                // table already there, or a fresh blank one otherwise.
+                // Still nothing but a text box's own text underneath;
+                // any other JSON Canvas reader sees plain markdown.
+                KeyCode::Char('t') => {
+                    if let Some(Selected::Node(id)) = self.selected.clone() {
+                        self.begin_table_edit(id);
+                    }
+                }
                 KeyCode::Char('d') | KeyCode::Delete => match self.selected.clone() {
                     Some(Selected::Node(id)) => {
                         let _ = self.dispatch(Request::Delete { id });

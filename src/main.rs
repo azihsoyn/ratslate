@@ -3,6 +3,7 @@ mod canvas_io;
 mod collab;
 mod model;
 mod render;
+mod table;
 
 use std::io;
 use std::path::PathBuf;

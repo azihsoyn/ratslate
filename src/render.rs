@@ -2,11 +2,15 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Color as RColor, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, BorderType, Paragraph, Wrap},
 };
 
-use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected};
+use ratatui_dnd::Hits;
+
+use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected, TableOp};
 use crate::model::{Color, EdgeEnd, Node, NodeKind, Shape, Side};
+use crate::table::Table;
 
 pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: Rect) {
     app.hits.clear();
@@ -52,7 +56,26 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             .as_ref()
             .filter(|(t, _)| t == &target)
             .map(|(_, color)| color.as_ref().map(ratatui_color));
-        draw_node(frame, node, selected, editing, &app.editing_text, preview);
+
+        let table_cursor = match &app.mode {
+            Mode::EditingCell(id, r, c) if id == &node.id => Some((*r, *c)),
+            _ => None,
+        };
+        if table_cursor.is_some() {
+            let view = TableView { node, selected, table: &app.editing_table, cursor: table_cursor, editing_text: &app.editing_text, preview };
+            draw_table_node(frame, view, &mut app.hits);
+        } else if let Some(table) = crate::table::parse(&display_text(node)) {
+            let view = TableView { node, selected, table: &table, cursor: None, editing_text: "", preview };
+            draw_table_node(frame, view, &mut app.hits);
+        } else {
+            draw_node(frame, node, selected, editing, &app.editing_text, preview);
+        }
+    }
+
+    if let Mode::EditingCell(id, _, _) = app.mode.clone()
+        && let Some(node) = app.canvas.node(&id)
+    {
+        draw_table_menu(frame, app, &id, node.rect, canvas_area);
     }
 
     if let Some(Selected::Node(id)) = app.selected.clone()
@@ -125,10 +148,10 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
 /// would apply — shown as if it already had, so picking one isn't a
 /// guess. `Some(None)` previews clearing the color; `None` (outer)
 /// means nothing's hovered, so the node's own color shows as normal.
-fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, editing_text: &str, preview: Option<Option<RColor>>) {
+fn node_style(color: Option<&Color>, selected: bool, preview: Option<Option<RColor>>) -> (Style, Style) {
     let shown = match preview {
         Some(p) => p,
-        None => node.color.as_ref().map(ratatui_color),
+        None => color.map(ratatui_color),
     };
     let base = shown.map(|c| Style::default().fg(c)).unwrap_or_default();
     // Bold-on-whatever-color-it-already-has is easy to miss, especially
@@ -141,6 +164,11 @@ fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, edit
     } else {
         base
     };
+    (base, border_style)
+}
+
+fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, editing_text: &str, preview: Option<Option<RColor>>) {
+    let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
     let mut block = Block::bordered().border_style(border_style);
     if node.shape == Shape::Rounded {
@@ -158,6 +186,215 @@ fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, edit
             Paragraph::new(text).style(base).wrap(Wrap { trim: false }),
             inner,
         );
+    }
+}
+
+/// Everything `draw_table_node` needs about the box itself, bundled so
+/// the function doesn't outgrow clippy's own argument-count lint —
+/// `hits` stays a separate parameter since it's mutated, not read.
+struct TableView<'a> {
+    node: &'a Node,
+    selected: bool,
+    table: &'a Table,
+    cursor: Option<(usize, usize)>,
+    editing_text: &'a str,
+    preview: Option<Option<RColor>>,
+}
+
+/// A box whose content parses as a GFM table, drawn as an actual grid
+/// instead of raw `| a | b |` text. `cursor`, while this box is the
+/// one open in `Mode::EditingCell`, is the live cell — shown reversed,
+/// with `editing_text` (not the table's own stale copy) as its content.
+fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget>) {
+    let TableView { node, selected, table, cursor, editing_text, preview } = view;
+    let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
+
+    let mut block = Block::bordered().border_style(border_style);
+    if node.shape == Shape::Rounded {
+        block = block.border_type(BorderType::Rounded);
+    }
+    let inner = block.inner(node.rect);
+    frame.render_widget(block, node.rect);
+
+    // The cell actually being typed into lives in `editing_text`, not
+    // yet written back to `table` (that only happens on navigating away
+    // from it) — patch it in before measuring column widths, or the
+    // column showing it renders one keystroke behind its own content.
+    // Re-encoded to `<br>` on the way in so every cell in the patched
+    // table agrees on how a line break is spelled, live multi-line
+    // typing included.
+    let mut patched;
+    let table: &Table = if let Some((cr, cc)) = cursor {
+        patched = table.clone();
+        if let Some(cell) = patched.get_mut(cr).and_then(|r| r.get_mut(cc)) {
+            *cell = crate::table::encode_break(editing_text);
+        }
+        &patched
+    } else {
+        table
+    };
+
+    let widths = crate::table::col_widths(table);
+
+    // The x of each internal column divider — a plain `Block` has no
+    // idea a divider is about to touch its border, so left alone the
+    // join reads as a gap (the border's own `─`/`│` glyph doesn't
+    // connect to the grid's) rather than a proper `┬`/`┴`/`├`/`┤`
+    // junction. Patched into the buffer once the whole grid is drawn.
+    // Bounded to `inner` — the box may not have grown to fit the full
+    // table yet (auto-grow only runs from interactive navigation), and
+    // an unclipped divider position would poke a junction glyph into
+    // whatever the box's content is already clipped away from, well
+    // outside its own border.
+    let divider_xs: Vec<u16> = {
+        let mut xs = Vec::new();
+        let mut cx = inner.x;
+        for (c, &w) in widths.iter().enumerate() {
+            if c > 0 {
+                if cx >= inner.right() {
+                    break;
+                }
+                xs.push(cx);
+                cx += 1;
+            }
+            cx += w as u16 + 2;
+        }
+        xs
+    };
+
+    let mut y = inner.y;
+    let mut header_sep_y = None;
+    for (r, row) in table.iter().enumerate() {
+        if y >= inner.bottom() {
+            break;
+        }
+        // A row is as tall as its tallest cell — most rows are one
+        // line, but a cell with its own line break within it stretches
+        // every other cell in the row to match.
+        let cols_lines: Vec<Vec<&str>> = widths
+            .iter()
+            .enumerate()
+            .map(|(c, _)| crate::table::cell_lines(row.get(c).map(String::as_str).unwrap_or("")))
+            .collect();
+        let row_h = cols_lines.iter().map(Vec::len).max().unwrap_or(1).max(1);
+
+        let row_top = y;
+        for line_idx in 0..row_h {
+            if y >= inner.bottom() {
+                break;
+            }
+            let mut spans = Vec::new();
+            for (c, &w) in widths.iter().enumerate() {
+                if c > 0 {
+                    spans.push(Span::styled("│", base));
+                }
+                let is_cursor = cursor == Some((r, c));
+                let lines = &cols_lines[c];
+                let content = lines.get(line_idx).copied().unwrap_or("");
+                // One space of breathing room on each side of the
+                // content, not just a bare column butted up against the
+                // divider — `col_widths`/`render_size` already size the
+                // box assuming this padding is here.
+                let mut text = format!(" {content:<w$}");
+                if is_cursor && line_idx + 1 == lines.len().max(1) {
+                    text.push('▏');
+                } else {
+                    text.push(' ');
+                }
+                let mut cell_style = base;
+                if r == 0 {
+                    cell_style = cell_style.add_modifier(Modifier::BOLD);
+                }
+                if is_cursor {
+                    cell_style = cell_style.add_modifier(Modifier::REVERSED);
+                }
+                spans.push(Span::styled(text, cell_style));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), Rect::new(inner.x, y, inner.width, 1));
+            y += 1;
+        }
+        // One hit rect per cell spanning its whole row height, not one
+        // per display line — a click anywhere in a multi-line cell
+        // should still land on it.
+        let mut cx = inner.x;
+        for (c, &w) in widths.iter().enumerate() {
+            if c > 0 {
+                cx += 1;
+            }
+            let cell_w = w as u16 + 2;
+            let cell_rect = Rect::new(cx, row_top, cell_w.min(inner.right().saturating_sub(cx)), y.saturating_sub(row_top).min(inner.bottom().saturating_sub(row_top)));
+            if !cell_rect.is_empty() {
+                hits.put(cell_rect, HitTarget::TableCell(node.id.clone(), r, c));
+            }
+            cx += cell_w;
+        }
+        // One grid line, right under the header — the column dividers
+        // already run the full height, so a line between every data
+        // row just reads as noise rather than making anything clearer.
+        // Padded to match the cells' own padded width, or the divider
+        // `┼`s would land one column off from the `│`s above and below
+        // them.
+        if y < inner.bottom() && r == 0 && table.len() > 1 {
+            let sep: String = widths
+                .iter()
+                .enumerate()
+                .map(|(i, &w)| if i == 0 { "─".repeat(w + 2) } else { format!("┼{}", "─".repeat(w + 2)) })
+                .collect();
+            frame.render_widget(Paragraph::new(sep).style(base), Rect::new(inner.x, y, inner.width, 1));
+            header_sep_y = Some(y);
+            y += 1;
+        }
+    }
+
+    let buf = frame.buffer_mut();
+    for &dx in &divider_xs {
+        if let Some(cell) = buf.cell_mut((dx, node.rect.y)) {
+            cell.set_symbol("┬");
+        }
+    }
+    // The bottom border only gets `┴` junctions when the grid actually
+    // reaches it — `table_grow_to_fit` never shrinks the box, so a
+    // taller-than-needed one leaves blank rows below the last divider,
+    // and a junction there would float disconnected from any line.
+    if y >= inner.bottom() {
+        for &dx in &divider_xs {
+            if node.rect.bottom() > node.rect.y
+                && let Some(cell) = buf.cell_mut((dx, node.rect.bottom() - 1))
+            {
+                cell.set_symbol("┴");
+            }
+        }
+    }
+    if let Some(sep_y) = header_sep_y {
+        if let Some(cell) = buf.cell_mut((node.rect.x, sep_y)) {
+            cell.set_symbol("├");
+        }
+        if node.rect.right() > node.rect.x
+            && let Some(cell) = buf.cell_mut((node.rect.right() - 1, sep_y))
+        {
+            cell.set_symbol("┤");
+        }
+    }
+}
+
+/// Row/column buttons for an open table editor, one row below the box
+/// — `Ctrl`+arrow does the same thing, but plenty of terminals never
+/// forward that combination at all, so this is the reliable path to it.
+fn draw_table_menu(frame: &mut Frame, app: &mut App, id: &str, node_rect: Rect, canvas_area: Rect) {
+    let y = node_rect.bottom();
+    let mut x = node_rect.x;
+    for (label, op) in [
+        ("+col", TableOp::AddCol),
+        ("-col", TableOp::DelCol),
+        ("+row", TableOp::AddRow),
+        ("-row", TableOp::DelRow),
+    ] {
+        let rect = Rect::new(x, y, label.len() as u16, 1).intersection(canvas_area);
+        if !rect.is_empty() {
+            app.hits.put(rect, HitTarget::TableMenu(id.to_string(), op));
+            frame.render_widget(Paragraph::new(label).style(Style::default().fg(RColor::DarkGray)), rect);
+        }
+        x += label.len() as u16 + 1;
     }
 }
 
@@ -637,8 +874,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let mode = match &app.mode {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
+        Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · +col/-col/+row/-row buttons below · esc done)",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · drag move · shift+drag connect · corner resize · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · corner resize · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

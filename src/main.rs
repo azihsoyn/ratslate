@@ -65,22 +65,51 @@ fn main() -> io::Result<()> {
 }
 
 fn run_whiteboard(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
+    let mut canvas_area = Rect::default();
+    // Redraw only when something actually happened — an input event, a
+    // change merged from another writer, or the first frame. Any-motion
+    // mouse tracking delivers an event for every cell the cursor
+    // crosses; drawing per event turned a flick of the mouse into
+    // hundreds of full-frame renders, and an idle board still redrew
+    // ten times a second for nothing.
+    let mut dirty = true;
     loop {
-        app.pull_collab();
+        dirty |= app.pull_collab();
 
-        let mut canvas_area = Rect::default();
-        terminal.draw(|frame| {
-            let full = frame.area();
-            let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(full);
-            canvas_area = chunks[0];
-            render::render(frame, app, chunks[0], chunks[1]);
-        })?;
+        if dirty {
+            terminal.draw(|frame| {
+                let full = frame.area();
+                let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(full);
+                canvas_area = chunks[0];
+                render::render(frame, app, chunks[0], chunks[1]);
+            })?;
+            dirty = false;
+        }
 
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => app.on_key(key),
-                Event::Mouse(mouse) => app.on_mouse(mouse, canvas_area),
-                _ => {}
+            // Handle everything arriving within one frame's budget and
+            // draw once at the end. A real mouse streams motion at
+            // 60–120Hz, one event at a time — draining only what's
+            // already queued still meant one full render per event, so
+            // a drag redrew at pointer rate. Waiting out the remainder
+            // of the budget for stragglers caps redraws near 60fps
+            // however the events arrive, at the cost of ~15ms of
+            // draw latency nothing can perceive.
+            let deadline = std::time::Instant::now() + Duration::from_millis(15);
+            loop {
+                match event::read()? {
+                    Event::Key(key) => {
+                        app.on_key(key);
+                        dirty = true;
+                    }
+                    Event::Mouse(mouse) => dirty |= app.on_mouse(mouse, canvas_area),
+                    Event::Resize(..) => dirty = true,
+                    _ => {}
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline || !event::poll(deadline - now)? {
+                    break;
+                }
             }
         }
 

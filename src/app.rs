@@ -71,6 +71,10 @@ pub enum HitTarget {
     /// Shift is what says "no, draw a connector instead"), a dot has no
     /// other job — a plain drag here always draws one.
     AnchorDot(ShapeId, CellAnchor),
+    /// The minimap overlay — a click (or a drag ending) anywhere on it
+    /// jumps the camera so that spot of the world sits at the center
+    /// of the view.
+    Minimap,
 }
 
 /// What one of a table's row/column buttons does, always relative to
@@ -81,6 +85,42 @@ pub enum TableOp {
     DelCol,
     AddRow,
     DelRow,
+}
+
+/// The minimap's place on screen and the stretch of world it shows —
+/// see [`App::minimap_layout`].
+#[derive(Clone)]
+pub struct MinimapLayout {
+    pub area: Rect,
+    pub inner: Rect,
+    /// World bounds `(x0, y0, x1, y1)` the inner area maps onto.
+    world: (i32, i32, i32, i32),
+}
+
+impl MinimapLayout {
+    /// World point → map cell, clamped into the inner area.
+    pub fn to_map(&self, wx: i32, wy: i32) -> (u16, u16) {
+        let (x0, y0, x1, y1) = self.world;
+        let fx = (wx - x0) as f32 / (x1 - x0).max(1) as f32;
+        let fy = (wy - y0) as f32 / (y1 - y0).max(1) as f32;
+        let mx = self.inner.x as f32 + fx * self.inner.width.saturating_sub(1) as f32;
+        let my = self.inner.y as f32 + fy * self.inner.height.saturating_sub(1) as f32;
+        (
+            (mx.round() as i32).clamp(self.inner.x as i32, self.inner.right() as i32 - 1) as u16,
+            (my.round() as i32).clamp(self.inner.y as i32, self.inner.bottom() as i32 - 1) as u16,
+        )
+    }
+
+    /// Map cell → the world point it stands for.
+    pub fn to_world(&self, mx: u16, my: u16) -> (i32, i32) {
+        let (x0, y0, x1, y1) = self.world;
+        let fx = (mx.saturating_sub(self.inner.x)) as f32 / self.inner.width.saturating_sub(1).max(1) as f32;
+        let fy = (my.saturating_sub(self.inner.y)) as f32 / self.inner.height.saturating_sub(1).max(1) as f32;
+        (
+            x0 + (fx * (x1 - x0) as f32).round() as i32,
+            y0 + (fy * (y1 - y0) as f32).round() as i32,
+        )
+    }
 }
 
 /// Which anchor grabbing (or dropping on) `(row, col)` names — the
@@ -109,7 +149,8 @@ impl HitTarget {
             | HitTarget::ColorSwatch(..)
             | HitTarget::TableMenu(..)
             | HitTarget::TableCell(..)
-            | HitTarget::AnchorDot(..) => None,
+            | HitTarget::AnchorDot(..)
+            | HitTarget::Minimap => None,
         }
     }
 }
@@ -320,6 +361,19 @@ pub struct App {
     /// board's top-left corner so a board authored anywhere on the
     /// plane (negative coordinates included) opens showing its content.
     pub camera: (i32, i32),
+    /// Whether the minimap overlay is shown — `m` toggles it.
+    pub minimap: bool,
+    /// The minimap layout frozen at the moment a drag started on it —
+    /// scrubbing the viewport around changes what the world bounds
+    /// would be, and remapping the cursor against bounds that move
+    /// under it made the view drift and judder instead of following
+    /// the hand. Cleared when the press ends.
+    pub minimap_drag: Option<MinimapLayout>,
+    /// Each text node's content parsed as a table (or the fact that it
+    /// isn't one), keyed by id and invalidated by comparing the stored
+    /// text — parsing markdown for every node on every frame was pure
+    /// per-frame waste when the text only changes on an actual edit.
+    pub table_cache: std::collections::HashMap<ShapeId, (String, Option<std::rc::Rc<crate::table::Table>>)>,
     undo_stack: Vec<Canvas>,
     redo_stack: Vec<Canvas>,
     grab_offset: (u16, u16),
@@ -409,6 +463,9 @@ impl App {
             status,
             canvas_area: Rect::default(),
             camera,
+            minimap: true,
+            minimap_drag: None,
+            table_cache: std::collections::HashMap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             grab_offset: (0, 0),
@@ -425,13 +482,15 @@ impl App {
     /// local change that hasn't reached disk yet. Skipped only
     /// mid-gesture, so it can't yank a box out from under an active
     /// drag or a keystroke out of an active edit.
-    pub fn pull_collab(&mut self) {
+    /// Returns whether anything was actually merged, so the caller can
+    /// skip redrawing when nothing changed.
+    pub fn pull_collab(&mut self) -> bool {
         if self.mode != Mode::Normal || self.drag.moving().is_some() || self.drawing.is_some() {
-            return;
+            return false;
         }
-        let Some(collab) = &mut self.collab else { return };
+        let Some(collab) = &mut self.collab else { return false };
         if !collab.pull() {
-            return;
+            return false;
         }
         let nodes = collab.snapshot();
         let edges = collab.snapshot_edges();
@@ -447,6 +506,7 @@ impl App {
             self.selected = None;
         }
         self.status = "merged a change from another writer".to_string();
+        true
     }
 
     /// Mirrors one node's current field values into the CRDT so another
@@ -742,6 +802,64 @@ impl App {
         (x as i32 - self.canvas_area.x as i32 + self.camera.0, y as i32 - self.canvas_area.y as i32 + self.camera.1)
     }
 
+    /// Reparses whichever text nodes changed since the last frame and
+    /// drops nothing else — called once at the top of every render, so
+    /// every table lookup after it is a plain map read.
+    pub fn sync_table_cache(&mut self) {
+        for node in &self.canvas.nodes {
+            let NodeKind::Text(text) = &node.kind else { continue };
+            if matches!(self.table_cache.get(&node.id), Some((cached, _)) if cached == text) {
+                continue;
+            }
+            let parsed = crate::table::parse(text).map(std::rc::Rc::new);
+            self.table_cache.insert(node.id.clone(), (text.clone(), parsed));
+        }
+    }
+
+    /// Centers the view on whatever world point this minimap cell
+    /// stands for.
+    fn minimap_jump(&mut self, mx: u16, my: u16) {
+        let Some(layout) = self.minimap_drag.clone().or_else(|| self.minimap_layout()) else { return };
+        let (wx, wy) = layout.to_world(mx, my);
+        self.camera = (wx - self.canvas_area.width as i32 / 2, wy - self.canvas_area.height as i32 / 2);
+    }
+
+    /// Where the minimap sits and what stretch of the world it shows —
+    /// one computation shared by the renderer (drawing it) and the
+    /// click handler (jumping the camera to a clicked spot), so the two
+    /// can never disagree about which world point a map cell stands
+    /// for. `None` when the canvas is too small to fit one, or the
+    /// overlay is toggled off.
+    pub fn minimap_layout(&self) -> Option<MinimapLayout> {
+        if !self.minimap {
+            return None;
+        }
+        let area = self.canvas_area;
+        let w = (area.width / 4).clamp(16, 32).min(area.width);
+        let h = (area.height / 4).clamp(8, 14).min(area.height);
+        if w < 8 || h < 5 {
+            return None;
+        }
+        let map_area = Rect::new(area.right() - w, area.bottom() - h, w, h);
+        let inner = Rect::new(map_area.x + 1, map_area.y + 1, map_area.width - 2, map_area.height - 2);
+
+        // The world stretch shown: everything on the board plus the
+        // current viewport, so the "you are here" rectangle can never
+        // wander off its own map.
+        let view = WorldRect::new(self.camera.0, self.camera.1, area.width, area.height);
+        let mut x0 = view.x;
+        let mut y0 = view.y;
+        let mut x1 = view.right();
+        let mut y1 = view.bottom();
+        for n in &self.canvas.nodes {
+            x0 = x0.min(n.rect.x);
+            y0 = y0.min(n.rect.y);
+            x1 = x1.max(n.rect.right());
+            y1 = y1.max(n.rect.bottom());
+        }
+        Some(MinimapLayout { area: map_area, inner, world: (x0, y0, x1, y1) })
+    }
+
     /// Where a resize-in-progress would land (world coordinates), for
     /// the preview ghost.
     pub fn resize_preview(&self) -> Option<(ShapeId, WorldRect)> {
@@ -990,7 +1108,13 @@ impl App {
             .map(|n| n.id.clone())
     }
 
-    pub fn on_mouse(&mut self, ev: MouseEvent, canvas_area: Rect) {
+    /// Returns whether anything the screen shows could have changed —
+    /// plain cursor movement that lands on nothing and leaves no hover
+    /// state behind is the overwhelming majority of mouse events, and
+    /// redrawing for each of those is what made just waving the cursor
+    /// around feel heavy.
+    pub fn on_mouse(&mut self, ev: MouseEvent, canvas_area: Rect) -> bool {
+        let hover_before = (self.hover_swatch.clone(), self.hover_cell.clone());
         if let MouseEventKind::Moved = ev.kind {
             self.hover_swatch = match self.hits.at(ev.column, ev.row) {
                 Some((HitTarget::ColorSwatch(target, color), _)) => Some((target, color.map(|c| Color::parse(&c)))),
@@ -1026,6 +1150,14 @@ impl App {
             if !stays_in_same_table {
                 self.commit_edit();
             }
+
+            // Freeze the minimap's own frame of reference for as long
+            // as this press lasts, so scrubbing the viewport maps the
+            // cursor against fixed bounds — see `minimap_drag`.
+            self.minimap_drag = match &hit {
+                Some((HitTarget::Minimap, _)) => self.minimap_layout(),
+                _ => None,
+            };
 
             // A dot's own drag always draws a connector — unlike a plain
             // cell or box body, which doubles as a move/edit target and
@@ -1122,6 +1254,18 @@ impl App {
                     if self.is_double_click(selected.clone()) {
                         self.begin_table_edit_at(id, row, col);
                     }
+                }
+            }
+            Did::Click(HitTarget::Minimap) => {
+                self.minimap_jump(ev.column, ev.row);
+                self.minimap_drag = None;
+            }
+            // Scrub: while the press that started on the minimap is
+            // still down, every movement re-centers the view — the map
+            // follows the hand instead of waiting for the release.
+            Did::Move if matches!(self.drag.moving(), Some(HitTarget::Minimap)) => {
+                if let Some((cx, cy)) = self.drag.cursor() {
+                    self.minimap_jump(cx, cy);
                 }
             }
             Did::Click(HitTarget::TableMenu(id, op)) => {
@@ -1222,6 +1366,13 @@ impl App {
                     None => self.status = "nothing to attach to".to_string(),
                 }
             }
+            // A drag that started on the minimap scrubs the camera the
+            // same way a click jumps it — wherever it ends is what
+            // lands in the center of the view.
+            Did::Drop { key: HitTarget::Minimap, x, y } => {
+                self.minimap_jump(x, y);
+                self.minimap_drag = None;
+            }
             _ => {}
         }
 
@@ -1277,6 +1428,13 @@ impl App {
                 Some((HitTarget::AnchorDot(id, anchor), _)) => Some((id, anchor)),
                 _ => None,
             };
+        }
+
+        // Every kind of event but plain movement acts on something;
+        // movement only matters when it changed what's hovered.
+        match ev.kind {
+            MouseEventKind::Moved => hover_before != (self.hover_swatch.clone(), self.hover_cell.clone()),
+            _ => true,
         }
     }
 
@@ -1418,6 +1576,7 @@ impl App {
                     }
                     None => {}
                 },
+                KeyCode::Char('m') => self.minimap = !self.minimap,
                 // Pan — the board is an infinite plane and these move
                 // the window over it, never the content. Nothing else
                 // claims plain arrows in Normal mode.

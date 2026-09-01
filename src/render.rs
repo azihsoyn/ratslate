@@ -3,7 +3,7 @@ use ratatui::{
     layout::Rect,
     style::{Color as RColor, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Paragraph, Wrap},
+    widgets::{Block, BorderType, Clear, Paragraph, Wrap},
 };
 
 use ratatui_dnd::Hits;
@@ -48,6 +48,7 @@ fn fully_visible(rect: WorldRect, area: Rect) -> bool {
 }
 
 pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: Rect) {
+    app.sync_table_cache();
     app.hits.clear();
     app.edge_hits.clear();
     app.canvas_area = canvas_area;
@@ -86,7 +87,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
     // these spots shows its own `●` on top instead.
     if let Some((id, hovered)) = app.hover_cell.clone()
         && let Some(node) = app.canvas.node(&id)
-        && let Some(table) = crate::table::parse(&display_text(node))
+        && let Some(table) = app.table_cache.get(&id).and_then(|(_, t)| t.clone())
     {
         let srect = to_screen(node.rect, camera, canvas_area);
         let dim = Style::default().fg(RColor::DarkGray);
@@ -144,7 +145,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         if table_cursor.is_some() {
             let view = TableView { node, rect: clipped, selected, table: &app.editing_table, cursor: table_cursor, editing_text: &app.editing_text, preview };
             draw_table_node(frame, view, &mut app.hits);
-        } else if let Some(table) = crate::table::parse(&display_text(node)) {
+        } else if let Some(table) = app.table_cache.get(&node.id).and_then(|(_, t)| t.clone()) {
             let view = TableView { node, rect: clipped, selected, table: &table, cursor: None, editing_text: "", preview };
             draw_table_node(frame, view, &mut app.hits);
         } else {
@@ -233,7 +234,69 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         draw_drag_preview(frame, (anchor_node, srect), None, (cx, cy), None);
     }
 
+    draw_minimap(frame, app);
+
     draw_status(frame, app, status_area);
+}
+
+/// A small overlay in the canvas's bottom-right corner: every box as a
+/// dot (in its own color) over the whole board's extent, with the
+/// current viewport outlined — the way back to content that's panned
+/// out of sight. Clicking (or dragging) anywhere on it centers the
+/// view there; `m` toggles it. Drawn last so it sits over everything,
+/// and its hit target registered last for the same reason: later wins,
+/// so a click on the map is never a click on whatever it covers.
+fn draw_minimap(frame: &mut Frame, app: &mut App) {
+    // While a scrub-drag is in progress, draw against the same frozen
+    // frame of reference the drag math uses — recomputing bounds every
+    // frame would slide the map under the very cursor dragging it.
+    let Some(layout) = app.minimap_drag.clone().or_else(|| app.minimap_layout()) else { return };
+
+    frame.render_widget(Clear, layout.area);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(RColor::DarkGray))
+        .title("map");
+    frame.render_widget(block, layout.area);
+
+    // The viewport first, as a dim filled region, so the node dots
+    // paint over it and stay legible inside it.
+    let (vx0, vy0) = layout.to_map(app.camera.0, app.camera.1);
+    let (vx1, vy1) = layout.to_map(
+        app.camera.0 + app.canvas_area.width as i32,
+        app.camera.1 + app.canvas_area.height as i32,
+    );
+    let view = Rect::new(vx0, vy0, (vx1 - vx0 + 1).max(1), (vy1 - vy0 + 1).max(1));
+    frame.render_widget(Block::new().style(Style::default().bg(RColor::Rgb(60, 60, 70))), view);
+
+    // The box being dragged or resized right now, at where its ghost
+    // is rather than where the model still says it sits — the model
+    // only updates on drop, and a map dot that sat still through the
+    // whole drag then teleported read as the map not updating at all.
+    let live: Option<(String, (i32, i32))> = match app.drag.moving() {
+        Some(HitTarget::Move(id)) => app.drag.ghost(app.canvas_area).map(|g| {
+            let (wx, wy) = app.to_world(g.x, g.y);
+            (id.clone(), (wx + g.width as i32 / 2, wy + g.height as i32 / 2))
+        }),
+        Some(HitTarget::Resize(..)) => app
+            .resize_preview()
+            .map(|(id, r)| (id, (r.x + r.width as i32 / 2, r.y + r.height as i32 / 2))),
+        _ => None,
+    };
+
+    // One dot per box, at its center — drawing each box's scaled
+    // extent instead made a single wide box read as a row of separate
+    // boxes, which is worse than not showing sizes at all.
+    for node in &app.canvas.nodes {
+        let (cx, cy) = match &live {
+            Some((id, center)) if id == &node.id => *center,
+            _ => (node.rect.x + node.rect.width as i32 / 2, node.rect.y + node.rect.height as i32 / 2),
+        };
+        let (mx, my) = layout.to_map(cx, cy);
+        let color = node.color.as_ref().map(ratatui_color).unwrap_or(RColor::Gray);
+        put_char(frame, mx as i32, my as i32, '▪', Style::default().fg(color));
+    }
+
+    app.hits.put(layout.area, HitTarget::Minimap);
 }
 
 /// `preview`, while a color picker swatch is hovered, is the color it
@@ -691,10 +754,7 @@ fn draw_edges(
     // anchor on a side that leaves top/bottom, a row anchor on one that
     // leaves left/right); the other axis's anchor, if any, is silently
     // unusable for this edge's current side and falls back to it.
-    let table_of = |id: &str| match &app.canvas.node(id)?.kind {
-        NodeKind::Text(t) => crate::table::parse(t),
-        _ => None,
-    };
+    let table_of = |id: &str| app.table_cache.get(id).and_then(|(_, t)| t.clone());
     // `route`'s own automatic geometry draws one straight line through
     // wherever the two boxes' extents happen to overlap on the shared
     // axis — a real spot to put a line, but not necessarily anywhere
@@ -1192,7 +1252,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Editing(_) => "EDIT (Esc to leave)",
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · +col/-col/+row/-row buttons below · esc done)",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · corner resize · arrows/wheel pan · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · corner resize · arrows/wheel pan · m map · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

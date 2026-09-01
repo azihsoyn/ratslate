@@ -8,12 +8,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
 use crate::collab::{Collab, EdgeFields, NodeFields};
-use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, ShapeId, Side};
+use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, ShapeId, Side, WorldRect};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
 const UNDO_LIMIT: usize = 100;
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+/// How far one pan keypress or wheel tick moves the view — terminal
+/// cells are about twice as tall as wide, so the two axes step
+/// differently to feel the same.
+const PAN_STEP_X: i32 = 4;
+const PAN_STEP_Y: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Corner {
@@ -135,11 +140,12 @@ pub enum Mode {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    /// Place a new text box, top-left at (x, y). `w`/`h` default to the
-    /// usual placed size if omitted.
+    /// Place a new text box, top-left at (x, y) in world coordinates
+    /// (negative allowed, same plane as the file's own). `w`/`h`
+    /// default to the usual placed size if omitted.
     Place {
-        x: u16,
-        y: u16,
+        x: i32,
+        y: i32,
         #[serde(default)]
         w: Option<u16>,
         #[serde(default)]
@@ -147,8 +153,9 @@ pub enum Request {
     },
     /// Replace a box's text outright.
     SetText { id: ShapeId, text: String },
-    /// Move and/or resize a box to an exact rectangle.
-    SetRect { id: ShapeId, x: u16, y: u16, w: u16, h: u16 },
+    /// Move and/or resize a box to an exact rectangle, in world
+    /// coordinates.
+    SetRect { id: ShapeId, x: i32, y: i32, w: u16, h: u16 },
     /// A JSON Canvas preset "1".."6", a hex string like "#ff8800", or
     /// null to clear it.
     SetColor { id: ShapeId, color: Option<String> },
@@ -308,10 +315,15 @@ pub struct App {
     /// has something to clamp against without threading it through
     /// `on_key`.
     pub canvas_area: Rect,
+    /// The world coordinate sitting at the canvas area's own top-left —
+    /// pan moves this, nothing in the model ever shifts. Starts at the
+    /// board's top-left corner so a board authored anywhere on the
+    /// plane (negative coordinates included) opens showing its content.
+    pub camera: (i32, i32),
     undo_stack: Vec<Canvas>,
     redo_stack: Vec<Canvas>,
     grab_offset: (u16, u16),
-    resize_origin: Option<(ShapeId, Corner, Rect)>,
+    resize_origin: Option<(ShapeId, Corner, WorldRect)>,
     /// A rectangle being dragged out on empty canvas: (press point,
     /// point the cursor is at now). `Request::Place` fires on release,
     /// sized from wherever the two ended up.
@@ -372,6 +384,14 @@ impl App {
             }
         }
 
+        // Open looking at the board's own top-left corner, wherever on
+        // the plane that happens to be — a board living entirely in
+        // negative space would otherwise open onto empty canvas.
+        let camera = (
+            canvas.nodes.iter().map(|n| n.rect.x).min().unwrap_or(0).min(0),
+            canvas.nodes.iter().map(|n| n.rect.y).min().unwrap_or(0).min(0),
+        );
+
         Self {
             canvas,
             drag: Drag::new(),
@@ -388,6 +408,7 @@ impl App {
             save_path,
             status,
             canvas_area: Rect::default(),
+            camera,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             grab_offset: (0, 0),
@@ -574,7 +595,7 @@ impl App {
             }
             Request::SetRect { id, x, y, w, h } => {
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
-                node.rect = Rect::new(x, y, w.max(1), h.max(1));
+                node.rect = WorldRect::new(x, y, w.max(1), h.max(1));
                 touched = Some(id);
                 Ok(Response::Ok)
             }
@@ -716,8 +737,14 @@ impl App {
         Some(Rect::new(x, y, w, h))
     }
 
-    /// Where a resize-in-progress would land, for the preview ghost.
-    pub fn resize_preview(&self, bounds: Rect) -> Option<(ShapeId, Rect)> {
+    /// Screen cell → world coordinate, through the camera.
+    pub fn to_world(&self, x: u16, y: u16) -> (i32, i32) {
+        (x as i32 - self.canvas_area.x as i32 + self.camera.0, y as i32 - self.canvas_area.y as i32 + self.camera.1)
+    }
+
+    /// Where a resize-in-progress would land (world coordinates), for
+    /// the preview ghost.
+    pub fn resize_preview(&self) -> Option<(ShapeId, WorldRect)> {
         let Some(HitTarget::Resize(id, corner)) = self.drag.moving() else {
             return None;
         };
@@ -726,7 +753,8 @@ impl App {
             return None;
         }
         let (cx, cy) = self.drag.cursor()?;
-        Some((id.clone(), resized_rect(*origin_rect, *corner, cx, cy, bounds)))
+        let (wx, wy) = self.to_world(cx, cy);
+        Some((id.clone(), resized_rect(*origin_rect, *corner, wx, wy)))
     }
 
     /// Write whatever is in the scratch buffer back to whatever is
@@ -828,9 +856,7 @@ impl App {
             return;
         }
         let (x, y) = (node.rect.x, node.rect.y);
-        let max_w = self.canvas_area.right().saturating_sub(x).max(w);
-        let max_h = self.canvas_area.bottom().saturating_sub(y).max(h);
-        let _ = self.dispatch(Request::SetRect { id: id.clone(), x, y, w: w.min(max_w), h: h.min(max_h) });
+        let _ = self.dispatch(Request::SetRect { id: id.clone(), x, y, w, h });
     }
 
     /// `Tab`/`Shift+Tab`: across, wrapping to the next or previous row.
@@ -931,8 +957,7 @@ impl App {
             return;
         }
         let (x, y, w) = (node.rect.x, node.rect.y, node.rect.width);
-        let max_h = self.canvas_area.bottom().saturating_sub(y).max(MIN_H);
-        let _ = self.dispatch(Request::SetRect { id: id.clone(), x, y, w, h: needed.min(max_h) });
+        let _ = self.dispatch(Request::SetRect { id: id.clone(), x, y, w, h: needed });
     }
 
     /// Whatever box is registered at this cell right now, ignoring a
@@ -954,13 +979,14 @@ impl App {
         }
     }
 
-    /// The node closest to this cell — a drop that missed a box by a
-    /// little should still connect, not silently do nothing.
+    /// The node closest to this screen cell — a drop that missed a box
+    /// by a little should still connect, not silently do nothing.
     fn nearest_node(&self, x: u16, y: u16) -> Option<ShapeId> {
+        let (wx, wy) = self.to_world(x, y);
         self.canvas
             .nodes
             .iter()
-            .min_by_key(|n| rect_distance(n.rect, x, y))
+            .min_by_key(|n| rect_distance(n.rect, wx, wy))
             .map(|n| n.id.clone())
     }
 
@@ -970,6 +996,17 @@ impl App {
                 Some((HitTarget::ColorSwatch(target, color), _)) => Some((target, color.map(|c| Color::parse(&c)))),
                 _ => None,
             };
+        }
+
+        // Wheel pans the view — vertical plainly, horizontal on
+        // terminals that report a sideways scroll (a trackpad, or a
+        // shift-modified wheel, depending on the emulator).
+        match ev.kind {
+            MouseEventKind::ScrollUp => self.camera.1 -= PAN_STEP_Y,
+            MouseEventKind::ScrollDown => self.camera.1 += PAN_STEP_Y,
+            MouseEventKind::ScrollLeft => self.camera.0 -= PAN_STEP_X,
+            MouseEventKind::ScrollRight => self.camera.0 += PAN_STEP_X,
+            _ => {}
         }
 
         let mut hit = self.hits.at(ev.column, ev.row);
@@ -1120,11 +1157,8 @@ impl App {
             } => {
                 if let Some(node) = self.canvas.node(&id) {
                     let (w, h) = (node.rect.width, node.rect.height);
-                    let max_x = canvas_area.right().saturating_sub(w).max(canvas_area.x);
-                    let max_y = canvas_area.bottom().saturating_sub(h).max(canvas_area.y);
-                    let nx = x.saturating_sub(self.grab_offset.0).clamp(canvas_area.x, max_x);
-                    let ny = y.saturating_sub(self.grab_offset.1).clamp(canvas_area.y, max_y);
-                    let _ = self.dispatch(Request::SetRect { id, x: nx, y: ny, w, h });
+                    let (wx, wy) = self.to_world(x.saturating_sub(self.grab_offset.0), y.saturating_sub(self.grab_offset.1));
+                    let _ = self.dispatch(Request::SetRect { id, x: wx, y: wy, w, h });
                 }
             }
             Did::Drop {
@@ -1136,7 +1170,8 @@ impl App {
                     && origin_id == id
                     && origin_corner == corner
                 {
-                    let r = resized_rect(origin_rect, corner, x, y, canvas_area);
+                    let (wx, wy) = self.to_world(x, y);
+                    let r = resized_rect(origin_rect, corner, wx, wy);
                     let _ = self.dispatch(Request::SetRect { id, x: r.x, y: r.y, w: r.width, h: r.height });
                 }
             }
@@ -1202,10 +1237,11 @@ impl App {
                 }
             } else if let Some((start, end)) = self.drawing.take() {
                 if start != end {
-                    let x = start.0.min(end.0);
-                    let y = start.1.min(end.1);
-                    let w = (start.0.max(end.0) - x + 1).max(MIN_W);
-                    let h = (start.1.max(end.1) - y + 1).max(MIN_H);
+                    let sx = start.0.min(end.0);
+                    let sy = start.1.min(end.1);
+                    let w = (start.0.max(end.0) - sx + 1).max(MIN_W);
+                    let h = (start.1.max(end.1) - sy + 1).max(MIN_H);
+                    let (x, y) = self.to_world(sx, sy);
                     if let Ok(Response::Placed { id }) = self.dispatch(Request::Place { x, y, w: Some(w), h: Some(h) }) {
                         let selected = Selected::Node(id);
                         self.selected = Some(selected.clone());
@@ -1382,6 +1418,13 @@ impl App {
                     }
                     None => {}
                 },
+                // Pan — the board is an infinite plane and these move
+                // the window over it, never the content. Nothing else
+                // claims plain arrows in Normal mode.
+                KeyCode::Left => self.camera.0 -= PAN_STEP_X,
+                KeyCode::Right => self.camera.0 += PAN_STEP_X,
+                KeyCode::Up => self.camera.1 -= PAN_STEP_Y,
+                KeyCode::Down => self.camera.1 += PAN_STEP_Y,
                 KeyCode::Esc => {
                     if self.color_picker.take().is_some() {
                         self.hover_swatch = None;
@@ -1410,36 +1453,42 @@ pub fn run_one(app: &mut App, kind: &str, value: serde_json::Value) -> serde_jso
     }
 }
 
-fn resized_rect(origin: Rect, corner: Corner, cx: u16, cy: u16, bounds: Rect) -> Rect {
-    let cx = cx.clamp(bounds.x, bounds.right().saturating_sub(1));
-    let cy = cy.clamp(bounds.y, bounds.bottom().saturating_sub(1));
+/// `cx`/`cy` are the cursor in world coordinates — same space as
+/// `origin`. No positional clamp: the plane is unbounded, only the
+/// minimum size holds.
+fn resized_rect(origin: WorldRect, corner: Corner, cx: i32, cy: i32) -> WorldRect {
     let (left, top, right, bottom) = (origin.x, origin.y, origin.right(), origin.bottom());
 
     let (new_left, new_right) = match corner {
-        Corner::TopLeft | Corner::BottomLeft => (cx.min(right.saturating_sub(MIN_W)), right),
-        Corner::TopRight | Corner::BottomRight => (left, cx.max(left + MIN_W)),
+        Corner::TopLeft | Corner::BottomLeft => (cx.min(right - MIN_W as i32), right),
+        Corner::TopRight | Corner::BottomRight => (left, cx.max(left + MIN_W as i32)),
     };
     let (new_top, new_bottom) = match corner {
-        Corner::TopLeft | Corner::TopRight => (cy.min(bottom.saturating_sub(MIN_H)), bottom),
-        Corner::BottomLeft | Corner::BottomRight => (top, cy.max(top + MIN_H)),
+        Corner::TopLeft | Corner::TopRight => (cy.min(bottom - MIN_H as i32), bottom),
+        Corner::BottomLeft | Corner::BottomRight => (top, cy.max(top + MIN_H as i32)),
     };
 
-    Rect::new(new_left, new_top, new_right - new_left, new_bottom - new_top)
+    WorldRect::new(
+        new_left,
+        new_top,
+        (new_right - new_left).clamp(1, u16::MAX as i32) as u16,
+        (new_bottom - new_top).clamp(1, u16::MAX as i32) as u16,
+    )
 }
 
 /// Cells from `(x, y)` to the nearest edge of `r`, 0 if inside it — the
 /// same measure ratatui-dnd's own `sort::Sortable` uses to let a drop
-/// just past a border still land.
-fn rect_distance(r: Rect, x: u16, y: u16) -> u32 {
+/// just past a border still land. World coordinates.
+fn rect_distance(r: WorldRect, x: i32, y: i32) -> u32 {
     let dx = if x < r.x {
         r.x - x
     } else {
-        x.saturating_sub(r.x + r.width.saturating_sub(1))
+        (x - (r.right() - 1)).max(0)
     };
     let dy = if y < r.y {
         r.y - y
     } else {
-        y.saturating_sub(r.y + r.height.saturating_sub(1))
+        (y - (r.bottom() - 1)).max(0)
     };
     dx as u32 + dy as u32
 }
@@ -1489,9 +1538,9 @@ fn node_from_fields(id: String, f: NodeFields) -> Node {
     };
     Node {
         id,
-        rect: Rect::new(
-            f.x.clamp(0, u16::MAX as i64) as u16,
-            f.y.clamp(0, u16::MAX as i64) as u16,
+        rect: WorldRect::new(
+            f.x.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            f.y.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             f.w.clamp(1, u16::MAX as i64) as u16,
             f.h.clamp(1, u16::MAX as i64) as u16,
         ),

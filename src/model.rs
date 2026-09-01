@@ -1,6 +1,34 @@
-use ratatui::layout::Rect;
-
 pub type ShapeId = String;
+
+/// A box's place on the board, in world coordinates — `i32` position
+/// because JSON Canvas boards (Obsidian's included) sit anywhere on an
+/// infinite plane, negative coordinates and all. What's actually on
+/// screen is the camera's problem, not the model's; keeping the world
+/// values verbatim is what lets a board round-trip through ratslate
+/// without every other tool seeing its content shifted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorldRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl WorldRect {
+    pub fn new(x: i32, y: i32, width: u16, height: u16) -> Self {
+        Self { x, y, width, height }
+    }
+
+    /// One past the right edge, same convention as `ratatui::Rect`.
+    pub fn right(&self) -> i32 {
+        self.x + self.width as i32
+    }
+
+    /// One past the bottom edge, same convention as `ratatui::Rect`.
+    pub fn bottom(&self) -> i32 {
+        self.y + self.height as i32
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Color {
@@ -89,7 +117,7 @@ pub enum NodeKind {
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: ShapeId,
-    pub rect: Rect,
+    pub rect: WorldRect,
     pub color: Option<Color>,
     pub shape: Shape,
     pub kind: NodeKind,
@@ -167,11 +195,11 @@ fn fresh_id() -> String {
 }
 
 impl Canvas {
-    pub fn place_text(&mut self, x: u16, y: u16, w: Option<u16>, h: Option<u16>) -> ShapeId {
+    pub fn place_text(&mut self, x: i32, y: i32, w: Option<u16>, h: Option<u16>) -> ShapeId {
         let id = fresh_id();
         self.nodes.push(Node {
             id: id.clone(),
-            rect: Rect::new(x, y, w.unwrap_or(16), h.unwrap_or(3)),
+            rect: WorldRect::new(x, y, w.unwrap_or(16), h.unwrap_or(3)),
             color: None,
             shape: Shape::default(),
             kind: NodeKind::Text(String::new()),

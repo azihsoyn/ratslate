@@ -9,8 +9,43 @@ use ratatui::{
 use ratatui_dnd::Hits;
 
 use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected, TableOp, cell_anchor_for};
-use crate::model::{CellAnchor, Color, EdgeEnd, Node, NodeKind, Shape, Side};
+use crate::model::{CellAnchor, Color, EdgeEnd, Node, NodeKind, Shape, Side, WorldRect};
 use crate::table::Table;
+
+/// World rect → screen space through the camera. Same `WorldRect` type
+/// (screen positions can be negative too, for a box hanging off the
+/// visible area's left or top), just a different origin.
+fn to_screen(rect: WorldRect, camera: (i32, i32), area: Rect) -> WorldRect {
+    WorldRect::new(
+        rect.x - camera.0 + area.x as i32,
+        rect.y - camera.1 + area.y as i32,
+        rect.width,
+        rect.height,
+    )
+}
+
+/// The part of a screen-space rect that's actually on the canvas —
+/// `None` when none of it is. This is where `i32` screen space becomes
+/// the `u16` a widget or a hit target needs.
+fn clip(rect: WorldRect, area: Rect) -> Option<Rect> {
+    let x0 = rect.x.max(area.x as i32);
+    let y0 = rect.y.max(area.y as i32);
+    let x1 = rect.right().min(area.right() as i32);
+    let y1 = rect.bottom().min(area.bottom() as i32);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some(Rect::new(x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16))
+}
+
+/// Whether a screen-space rect sits entirely on the canvas — the
+/// full-content drawing paths need the whole box, not a sliver.
+fn fully_visible(rect: WorldRect, area: Rect) -> bool {
+    rect.x >= area.x as i32
+        && rect.y >= area.y as i32
+        && rect.right() <= area.right() as i32
+        && rect.bottom() <= area.bottom() as i32
+}
 
 pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: Rect) {
     app.hits.clear();
@@ -22,13 +57,17 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         _ => None,
     };
 
-    // Where the box being dragged actually is right now, so a
-    // connector follows the ghost instead of staying put until the
-    // drop lands.
-    let live_rect: Option<(String, Rect)> = if let Some((id, rect)) = app.resize_preview(canvas_area) {
-        Some((id, rect))
+    let camera = app.camera;
+
+    // Where the box being dragged actually is right now (screen
+    // space), so a connector follows the ghost instead of staying put
+    // until the drop lands.
+    let live_rect: Option<(String, WorldRect)> = if let Some((id, rect)) = app.resize_preview() {
+        Some((id, to_screen(rect, camera, canvas_area)))
     } else if let Some(HitTarget::Move(id)) = app.drag.moving() {
-        app.drag.ghost(canvas_area).map(|g| (id.clone(), g))
+        app.drag
+            .ghost(canvas_area)
+            .map(|g| (id.clone(), WorldRect::new(g.x as i32, g.y as i32, g.width, g.height)))
     } else {
         None
     };
@@ -49,20 +88,21 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         && let Some(node) = app.canvas.node(&id)
         && let Some(table) = crate::table::parse(&display_text(node))
     {
+        let srect = to_screen(node.rect, camera, canvas_area);
         let dim = Style::default().fg(RColor::DarkGray);
         if let Some(c) = hovered.col
-            && let Some(frac) = crate::table::col_center_frac(&table, c, node.rect.width)
+            && let Some(frac) = crate::table::col_center_frac(&table, c, srect.width)
         {
             for side in [Side::Top, Side::Bottom] {
-                let (x, y) = side_point(node.rect, side, frac);
+                let (x, y) = side_point(srect, side, frac);
                 put_char(frame, x, y, '○', dim);
             }
         }
         if let Some(r) = hovered.row
-            && let Some(frac) = crate::table::row_center_frac(&table, r, node.rect.height)
+            && let Some(frac) = crate::table::row_center_frac(&table, r, srect.height)
         {
             for side in [Side::Left, Side::Right] {
-                let (x, y) = side_point(node.rect, side, frac);
+                let (x, y) = side_point(srect, side, frac);
                 put_char(frame, x, y, '○', dim);
             }
         }
@@ -74,8 +114,18 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         if hidden_id.as_deref() == Some(node.id.as_str()) {
             continue;
         }
-        app.hits.put(node.rect, HitTarget::Move(node.id.clone()));
-        for (corner, rect) in corner_rects(node.rect) {
+        let srect = to_screen(node.rect, camera, canvas_area);
+        let Some(clipped) = clip(srect, canvas_area) else { continue };
+        app.hits.put(clipped, HitTarget::Move(node.id.clone()));
+        // A box only partly on screen draws as its clipped frame — no
+        // borders-at-the-wrong-place content layout to get subtly
+        // wrong, and the `Move` hit above is still enough to grab it
+        // and drag it back into view.
+        if !fully_visible(srect, canvas_area) {
+            frame.render_widget(Block::bordered(), clipped);
+            continue;
+        }
+        for (corner, rect) in corner_rects(clipped) {
             app.hits.put(rect, HitTarget::Resize(node.id.clone(), corner));
         }
         let selected = matches!(&app.selected, Some(Selected::Node(id)) if id == &node.id);
@@ -92,44 +142,51 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             _ => None,
         };
         if table_cursor.is_some() {
-            let view = TableView { node, selected, table: &app.editing_table, cursor: table_cursor, editing_text: &app.editing_text, preview };
+            let view = TableView { node, rect: clipped, selected, table: &app.editing_table, cursor: table_cursor, editing_text: &app.editing_text, preview };
             draw_table_node(frame, view, &mut app.hits);
         } else if let Some(table) = crate::table::parse(&display_text(node)) {
-            let view = TableView { node, selected, table: &table, cursor: None, editing_text: "", preview };
+            let view = TableView { node, rect: clipped, selected, table: &table, cursor: None, editing_text: "", preview };
             draw_table_node(frame, view, &mut app.hits);
         } else {
-            draw_node(frame, node, selected, editing, &app.editing_text, preview);
+            draw_node(frame, node, clipped, selected, editing, &app.editing_text, preview);
         }
     }
 
     if let Mode::EditingCell(id, _, _) = app.mode.clone()
         && let Some(node) = app.canvas.node(&id)
+        && let Some(clipped) = clip(to_screen(node.rect, camera, canvas_area), canvas_area)
     {
-        draw_table_menu(frame, app, &id, node.rect, canvas_area);
+        draw_table_menu(frame, app, &id, clipped, canvas_area);
     }
 
     if let Some(Selected::Node(id)) = app.selected.clone()
         && let Some(node) = app.canvas.node(&id)
     {
+        let srect = to_screen(node.rect, camera, canvas_area);
         let target = Selected::Node(id.clone());
-        let (bx, by) = (node.rect.right(), node.rect.y);
-        let button = Rect::new(bx, by, 1, 1).intersection(canvas_area);
-        if !button.is_empty() {
+        let (bx, by) = (srect.right(), srect.y);
+        if bx >= 0
+            && by >= 0
+            && let button = Rect::new(bx as u16, by as u16, 1, 1).intersection(canvas_area)
+            && !button.is_empty()
+        {
             app.hits.put(button, HitTarget::ColorMenu(target.clone()));
             // Filled with the box's own color, so the button doubles as
             // a preview of what's currently set — not just a dropdown
             // that happens to sit there.
             let dot_color = node.color.as_ref().map(ratatui_color).unwrap_or(RColor::White);
             frame.render_widget(Paragraph::new("●").style(Style::default().fg(dot_color)), button);
-        }
-        if app.color_picker.as_ref() == Some(&target) {
-            draw_color_picker(frame, app, target, bx, by + 1, canvas_area);
+            if app.color_picker.as_ref() == Some(&target) {
+                draw_color_picker(frame, app, target, bx as u16, by as u16 + 1, canvas_area);
+            }
         }
     }
 
-    if let Some((id, rect)) = &live_rect {
+    if let Some((id, rect)) = &live_rect
+        && let Some(clipped) = clip(*rect, canvas_area)
+    {
         let color = app.canvas.node(id).and_then(|n| n.color.as_ref());
-        draw_ghost(frame, *rect, color);
+        draw_ghost(frame, clipped, color);
     }
 
     if let Some(rect) = app.drawing_preview() {
@@ -145,15 +202,20 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         // row/column should be visible before the drop that commits it.
         let hover_target = match app.hits.at(cx, cy) {
             Some((HitTarget::TableCell(id, row, col), _)) if &id != from => {
-                app.canvas.node(&id).map(|n| (n, Some(cell_anchor_for(row, col))))
+                app.canvas.node(&id).map(|n| (n, to_screen(n.rect, camera, canvas_area), Some(cell_anchor_for(row, col))))
             }
             Some((HitTarget::AnchorDot(id, dot_anchor), _)) if &id != from => {
-                app.canvas.node(&id).map(|n| (n, Some(dot_anchor)))
+                app.canvas.node(&id).map(|n| (n, to_screen(n.rect, camera, canvas_area), Some(dot_anchor)))
             }
-            Some((target, _)) => target.node_id().filter(|id| *id != from).and_then(|id| app.canvas.node(id)).map(|n| (n, None)),
+            Some((target, _)) => target
+                .node_id()
+                .filter(|id| *id != from)
+                .and_then(|id| app.canvas.node(id))
+                .map(|n| (n, to_screen(n.rect, camera, canvas_area), None)),
             None => None,
         };
-        draw_drag_preview(frame, from_node, *anchor, (cx, cy), hover_target);
+        let from_srect = to_screen(from_node.rect, camera, canvas_area);
+        draw_drag_preview(frame, (from_node, from_srect), *anchor, (cx, cy), hover_target);
     }
 
     // Dragging one end of an existing connector: a line from whichever
@@ -167,7 +229,8 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         }
         && let Some(anchor_node) = app.canvas.node(anchor_id)
     {
-        draw_drag_preview(frame, anchor_node, None, (cx, cy), None);
+        let srect = to_screen(anchor_node.rect, camera, canvas_area);
+        draw_drag_preview(frame, (anchor_node, srect), None, (cx, cy), None);
     }
 
     draw_status(frame, app, status_area);
@@ -196,15 +259,18 @@ fn node_style(color: Option<&Color>, selected: bool, preview: Option<Option<RCol
     (base, border_style)
 }
 
-fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, editing_text: &str, preview: Option<Option<RColor>>) {
+/// `rect` is the node's place on screen, already translated through
+/// the camera — the node's own `rect` is world coordinates and never
+/// drawn from directly.
+fn draw_node(frame: &mut Frame, node: &Node, rect: Rect, selected: bool, editing: bool, editing_text: &str, preview: Option<Option<RColor>>) {
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
     let mut block = Block::bordered().border_style(border_style);
     if node.shape == Shape::Rounded {
         block = block.border_type(BorderType::Rounded);
     }
-    let inner = block.inner(node.rect);
-    frame.render_widget(block, node.rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
 
     let mut text = if editing { editing_text.to_string() } else { display_text(node) };
     if editing {
@@ -223,6 +289,9 @@ fn draw_node(frame: &mut Frame, node: &Node, selected: bool, editing: bool, edit
 /// `hits` stays a separate parameter since it's mutated, not read.
 struct TableView<'a> {
     node: &'a Node,
+    /// The node's place on screen, already translated through the
+    /// camera and known to be fully visible.
+    rect: Rect,
     selected: bool,
     table: &'a Table,
     cursor: Option<(usize, usize)>,
@@ -235,15 +304,15 @@ struct TableView<'a> {
 /// one open in `Mode::EditingCell`, is the live cell — shown reversed,
 /// with `editing_text` (not the table's own stale copy) as its content.
 fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget>) {
-    let TableView { node, selected, table, cursor, editing_text, preview } = view;
+    let TableView { node, rect, selected, table, cursor, editing_text, preview } = view;
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
     let mut block = Block::bordered().border_style(border_style);
     if node.shape == Shape::Rounded {
         block = block.border_type(BorderType::Rounded);
     }
-    let inner = block.inner(node.rect);
-    frame.render_widget(block, node.rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
 
     // The cell actually being typed into lives in `editing_text`, not
     // yet written back to `table` (that only happens on navigating away
@@ -377,7 +446,7 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
 
     let buf = frame.buffer_mut();
     for &dx in &divider_xs {
-        if let Some(cell) = buf.cell_mut((dx, node.rect.y)) {
+        if let Some(cell) = buf.cell_mut((dx, rect.y)) {
             cell.set_symbol("┬");
         }
     }
@@ -387,19 +456,19 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
     // and a junction there would float disconnected from any line.
     if y >= inner.bottom() {
         for &dx in &divider_xs {
-            if node.rect.bottom() > node.rect.y
-                && let Some(cell) = buf.cell_mut((dx, node.rect.bottom() - 1))
+            if rect.bottom() > rect.y
+                && let Some(cell) = buf.cell_mut((dx, rect.bottom() - 1))
             {
                 cell.set_symbol("┴");
             }
         }
     }
     if let Some(sep_y) = header_sep_y {
-        if let Some(cell) = buf.cell_mut((node.rect.x, sep_y)) {
+        if let Some(cell) = buf.cell_mut((rect.x, sep_y)) {
             cell.set_symbol("├");
         }
-        if node.rect.right() > node.rect.x
-            && let Some(cell) = buf.cell_mut((node.rect.right() - 1, sep_y))
+        if rect.right() > rect.x
+            && let Some(cell) = buf.cell_mut((rect.right() - 1, sep_y))
         {
             cell.set_symbol("┤");
         }
@@ -417,21 +486,22 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
     // stretched back in to cover the border cell right next to it too
     // — a dot is a real mouse target, not just a render position, and a
     // single terminal cell is a hard thing to land a real cursor on.
+    let srect = WorldRect::new(rect.x as i32, rect.y as i32, rect.width, rect.height);
     for (c, _) in widths.iter().enumerate() {
-        if let Some(frac) = crate::table::col_center_frac(table, c, node.rect.width) {
+        if let Some(frac) = crate::table::col_center_frac(table, c, rect.width) {
             let anchor = CellAnchor { row: None, col: Some(c) };
             for side in [Side::Top, Side::Bottom] {
-                let (x, y) = side_point(node.rect, side, frac);
+                let (x, y) = side_point(srect, side, frac);
                 let hit_y = if side == Side::Bottom { y - 1 } else { y };
                 hits.put(rect_span(x - 1, hit_y, 3, 2), HitTarget::AnchorDot(node.id.clone(), anchor));
             }
         }
     }
     for r in 0..table.len() {
-        if let Some(frac) = crate::table::row_center_frac(table, r, node.rect.height) {
+        if let Some(frac) = crate::table::row_center_frac(table, r, rect.height) {
             let anchor = CellAnchor { row: Some(r), col: None };
             for side in [Side::Left, Side::Right] {
-                let (x, y) = side_point(node.rect, side, frac);
+                let (x, y) = side_point(srect, side, frac);
                 let hit_x = if side == Side::Right { x - 1 } else { x };
                 hits.put(rect_span(hit_x, y - 1, 2, 3), HitTarget::AnchorDot(node.id.clone(), anchor));
             }
@@ -550,21 +620,26 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
 fn draw_edges(
     frame: &mut Frame,
     app: &mut App,
-    live: Option<&(String, Rect)>,
+    live: Option<&(String, WorldRect)>,
     reattaching: Option<&(String, Endpoint)>,
     canvas_area: Rect,
 ) {
-    let rect_of = |id: &str| -> Option<Rect> {
+    // Screen-space rects throughout — everything downstream (routing,
+    // glyph placement, hit registration) is bounded per-cell, so a box
+    // off the visible canvas simply routes to coordinates whose glyphs
+    // `put_char` then drops.
+    let camera = app.camera;
+    let rect_of = |id: &str| -> Option<WorldRect> {
         live.filter(|(live_id, _)| live_id == id)
             .map(|(_, r)| *r)
-            .or_else(|| app.canvas.node(id).map(|n| n.rect))
+            .or_else(|| app.canvas.node(id).map(|n| to_screen(n.rect, camera, canvas_area)))
     };
 
     // Which side of `from` and of `to` each edge leaves/arrives on, so
     // several edges leaving the same box on the same side can be spread
     // across it instead of all riding the exact midpoint and overlapping
     // for however far they travel together.
-    let rects: Vec<Option<(Rect, Rect)>> = app
+    let rects: Vec<Option<(WorldRect, WorldRect)>> = app
         .canvas
         .edges
         .iter()
@@ -834,7 +909,7 @@ fn forced_vertical(anchor: Option<CellAnchor>) -> Option<bool> {
 /// The specific top/bottom or left/right side of `this` that faces
 /// `other` — `sides_for`'s own tie-break, reused so a forced axis still
 /// picks whichever concrete side actually points toward the other box.
-fn side_toward(this: Rect, other: Rect, vertical: bool) -> Side {
+fn side_toward(this: WorldRect, other: WorldRect, vertical: bool) -> Side {
     let (tcx, tcy) = center(this);
     let (ocx, ocy) = center(other);
     if vertical {
@@ -850,9 +925,9 @@ fn side_toward(this: Rect, other: Rect, vertical: bool) -> Side {
 /// arrives on — the same three cases [`route`] draws, but usable before
 /// any actual coordinate is picked, so several edges sharing a side can
 /// be spread across it first.
-fn sides_for(from: Rect, to: Rect) -> (Side, Side) {
-    let (fx0, fy0, fx1, fy1) = (from.x as i32, from.y as i32, from.right() as i32, from.bottom() as i32);
-    let (tx0, ty0, tx1, ty1) = (to.x as i32, to.y as i32, to.right() as i32, to.bottom() as i32);
+fn sides_for(from: WorldRect, to: WorldRect) -> (Side, Side) {
+    let (fx0, fy0, fx1, fy1) = (from.x, from.y, from.right(), from.bottom());
+    let (tx0, ty0, tx1, ty1) = (to.x, to.y, to.right(), to.bottom());
 
     let (oy0, oy1) = (fy0.max(ty0), fy1.min(ty1));
     if oy0 < oy1 {
@@ -873,8 +948,8 @@ fn sides_for(from: Rect, to: Rect) -> (Side, Side) {
 /// along it — one cell past the border, same convention `route`'s own
 /// auto-picked sides already use, so an arrowhead never lands on the
 /// border row/column a box's own widget redraws afterward.
-fn side_point(rect: Rect, side: Side, frac: f32) -> (i32, i32) {
-    let (x0, y0, x1, y1) = (rect.x as i32, rect.y as i32, rect.right() as i32, rect.bottom() as i32);
+fn side_point(rect: WorldRect, side: Side, frac: f32) -> (i32, i32) {
+    let (x0, y0, x1, y1) = (rect.x, rect.y, rect.right(), rect.bottom());
     match side {
         Side::Right => (x1, y0 + (frac * (y1 - y0 - 1).max(0) as f32).round() as i32),
         Side::Left => (x0 - 1, y0 + (frac * (y1 - y0 - 1).max(0) as f32).round() as i32),
@@ -889,7 +964,7 @@ fn side_point(rect: Rect, side: Side, frac: f32) -> (i32, i32) {
 /// fits their exit directions. Simpler than [`route`]'s own geometry
 /// (which picks the *shape* of the bend from box positions, not told
 /// which sides to use), but every leg still lands orthogonally.
-fn route_explicit(from: Rect, to: Rect, from_frac: f32, to_frac: f32, from_side: Side, to_side: Side) -> Vec<(i32, i32)> {
+fn route_explicit(from: WorldRect, to: WorldRect, from_frac: f32, to_frac: f32, from_side: Side, to_side: Side) -> Vec<(i32, i32)> {
     let e = side_point(from, from_side, from_frac);
     let n = side_point(to, to_side, to_frac);
     let horizontal = |s: Side| matches!(s, Side::Left | Side::Right);
@@ -928,12 +1003,12 @@ fn route_explicit(from: Rect, to: Rect, from_frac: f32, to_frac: f32, from_side:
 /// all leave from its exact midpoint and overlap. `sides`, when both
 /// ends name one explicitly, routes between exactly those instead of
 /// picking automatically from where the boxes happen to sit.
-fn route(from: Rect, to: Rect, from_frac: f32, to_frac: f32, sides: Option<(Side, Side)>) -> Vec<(i32, i32)> {
+fn route(from: WorldRect, to: WorldRect, from_frac: f32, to_frac: f32, sides: Option<(Side, Side)>) -> Vec<(i32, i32)> {
     if let Some((fs, ts)) = sides {
         return route_explicit(from, to, from_frac, to_frac, fs, ts);
     }
-    let (fx0, fy0, fx1, fy1) = (from.x as i32, from.y as i32, from.right() as i32, from.bottom() as i32);
-    let (tx0, ty0, tx1, ty1) = (to.x as i32, to.y as i32, to.right() as i32, to.bottom() as i32);
+    let (fx0, fy0, fx1, fy1) = (from.x, from.y, from.right(), from.bottom());
+    let (tx0, ty0, tx1, ty1) = (to.x, to.y, to.right(), to.bottom());
 
     let (oy0, oy1) = (fy0.max(ty0), fy1.min(ty1));
     if oy0 < oy1 {
@@ -1013,25 +1088,25 @@ fn corner_char(prev: (i32, i32), corner: (i32, i32), next: (i32, i32)) -> char {
     }
 }
 
-fn center(rect: Rect) -> (i32, i32) {
+fn center(rect: WorldRect) -> (i32, i32) {
     (
-        rect.x as i32 + rect.width as i32 / 2,
-        rect.y as i32 + rect.height as i32 / 2,
+        rect.x + rect.width as i32 / 2,
+        rect.y + rect.height as i32 / 2,
     )
 }
 
-fn inside(rect: Rect, x: i32, y: i32) -> bool {
-    x >= rect.x as i32
-        && x < rect.x as i32 + rect.width as i32
-        && y >= rect.y as i32
-        && y < rect.y as i32 + rect.height as i32
+fn inside(rect: WorldRect, x: i32, y: i32) -> bool {
+    x >= rect.x
+        && x < rect.x + rect.width as i32
+        && y >= rect.y
+        && y < rect.y + rect.height as i32
 }
 
 /// A row/column anchor's own position along whichever side it forces —
 /// `None` when there's no table to measure, no anchor on that axis, or
 /// no anchor at all, in which case the caller's own default (a plain
 /// box's own midpoint) stands.
-fn anchor_frac(table: Option<&Table>, anchor: Option<CellAnchor>, vertical: bool, rect: Rect) -> Option<f32> {
+fn anchor_frac(table: Option<&Table>, anchor: Option<CellAnchor>, vertical: bool, rect: WorldRect) -> Option<f32> {
     let table = table?;
     if vertical {
         crate::table::col_center_frac(table, anchor?.col?, rect.width)
@@ -1053,16 +1128,16 @@ fn anchor_frac(table: Option<&Table>, anchor: Option<CellAnchor>, vertical: bool
 /// ever letting go.
 fn draw_drag_preview(
     frame: &mut Frame,
-    from_node: &Node,
+    from: (&Node, WorldRect),
     from_anchor: Option<CellAnchor>,
     cursor: (u16, u16),
-    hover_target: Option<(&Node, Option<CellAnchor>)>,
+    hover_target: Option<(&Node, WorldRect, Option<CellAnchor>)>,
 ) {
-    let from_rect = from_node.rect;
+    let (from_node, from_rect) = from;
     let from_table = crate::table::parse(&display_text(from_node));
     let (to_rect, to_anchor, to_table) = match hover_target {
-        Some((node, anchor)) => (node.rect, anchor, crate::table::parse(&display_text(node))),
-        None => (Rect::new(cursor.0, cursor.1, 1, 1), None, None),
+        Some((node, rect, anchor)) => (rect, anchor, crate::table::parse(&display_text(node))),
+        None => (WorldRect::new(cursor.0 as i32, cursor.1 as i32, 1, 1), None, None),
     };
 
     let (auto_fs, auto_ts) = sides_for(from_rect, to_rect);
@@ -1117,7 +1192,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Editing(_) => "EDIT (Esc to leave)",
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · +col/-col/+row/-row buttons below · esc done)",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · corner resize · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · corner resize · arrows/wheel pan · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

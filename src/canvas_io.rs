@@ -4,11 +4,10 @@
 use std::path::Path;
 
 use anyhow::Result;
-use ratatui::layout::Rect;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, Side};
+use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, Side, WorldRect};
 
 /// A board, in the shape https://jsoncanvas.org/spec/1.0/ describes on
 /// disk — also what `Request::State` hands back over `--api`.
@@ -150,34 +149,16 @@ fn side_to_string(s: Side) -> &'static str {
     }
 }
 
+fn clamp_i32(v: i64) -> i32 {
+    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
 fn clamp_u16(v: i64) -> u16 {
     v.clamp(0, u16::MAX as i64) as u16
 }
 
-fn file_node_pos(node: &FileNode) -> (i64, i64) {
-    match node {
-        FileNode::Text { x, y, .. }
-        | FileNode::File { x, y, .. }
-        | FileNode::Link { x, y, .. }
-        | FileNode::Group { x, y, .. } => (*x, *y),
-    }
-}
-
 fn from_file(root: FileRoot) -> Canvas {
     let mut canvas = Canvas::default();
-
-    // JSON Canvas allows negative coordinates (there is no pan yet on our
-    // side), so shift everything into non-negative screen space instead
-    // of just clamping each node independently and distorting the layout.
-    let mut min_x = 0i64;
-    let mut min_y = 0i64;
-    for n in &root.nodes {
-        let (x, y) = file_node_pos(n);
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-    }
-    let off_x = -min_x;
-    let off_y = -min_y;
 
     for fnode in root.nodes {
         let (id, x, y, w, h, color, shape, kind) = match fnode {
@@ -244,12 +225,11 @@ fn from_file(root: FileRoot) -> Canvas {
                 },
             ),
         };
-        let rect = Rect::new(
-            clamp_u16(x + off_x),
-            clamp_u16(y + off_y),
-            clamp_u16(w).max(1),
-            clamp_u16(h).max(1),
-        );
+        // World coordinates kept verbatim — negative and all. The
+        // camera decides what's on screen; the model never shifts, so
+        // a board authored elsewhere saves back with every coordinate
+        // exactly where that tool put it.
+        let rect = WorldRect::new(clamp_i32(x), clamp_i32(y), clamp_u16(w).max(1), clamp_u16(h).max(1));
         canvas.nodes.push(Node {
             id,
             rect,

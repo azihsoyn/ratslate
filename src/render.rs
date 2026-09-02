@@ -1250,7 +1250,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let mode = match &app.mode {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
-        Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · +col/-col/+row/-row buttons below · esc done)",
+        Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
     };
     let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · corner resize · arrows/wheel pan · m map · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);

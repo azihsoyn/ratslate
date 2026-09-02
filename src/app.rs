@@ -363,6 +363,12 @@ pub struct App {
     pub camera: (i32, i32),
     /// Whether the minimap overlay is shown — `m` toggles it.
     pub minimap: bool,
+    /// Within-session undo for the open table grid: snapshots of the
+    /// staged table (plus cursor and the live cell's scratch text)
+    /// taken before each navigation or row/column change, so Ctrl+Z
+    /// while the grid is open steps back through the session instead
+    /// of doing nothing. Cleared when the grid opens or closes.
+    table_undo: Vec<(crate::table::Table, usize, usize, String)>,
     /// The minimap layout frozen at the moment a drag started on it —
     /// scrubbing the viewport around changes what the world bounds
     /// would be, and remapping the cursor against bounds that move
@@ -465,6 +471,7 @@ impl App {
             camera,
             minimap: true,
             minimap_drag: None,
+            table_undo: Vec::new(),
             table_cache: std::collections::HashMap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -632,7 +639,13 @@ impl App {
     /// came from a mouse drag, a keystroke, or `--api`.
     pub fn dispatch(&mut self, req: Request) -> Result<Response, String> {
         let mutates = req.mutates();
-        if mutates {
+        // A table-editing session is one undo step, not one per
+        // keystroke's auto-grow plus one for the final text — the
+        // snapshot for the whole session is taken once when the grid
+        // opens (see `begin_table_edit_at`), so the dispatches the
+        // session itself makes (grow `SetRect`s, the closing `SetText`)
+        // must not each push another.
+        if mutates && !matches!(self.mode, Mode::EditingCell(..)) {
             self.push_undo();
         }
         let mut touched: Option<ShapeId> = None;
@@ -892,6 +905,7 @@ impl App {
                 self.sync_cell(row, col);
                 let text = crate::table::format(&self.editing_table);
                 self.editing_table = Vec::new();
+                self.table_undo.clear();
                 let _ = self.dispatch(Request::SetText { id, text });
             }
             Mode::Normal => return,
@@ -925,11 +939,29 @@ impl App {
             Some(NodeKind::Text(t)) => t.clone(),
             _ => return,
         };
+        // The board-level snapshot for the whole session — every grow
+        // and the final text land as this one undo step. Dispatches
+        // made while the grid is open skip their own push (see
+        // `dispatch`).
+        self.push_undo();
+        self.table_undo.clear();
         self.editing_table = crate::table::parse(&current).unwrap_or_else(crate::table::blank);
         let (rows, cols) = self.table_dims();
         let r = row.min(rows.saturating_sub(1));
         let c = col.min(cols.saturating_sub(1));
         self.table_goto(id, r, c);
+        self.table_snapshot(r, c);
+    }
+
+    /// One within-session undo point: the staged grid as it is right
+    /// now, with the cursor and its scratch text — pushed before any
+    /// navigation or structural change, so Ctrl+Z lands back on the
+    /// cell as it was, mid-typing included.
+    fn table_snapshot(&mut self, row: usize, col: usize) {
+        self.table_undo.push((self.editing_table.clone(), row, col, self.editing_text.clone()));
+        if self.table_undo.len() > UNDO_LIMIT {
+            self.table_undo.remove(0);
+        }
     }
 
     fn table_dims(&self) -> (usize, usize) {
@@ -981,6 +1013,7 @@ impl App {
     /// Tabbing past the last cell of the last row grows the table by
     /// one row — the usual way a spreadsheet keeps a table growing.
     fn table_tab(&mut self, id: ShapeId, row: usize, col: usize, backward: bool) {
+        self.table_snapshot(row, col);
         self.sync_cell(row, col);
         let (rows, cols) = self.table_dims();
         let (r, c) = if backward {
@@ -1004,6 +1037,7 @@ impl App {
     /// end the same way `Tab` does — the fast way to fill one column
     /// down a whole table.
     fn table_enter(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.table_snapshot(row, col);
         self.sync_cell(row, col);
         let (rows, cols) = self.table_dims();
         if row + 1 >= rows {
@@ -1015,6 +1049,7 @@ impl App {
     /// Arrow keys: plain navigation, clamped to the grid's own bounds —
     /// unlike `Tab`/`Enter`, never grows it.
     fn table_move(&mut self, id: ShapeId, row: usize, col: usize, dr: i32, dc: i32) {
+        self.table_snapshot(row, col);
         self.sync_cell(row, col);
         let (rows, cols) = self.table_dims();
         let r = (row as i32 + dr).clamp(0, rows as i32 - 1) as usize;
@@ -1023,6 +1058,7 @@ impl App {
     }
 
     fn table_insert_col(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.table_snapshot(row, col);
         self.sync_cell(row, col);
         for r in &mut self.editing_table {
             r.insert(col + 1, String::new());
@@ -1034,6 +1070,7 @@ impl App {
     /// table entirely — there's always at least one column to type
     /// into.
     fn table_delete_col(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.table_snapshot(row, col);
         self.sync_cell(row, col);
         let (_, cols) = self.table_dims();
         if cols > 1 {
@@ -1046,6 +1083,7 @@ impl App {
     }
 
     fn table_insert_row(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.table_snapshot(row, col);
         self.sync_cell(row, col);
         let (_, cols) = self.table_dims();
         self.editing_table.insert(row + 1, vec![String::new(); cols]);
@@ -1055,6 +1093,7 @@ impl App {
     /// A no-op on the header row, or once only the header and one data
     /// row are left — a table always keeps both.
     fn table_delete_row(&mut self, id: ShapeId, row: usize, col: usize) {
+        self.table_snapshot(row, col);
         self.sync_cell(row, col);
         let (rows, _) = self.table_dims();
         if row != 0 && rows > 2 {
@@ -1469,6 +1508,17 @@ impl App {
             },
             Mode::EditingCell(id, row, col) => match key.code {
                 KeyCode::Esc => self.commit_edit(),
+                // Undo within the open grid — steps back through the
+                // session's own snapshots. The board-level Ctrl+Z takes
+                // over again once the grid closes, where the whole
+                // session counts as one step.
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some((table, r, c, text)) = self.table_undo.pop() {
+                        self.editing_table = table;
+                        self.editing_text = text;
+                        self.mode = Mode::EditingCell(id, r, c);
+                    }
+                }
                 KeyCode::Tab => self.table_tab(id, row, col, false),
                 KeyCode::BackTab => self.table_tab(id, row, col, true),
                 // Plain Enter moves down a row, spreadsheet-style — a
@@ -1567,12 +1617,22 @@ impl App {
                         self.begin_table_edit(id);
                     }
                 }
+                // The status names the way back every time — `d` is one
+                // unmodified letter, and typing at a box that turned
+                // out not to be in edit mode (a double-click that
+                // missed its window, say) can fire it by accident. The
+                // box vanishing with no explanation read as data loss;
+                // vanishing with "ctrl+z" on screen reads as a slip.
                 KeyCode::Char('d') | KeyCode::Delete => match self.selected.clone() {
                     Some(Selected::Node(id)) => {
-                        let _ = self.dispatch(Request::Delete { id });
+                        if self.dispatch(Request::Delete { id }).is_ok() {
+                            self.status = "deleted — ctrl+z to undo".to_string();
+                        }
                     }
                     Some(Selected::Edge(id)) => {
-                        let _ = self.dispatch(Request::DeleteEdge { id });
+                        if self.dispatch(Request::DeleteEdge { id }).is_ok() {
+                            self.status = "connector deleted — ctrl+z to undo".to_string();
+                        }
                     }
                     None => {}
                 },

@@ -206,6 +206,14 @@ pub enum Request {
     },
     /// Turn a box into a JSON Canvas link node, or change its URL.
     SetUrl { id: ShapeId, url: String },
+    /// Turn a box into a JSON Canvas group node — a labeled fence
+    /// whose members are whatever boxes sit geometrically inside it.
+    /// Moving the group moves them with it.
+    SetGroup {
+        id: ShapeId,
+        #[serde(default)]
+        label: Option<String>,
+    },
     /// Label a group node, or clear its label with `null`.
     SetGroupLabel { id: ShapeId, label: Option<String> },
     /// Move and/or resize a box to an exact rectangle, in world
@@ -665,6 +673,9 @@ impl App {
         let mut touched: Option<ShapeId> = None;
         let mut touched_edge: Option<String> = None;
         let mut removed_edges: Vec<String> = Vec::new();
+        // Nodes moved alongside the one the request named — a group
+        // move carries its members, and each needs its own CRDT sync.
+        let mut touched_also: Vec<ShapeId> = Vec::new();
         let result = match req {
             Request::Place { x, y, w, h } => {
                 let id = self.canvas.place_text(x, y, w, h);
@@ -698,6 +709,12 @@ impl App {
                 touched = Some(id);
                 Ok(Response::Ok)
             }
+            Request::SetGroup { id, label } => {
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                node.kind = NodeKind::Group { label: label.filter(|l| !l.is_empty()), background: None, background_style: None };
+                touched = Some(id);
+                Ok(Response::Ok)
+            }
             Request::SetGroupLabel { id, label } => {
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
                 let NodeKind::Group { label: slot, .. } = &mut node.kind else {
@@ -709,7 +726,31 @@ impl App {
             }
             Request::SetRect { id, x, y, w, h } => {
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
-                node.rect = WorldRect::new(x, y, w.max(1), h.max(1));
+                let old_rect = node.rect;
+                let new_rect = WorldRect::new(x, y, w.max(1), h.max(1));
+                node.rect = new_rect;
+                // Moving a group carries everything geometrically
+                // inside it — JSON Canvas has no membership field, so
+                // containment IS membership, the same way Obsidian
+                // reads it. A resize (size changed) redraws the fence
+                // without dragging anyone along.
+                let is_group = matches!(self.canvas.node(&id).map(|n| &n.kind), Some(NodeKind::Group { .. }));
+                let pure_move = old_rect.width == new_rect.width && old_rect.height == new_rect.height;
+                if is_group && pure_move && (new_rect.x != old_rect.x || new_rect.y != old_rect.y) {
+                    let (dx, dy) = (new_rect.x - old_rect.x, new_rect.y - old_rect.y);
+                    for other in &mut self.canvas.nodes {
+                        if other.id != id
+                            && other.rect.x >= old_rect.x
+                            && other.rect.y >= old_rect.y
+                            && other.rect.right() <= old_rect.right()
+                            && other.rect.bottom() <= old_rect.bottom()
+                        {
+                            other.rect.x += dx;
+                            other.rect.y += dy;
+                            touched_also.push(other.id.clone());
+                        }
+                    }
+                }
                 touched = Some(id);
                 Ok(Response::Ok)
             }
@@ -830,6 +871,9 @@ impl App {
             if let Some(id) = &touched {
                 self.sync_node(id);
             }
+            for id in &touched_also {
+                self.sync_node(id);
+            }
             if let Some(id) = &touched_edge {
                 self.sync_edge(id);
             }
@@ -883,12 +927,25 @@ impl App {
                 return;
             }
         };
-        // A file that isn't there is our error to report, on the
-        // status line — handing it to the opener anyway let the
+        // A file that isn't there yet gets created (directories and
+        // all) instead of erroring — a file box naming a note that
+        // doesn't exist is how a note starts, same as Obsidian's
+        // create-on-open. Failures to create are ours to report on the
+        // status line; handing a bad path to the opener anyway let the
         // child's own complaint print straight over the TUI.
+        let mut created = false;
         if !target.contains("://") && !std::path::Path::new(&target).exists() {
-            self.status = format!("file not found: {target}");
-            return;
+            if let Some(dir) = std::path::Path::new(&target).parent()
+                && let Err(e) = std::fs::create_dir_all(dir)
+            {
+                self.status = format!("couldn't create {}: {e}", dir.display());
+                return;
+            }
+            if let Err(e) = std::fs::write(&target, "") {
+                self.status = format!("couldn't create {target}: {e}");
+                return;
+            }
+            created = true;
         }
         #[cfg(target_os = "macos")]
         let opener = "open";
@@ -901,7 +958,7 @@ impl App {
             .stderr(std::process::Stdio::null())
             .spawn();
         match spawned {
-            Ok(_) => self.status = format!("opened {target}"),
+            Ok(_) => self.status = format!("{} {target}", if created { "created and opened" } else { "opened" }),
             Err(e) => self.status = format!("couldn't open {target}: {e}"),
         }
     }
@@ -1786,6 +1843,20 @@ impl App {
                     }
                     None => {}
                 },
+                // Draw a box around what you want fenced, then `g` —
+                // its text (if any) becomes the label. Boxes inside
+                // become members from that moment, purely by geometry.
+                KeyCode::Char('g') => {
+                    if let Some(Selected::Node(id)) = self.selected.clone() {
+                        let label = match self.canvas.node(&id).map(|n| &n.kind) {
+                            Some(NodeKind::Text(t)) if !t.is_empty() => Some(t.clone()),
+                            _ => None,
+                        };
+                        if self.dispatch(Request::SetGroup { id, label }).is_ok() {
+                            self.status = "grouped — boxes inside move with it now".to_string();
+                        }
+                    }
+                }
                 KeyCode::Char('o') => self.open_selected(),
                 KeyCode::Char('y') => self.yank_selected(),
                 KeyCode::Char('m') => self.minimap = !self.minimap,

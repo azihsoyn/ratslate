@@ -60,17 +60,51 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
 
     let camera = app.camera;
 
-    // Where the box being dragged actually is right now (screen
-    // space), so a connector follows the ghost instead of staying put
-    // until the drop lands.
-    let live_rect: Option<(String, WorldRect)> = if let Some((id, rect)) = app.resize_preview() {
-        Some((id, to_screen(rect, camera, canvas_area)))
-    } else if let Some(HitTarget::Move(id)) = app.drag.moving() {
-        app.drag
-            .ghost(canvas_area)
-            .map(|g| (id.clone(), WorldRect::new(g.x as i32, g.y as i32, g.width, g.height)))
-    } else {
-        None
+    // Where anything mid-gesture actually is right now, in world
+    // coordinates the model doesn't know about yet: the box being
+    // dragged or resized at its ghost's position — and, when that box
+    // is a group, every member shifted by the same delta, since the
+    // drop will move them and a preview where the fence slides away
+    // from its own contents read as everything being out of step.
+    let mut overrides: std::collections::HashMap<String, WorldRect> = std::collections::HashMap::new();
+    if let Some((id, rect)) = app.resize_preview() {
+        overrides.insert(id, rect);
+    } else if let Some(HitTarget::Move(id)) = app.drag.moving()
+        && let Some(g) = app.drag.ghost(canvas_area)
+    {
+        let ghost_world = WorldRect::new(
+            g.x as i32 - canvas_area.x as i32 + camera.0,
+            g.y as i32 - canvas_area.y as i32 + camera.1,
+            g.width,
+            g.height,
+        );
+        if let Some(node) = app.canvas.node(id)
+            && matches!(node.kind, NodeKind::Group { .. })
+        {
+            let (dx, dy) = (ghost_world.x - node.rect.x, ghost_world.y - node.rect.y);
+            let fence = node.rect;
+            for other in &app.canvas.nodes {
+                if other.id != *id
+                    && other.rect.x >= fence.x
+                    && other.rect.y >= fence.y
+                    && other.rect.right() <= fence.right()
+                    && other.rect.bottom() <= fence.bottom()
+                {
+                    overrides.insert(
+                        other.id.clone(),
+                        WorldRect::new(other.rect.x + dx, other.rect.y + dy, other.rect.width, other.rect.height),
+                    );
+                }
+            }
+        }
+        overrides.insert(id.clone(), ghost_world);
+    }
+    // The dragged box's own frame still draws as the dim ghost.
+    let live_rect: Option<(String, WorldRect)> = match app.drag.moving() {
+        Some(HitTarget::Move(id)) | Some(HitTarget::Resize(id, _)) => {
+            overrides.get(id).map(|r| (id.clone(), to_screen(*r, camera, canvas_area)))
+        }
+        _ => None,
     };
 
     let reattaching: Option<(String, Endpoint)> = match app.drag.moving() {
@@ -109,13 +143,22 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         }
     }
 
-    draw_edges(frame, app, live_rect.as_ref(), reattaching.as_ref(), canvas_area);
+    draw_edges(frame, app, &overrides, reattaching.as_ref(), canvas_area);
 
-    for node in &app.canvas.nodes {
+    // Groups first, whatever the array order says — they're fences
+    // around other boxes, and drawing one after its members would put
+    // its interior hit target over theirs, making everything inside
+    // ungrabbable. Painting order and hit order both want background
+    // status for them.
+    let mut draw_order: Vec<usize> = (0..app.canvas.nodes.len()).collect();
+    draw_order.sort_by_key(|&i| !matches!(app.canvas.nodes[i].kind, NodeKind::Group { .. }));
+    for i in draw_order {
+        let node = &app.canvas.nodes[i];
         if hidden_id.as_deref() == Some(node.id.as_str()) {
             continue;
         }
-        let srect = to_screen(node.rect, camera, canvas_area);
+        let world = overrides.get(&node.id).copied().unwrap_or(node.rect);
+        let srect = to_screen(world, camera, canvas_area);
         let Some(clipped) = clip(srect, canvas_area) else { continue };
         app.hits.put(clipped, HitTarget::Move(node.id.clone()));
         // A box only partly on screen draws as its clipped frame — no
@@ -137,6 +180,11 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             .as_ref()
             .filter(|(t, _)| t == &target)
             .map(|(_, color)| color.as_ref().map(ratatui_color));
+
+        if matches!(node.kind, NodeKind::Group { .. }) {
+            draw_group_node(frame, node, clipped, selected, editing, &app.editing_text, preview);
+            continue;
+        }
 
         let table_cursor = match &app.mode {
             Mode::EditingCell(id, r, c) if id == &node.id => Some((*r, *c)),
@@ -234,7 +282,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         draw_drag_preview(frame, (anchor_node, srect), None, (cx, cy), None);
     }
 
-    draw_minimap(frame, app);
+    draw_minimap(frame, app, &overrides);
 
     draw_status(frame, app, status_area);
 }
@@ -246,7 +294,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
 /// view there; `m` toggles it. Drawn last so it sits over everything,
 /// and its hit target registered last for the same reason: later wins,
 /// so a click on the map is never a click on whatever it covers.
-fn draw_minimap(frame: &mut Frame, app: &mut App) {
+fn draw_minimap(frame: &mut Frame, app: &mut App, overrides: &std::collections::HashMap<String, WorldRect>) {
     // While a scrub-drag is in progress, draw against the same frozen
     // frame of reference the drag math uses — recomputing bounds every
     // frame would slide the map under the very cursor dragging it.
@@ -268,29 +316,14 @@ fn draw_minimap(frame: &mut Frame, app: &mut App) {
     let view = Rect::new(vx0, vy0, (vx1 - vx0 + 1).max(1), (vy1 - vy0 + 1).max(1));
     frame.render_widget(Block::new().style(Style::default().bg(RColor::Rgb(60, 60, 70))), view);
 
-    // The box being dragged or resized right now, at where its ghost
-    // is rather than where the model still says it sits — the model
-    // only updates on drop, and a map dot that sat still through the
-    // whole drag then teleported read as the map not updating at all.
-    let live: Option<(String, (i32, i32))> = match app.drag.moving() {
-        Some(HitTarget::Move(id)) => app.drag.ghost(app.canvas_area).map(|g| {
-            let (wx, wy) = app.to_world(g.x, g.y);
-            (id.clone(), (wx + g.width as i32 / 2, wy + g.height as i32 / 2))
-        }),
-        Some(HitTarget::Resize(..)) => app
-            .resize_preview()
-            .map(|(id, r)| (id, (r.x + r.width as i32 / 2, r.y + r.height as i32 / 2))),
-        _ => None,
-    };
-
     // One dot per box, at its center — drawing each box's scaled
     // extent instead made a single wide box read as a row of separate
-    // boxes, which is worse than not showing sizes at all.
+    // boxes, which is worse than not showing sizes at all. Anything
+    // mid-gesture (a ghost, a dragged group's members) shows at its
+    // preview position, not where the model still says it sits.
     for node in &app.canvas.nodes {
-        let (cx, cy) = match &live {
-            Some((id, center)) if id == &node.id => *center,
-            _ => (node.rect.x + node.rect.width as i32 / 2, node.rect.y + node.rect.height as i32 / 2),
-        };
+        let rect = overrides.get(&node.id).copied().unwrap_or(node.rect);
+        let (cx, cy) = (rect.x + rect.width as i32 / 2, rect.y + rect.height as i32 / 2);
         let (mx, my) = layout.to_map(cx, cy);
         let color = node.color.as_ref().map(ratatui_color).unwrap_or(RColor::Gray);
         put_char(frame, mx as i32, my as i32, '▪', Style::default().fg(color));
@@ -345,6 +378,32 @@ fn draw_node(frame: &mut Frame, node: &Node, rect: Rect, selected: bool, editing
             inner,
         );
     }
+}
+
+/// A group: a fence, not a box — just its border and label, drawn dim
+/// (unless colored or selected) so the boxes standing inside it stay
+/// the foreground. The label lives on the top border, and editing the
+/// group edits that label in place.
+fn draw_group_node(frame: &mut Frame, node: &Node, rect: Rect, selected: bool, editing: bool, editing_text: &str, preview: Option<Option<RColor>>) {
+    let (_, border_style) = node_style(node.color.as_ref(), selected, preview);
+    let style = if !selected && node.color.is_none() && preview.is_none() {
+        Style::default().fg(RColor::DarkGray)
+    } else {
+        border_style
+    };
+    let label = if editing {
+        format!("{editing_text}▏")
+    } else {
+        match &node.kind {
+            NodeKind::Group { label: Some(l), .. } => l.clone(),
+            _ => String::new(),
+        }
+    };
+    let mut block = Block::bordered().border_style(style);
+    if !label.is_empty() {
+        block = block.title(Span::styled(format!(" {label} "), style.add_modifier(Modifier::BOLD)));
+    }
+    frame.render_widget(block, rect);
 }
 
 /// Everything `draw_table_node` needs about the box itself, bundled so
@@ -683,19 +742,23 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
 fn draw_edges(
     frame: &mut Frame,
     app: &mut App,
-    live: Option<&(String, WorldRect)>,
+    overrides: &std::collections::HashMap<String, WorldRect>,
     reattaching: Option<&(String, Endpoint)>,
     canvas_area: Rect,
 ) {
     // Screen-space rects throughout — everything downstream (routing,
     // glyph placement, hit registration) is bounded per-cell, so a box
     // off the visible canvas simply routes to coordinates whose glyphs
-    // `put_char` then drops.
+    // `put_char` then drops. `overrides` carries mid-gesture world
+    // positions (ghosts, a dragged group's members) the model doesn't
+    // hold yet, so connectors track the preview instead of the past.
     let camera = app.camera;
     let rect_of = |id: &str| -> Option<WorldRect> {
-        live.filter(|(live_id, _)| live_id == id)
-            .map(|(_, r)| *r)
-            .or_else(|| app.canvas.node(id).map(|n| to_screen(n.rect, camera, canvas_area)))
+        overrides
+            .get(id)
+            .copied()
+            .or_else(|| app.canvas.node(id).map(|n| n.rect))
+            .map(|r| to_screen(r, camera, canvas_area))
     };
 
     // Which side of `from` and of `to` each edge leaves/arrives on, so
@@ -1252,7 +1315,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Editing(_) => "EDIT (Esc to leave)",
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · corner resize · arrows/wheel pan · m map · o open file/link · y copy · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · corner resize · arrows/wheel pan · m map · o open file/link · y copy · g group · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

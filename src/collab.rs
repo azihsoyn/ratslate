@@ -43,6 +43,9 @@ pub struct NodeFields {
     /// a file box, a URL for a link, a label for a group. Which one
     /// `kind` says.
     pub text: String,
+    /// A file node's anchor within its file — `None` for every other
+    /// kind, which have no such thing.
+    pub subpath: Option<String>,
     pub color: Option<String>,
     pub shape: String,
     /// "text" | "file" | "link" | "group".
@@ -124,12 +127,17 @@ impl Collab {
             Some(c) => Any::String(Arc::from(c.as_str())),
             None => Any::Null,
         };
-        let entry: [(Arc<str>, In); 8] = [
+        let subpath: Any = match &f.subpath {
+            Some(sp) => Any::String(Arc::from(sp.as_str())),
+            None => Any::Null,
+        };
+        let entry: [(Arc<str>, In); 9] = [
             (Arc::from("x"), In::Any(Any::BigInt(f.x))),
             (Arc::from("y"), In::Any(Any::BigInt(f.y))),
             (Arc::from("w"), In::Any(Any::BigInt(f.w))),
             (Arc::from("h"), In::Any(Any::BigInt(f.h))),
             (Arc::from("text"), In::Any(Any::String(Arc::from(f.text.as_str())))),
+            (Arc::from("subpath"), In::Any(subpath)),
             (Arc::from("color"), In::Any(color)),
             (Arc::from("shape"), In::Any(Any::String(Arc::from(f.shape.as_str())))),
             (Arc::from("kind"), In::Any(Any::String(Arc::from(f.kind.as_str())))),
@@ -176,6 +184,10 @@ impl Collab {
                     w: get_i64("w"),
                     h: get_i64("h"),
                     text: get_str("text"),
+                    subpath: match fields.get("subpath") {
+                        Some(Any::String(s)) => Some(s.to_string()),
+                        _ => None,
+                    },
                     color,
                     shape: get_str("shape"),
                     kind: get_str("kind"),

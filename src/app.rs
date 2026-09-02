@@ -192,8 +192,22 @@ pub enum Request {
         #[serde(default)]
         h: Option<u16>,
     },
-    /// Replace a box's text outright.
+    /// Replace a text box's content outright. Errors on file, link and
+    /// group nodes — those hold a path, a URL and a label, reached
+    /// through `set_file`, `set_url` and `set_group_label` instead.
     SetText { id: ShapeId, text: String },
+    /// Turn a box into a JSON Canvas file node, or repoint an existing
+    /// one — `file` is a path, `subpath` an optional anchor within it.
+    SetFile {
+        id: ShapeId,
+        file: String,
+        #[serde(default)]
+        subpath: Option<String>,
+    },
+    /// Turn a box into a JSON Canvas link node, or change its URL.
+    SetUrl { id: ShapeId, url: String },
+    /// Label a group node, or clear its label with `null`.
+    SetGroupLabel { id: ShapeId, label: Option<String> },
     /// Move and/or resize a box to an exact rectangle, in world
     /// coordinates.
     SetRect { id: ShapeId, x: i32, y: i32, w: u16, h: u16 },
@@ -658,11 +672,38 @@ impl App {
                 Ok(Response::Placed { id })
             }
             Request::SetText { id, text } => {
-                self.canvas.node(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                let node = self.canvas.node(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                match &node.kind {
+                    NodeKind::Text(_) => {}
+                    NodeKind::File { .. } => return Err(format!("{id} is a file node — use set_file")),
+                    NodeKind::Link(_) => return Err(format!("{id} is a link node — use set_url")),
+                    NodeKind::Group { .. } => return Err(format!("{id} is a group node — use set_group_label")),
+                }
                 self.canvas.edit_text(&id, |t| {
                     t.clear();
                     t.push_str(&text);
                 });
+                touched = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetFile { id, file, subpath } => {
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                node.kind = NodeKind::File { path: file, subpath };
+                touched = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetUrl { id, url } => {
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                node.kind = NodeKind::Link(url);
+                touched = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetGroupLabel { id, label } => {
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                let NodeKind::Group { label: slot, .. } = &mut node.kind else {
+                    return Err(format!("{id} is not a group node"));
+                };
+                *slot = label.filter(|l| !l.is_empty());
                 touched = Some(id);
                 Ok(Response::Ok)
             }
@@ -815,6 +856,104 @@ impl App {
         (x as i32 - self.canvas_area.x as i32 + self.camera.0, y as i32 - self.canvas_area.y as i32 + self.camera.1)
     }
 
+    /// `o` on a link box hands its URL to the OS opener (browser); on
+    /// a file box, its path — resolved against the board file's own
+    /// directory, since JSON Canvas file paths are vault-relative.
+    /// Everything else has nothing to open and says so.
+    fn open_selected(&mut self) {
+        let Some(Selected::Node(id)) = &self.selected else {
+            self.status = "nothing selected to open".to_string();
+            return;
+        };
+        let target = match self.canvas.node(id).map(|n| &n.kind) {
+            Some(NodeKind::Link(url)) => url.clone(),
+            Some(NodeKind::File { path, .. }) => {
+                if std::path::Path::new(path).is_absolute() {
+                    path.clone()
+                } else {
+                    let base = self.save_path.as_deref().and_then(std::path::Path::parent);
+                    match base {
+                        Some(dir) => dir.join(path).display().to_string(),
+                        None => path.clone(),
+                    }
+                }
+            }
+            _ => {
+                self.status = "only file and link boxes can be opened".to_string();
+                return;
+            }
+        };
+        // A file that isn't there is our error to report, on the
+        // status line — handing it to the opener anyway let the
+        // child's own complaint print straight over the TUI.
+        if !target.contains("://") && !std::path::Path::new(&target).exists() {
+            self.status = format!("file not found: {target}");
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let opener = "open";
+        #[cfg(not(target_os = "macos"))]
+        let opener = "xdg-open";
+        let spawned = std::process::Command::new(opener)
+            .arg(&target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(_) => self.status = format!("opened {target}"),
+            Err(e) => self.status = format!("couldn't open {target}: {e}"),
+        }
+    }
+
+    /// `y` copies what the selection holds — a box's text (a file
+    /// box's path, a link's URL, a group's label) or a connector's
+    /// label — through the system clipboard. The terminal's own
+    /// mouse-selection can't reach text under mouse capture, so this
+    /// is the way content leaves the board.
+    fn yank_selected(&mut self) {
+        let text = match &self.selected {
+            Some(Selected::Node(id)) => match self.canvas.node(id).map(|n| &n.kind) {
+                Some(NodeKind::Text(t)) => t.clone(),
+                Some(NodeKind::File { path, .. }) => path.clone(),
+                Some(NodeKind::Link(url)) => url.clone(),
+                Some(NodeKind::Group { label, .. }) => label.clone().unwrap_or_default(),
+                None => return,
+            },
+            Some(Selected::Edge(id)) => match self.canvas.edge(id).and_then(|e| e.label.clone()) {
+                Some(l) => l,
+                None => {
+                    self.status = "connector has no label to copy".to_string();
+                    return;
+                }
+            },
+            None => {
+                self.status = "nothing selected to copy".to_string();
+                return;
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let clip = "pbcopy";
+        #[cfg(not(target_os = "macos"))]
+        let clip = "xclip";
+        let child = std::process::Command::new(clip)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match child {
+            Ok(mut c) => {
+                use std::io::Write;
+                if let Some(stdin) = c.stdin.as_mut() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = c.wait();
+                self.status = format!("copied {} chars", text.chars().count());
+            }
+            Err(e) => self.status = format!("couldn't copy: {e}"),
+        }
+    }
+
     /// Reparses whichever text nodes changed since the last frame and
     /// drops nothing else — called once at the top of every render, so
     /// every table lookup after it is a plain map read.
@@ -897,7 +1036,12 @@ impl App {
             Mode::Editing(target) => {
                 let text = std::mem::take(&mut self.editing_text);
                 let _ = match target {
-                    Selected::Node(id) => self.dispatch(Request::SetText { id, text }),
+                    Selected::Node(id) => match self.canvas.node(&id).map(|n| n.kind.clone()) {
+                        Some(NodeKind::File { subpath, .. }) => self.dispatch(Request::SetFile { id, file: text, subpath }),
+                        Some(NodeKind::Link(_)) => self.dispatch(Request::SetUrl { id, url: text }),
+                        Some(NodeKind::Group { .. }) => self.dispatch(Request::SetGroupLabel { id, label: Some(text) }),
+                        _ => self.dispatch(Request::SetText { id, text }),
+                    },
                     Selected::Edge(id) => self.dispatch(Request::SetLabel { id, label: Some(text) }),
                 };
             }
@@ -913,11 +1057,17 @@ impl App {
         self.mode = Mode::Normal;
     }
 
+    /// What editing a box means depends on what it holds: a text box
+    /// edits its text, a file box its path, a link box its URL, a
+    /// group its label.
     fn begin_edit(&mut self, target: Selected) {
         self.editing_text = match &target {
             Selected::Node(id) => match self.canvas.node(id).map(|n| &n.kind) {
                 Some(NodeKind::Text(t)) => t.clone(),
-                _ => String::new(),
+                Some(NodeKind::File { path, .. }) => path.clone(),
+                Some(NodeKind::Link(url)) => url.clone(),
+                Some(NodeKind::Group { label, .. }) => label.clone().unwrap_or_default(),
+                None => String::new(),
             },
             Selected::Edge(id) => self.canvas.edge(id).and_then(|e| e.label.clone()).unwrap_or_default(),
         };
@@ -1636,6 +1786,8 @@ impl App {
                     }
                     None => {}
                 },
+                KeyCode::Char('o') => self.open_selected(),
+                KeyCode::Char('y') => self.yank_selected(),
                 KeyCode::Char('m') => self.minimap = !self.minimap,
                 // Pan — the board is an infinite plane and these move
                 // the window over it, never the content. Nothing else
@@ -1728,13 +1880,11 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
 }
 
 fn node_fields(node: &Node) -> NodeFields {
-    let (kind, text) = match &node.kind {
-        NodeKind::Text(t) => ("text", t.clone()),
-        // `subpath` doesn't round-trip — no board so far has used it,
-        // and it's not worth a ninth CRDT field until one does.
-        NodeKind::File { path, .. } => ("file", path.clone()),
-        NodeKind::Link(url) => ("link", url.clone()),
-        NodeKind::Group { label, .. } => ("group", label.clone().unwrap_or_default()),
+    let (kind, text, subpath) = match &node.kind {
+        NodeKind::Text(t) => ("text", t.clone(), None),
+        NodeKind::File { path, subpath } => ("file", path.clone(), subpath.clone()),
+        NodeKind::Link(url) => ("link", url.clone(), None),
+        NodeKind::Group { label, .. } => ("group", label.clone().unwrap_or_default(), None),
     };
     NodeFields {
         x: node.rect.x as i64,
@@ -1742,6 +1892,7 @@ fn node_fields(node: &Node) -> NodeFields {
         w: node.rect.width as i64,
         h: node.rect.height as i64,
         text,
+        subpath,
         color: node.color.as_ref().map(|c| c.to_string()),
         shape: node.shape.as_str().unwrap_or("rectangle").to_string(),
         kind: kind.to_string(),
@@ -1750,7 +1901,7 @@ fn node_fields(node: &Node) -> NodeFields {
 
 fn node_from_fields(id: String, f: NodeFields) -> Node {
     let kind = match f.kind.as_str() {
-        "file" => NodeKind::File { path: f.text, subpath: None },
+        "file" => NodeKind::File { path: f.text, subpath: f.subpath },
         "link" => NodeKind::Link(f.text),
         "group" => NodeKind::Group { label: Some(f.text).filter(|s| !s.is_empty()), background: None, background_style: None },
         _ => NodeKind::Text(f.text),

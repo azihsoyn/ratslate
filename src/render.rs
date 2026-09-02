@@ -78,23 +78,30 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             g.width,
             g.height,
         );
-        if let Some(node) = app.canvas.node(id)
-            && matches!(node.kind, NodeKind::Group { .. })
-        {
+        if let Some(node) = app.canvas.node(id) {
             let (dx, dy) = (ghost_world.x - node.rect.x, ghost_world.y - node.rect.y);
-            let fence = node.rect;
-            for other in &app.canvas.nodes {
-                if other.id != *id
-                    && other.rect.x >= fence.x
-                    && other.rect.y >= fence.y
-                    && other.rect.right() <= fence.right()
-                    && other.rect.bottom() <= fence.bottom()
-                {
-                    overrides.insert(
-                        other.id.clone(),
-                        WorldRect::new(other.rect.x + dx, other.rect.y + dy, other.rect.width, other.rect.height),
-                    );
-                }
+            // A group's fence carries its geometric members; a member
+            // of a multi-selection carries the rest of the party.
+            // Either way everyone previews at their landing spot.
+            let mut carried: Vec<&Node> = Vec::new();
+            if matches!(node.kind, NodeKind::Group { .. }) {
+                let fence = node.rect;
+                carried.extend(app.canvas.nodes.iter().filter(|other| {
+                    other.id != *id
+                        && other.rect.x >= fence.x
+                        && other.rect.y >= fence.y
+                        && other.rect.right() <= fence.right()
+                        && other.rect.bottom() <= fence.bottom()
+                }));
+            }
+            if app.multi.contains(id) {
+                carried.extend(app.canvas.nodes.iter().filter(|other| other.id != *id && app.multi.contains(&other.id)));
+            }
+            for other in carried {
+                overrides.insert(
+                    other.id.clone(),
+                    WorldRect::new(other.rect.x + dx, other.rect.y + dy, other.rect.width, other.rect.height),
+                );
             }
         }
         overrides.insert(id.clone(), ghost_world);
@@ -172,7 +179,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         for (corner, rect) in corner_rects(clipped) {
             app.hits.put(rect, HitTarget::Resize(node.id.clone(), corner));
         }
-        let selected = matches!(&app.selected, Some(Selected::Node(id)) if id == &node.id);
+        let selected = matches!(&app.selected, Some(Selected::Node(id)) if id == &node.id) || app.multi.contains(&node.id);
         let editing = matches!(&app.mode, Mode::Editing(Selected::Node(id)) if id == &node.id);
         let target = Selected::Node(node.id.clone());
         let preview = app
@@ -240,6 +247,20 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
 
     if let Some(rect) = app.drawing_preview() {
         draw_ghost(frame, rect, None);
+    }
+
+    // The rubber band being dragged out — a cyan frame, distinct from
+    // the gray place-a-box ghost, since letting go does something very
+    // different.
+    if let Some((start, end)) = app.selecting {
+        let x = start.0.min(end.0);
+        let y = start.1.min(end.1);
+        let w = start.0.max(end.0) - x + 1;
+        let h = start.1.max(end.1) - y + 1;
+        frame.render_widget(
+            Block::bordered().border_style(Style::default().fg(RColor::Cyan)),
+            Rect::new(x, y, w, h).intersection(canvas_area),
+        );
     }
 
     if let Some(HitTarget::Connect(from, anchor)) = app.drag.moving()
@@ -1315,10 +1336,67 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Editing(_) => "EDIT (Esc to leave)",
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · corner resize · arrows/wheel pan · m map · o open file/link · y copy · g group · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · o open file/link · y copy · g group · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),
         area,
     );
+}
+
+/// The whole board drawn to plain text: the content's bounding box
+/// (plus margin for the arrowheads and anchor dots that sit just past
+/// borders), rendered through the exact same pipeline as the screen
+/// into an in-memory buffer — so tables, connectors and groups come
+/// out precisely as the TUI draws them, not a second implementation's
+/// approximation. The camera and minimap are borrowed and restored:
+/// the caller's own view doesn't move.
+pub fn to_ascii(app: &mut App) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut x0 = i32::MAX;
+    let mut y0 = i32::MAX;
+    let mut x1 = i32::MIN;
+    let mut y1 = i32::MIN;
+    for n in &app.canvas.nodes {
+        x0 = x0.min(n.rect.x);
+        y0 = y0.min(n.rect.y);
+        x1 = x1.max(n.rect.right());
+        y1 = y1.max(n.rect.bottom());
+    }
+    if app.canvas.nodes.is_empty() {
+        return String::new();
+    }
+    let margin = 2;
+    let w = ((x1 - x0) + margin * 2).clamp(4, 2000) as u16;
+    let h = ((y1 - y0) + margin * 2).clamp(4, 2000) as u16;
+
+    let saved_camera = app.camera;
+    let saved_minimap = app.minimap;
+    app.camera = (x0 - margin, y0 - margin);
+    app.minimap = false;
+
+    let backend = TestBackend::new(w, h);
+    let mut term = Terminal::new(backend).expect("in-memory terminal");
+    let _ = term.draw(|frame| {
+        render(frame, app, Rect::new(0, 0, w, h), Rect::new(0, 0, 0, 0));
+    });
+
+    let buffer = term.backend().buffer();
+    let mut lines: Vec<String> = buffer
+        .content
+        .chunks(w as usize)
+        .map(|row| row.iter().map(|c| c.symbol()).collect::<String>().trim_end().to_string())
+        .collect();
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    while lines.first().is_some_and(String::is_empty) {
+        lines.remove(0);
+    }
+
+    app.camera = saved_camera;
+    app.minimap = saved_minimap;
+    lines.join("\n")
 }

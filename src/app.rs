@@ -228,6 +228,12 @@ pub enum Request {
     Connect { from: ShapeId, to: ShapeId },
     /// Remove a box and any connectors touching it.
     Delete { id: ShapeId },
+    /// Remove several boxes (and connectors touching them) as one
+    /// undo step — what deleting a multi-selection means.
+    DeleteMany { ids: Vec<ShapeId> },
+    /// Shift several boxes by the same delta as one undo step — what
+    /// dropping a dragged multi-selection means.
+    MoveBy { ids: Vec<ShapeId>, dx: i32, dy: i32 },
     /// Label a connector, or clear its label with `null`.
     SetLabel { id: String, label: Option<String> },
     /// Same color grammar as a box's `SetColor`.
@@ -263,6 +269,11 @@ pub enum Request {
     Select { id: Option<Selected> },
     /// The whole board, as JSON Canvas.
     State,
+    /// The whole board drawn to plain text — the same rendering the
+    /// TUI shows (boxes, tables, connectors, groups), over the
+    /// content's own bounding box. The spatial layout in readable
+    /// form: paste it in a doc, or read it to see the board.
+    Render,
     /// Write the board to the path given on the command line.
     Save,
     /// Undo the last change that touched the board.
@@ -277,7 +288,7 @@ impl Request {
     fn mutates(&self) -> bool {
         !matches!(
             self,
-            Request::Select { .. } | Request::State | Request::Save | Request::Undo | Request::Redo
+            Request::Select { .. } | Request::State | Request::Render | Request::Save | Request::Undo | Request::Redo
         )
     }
 }
@@ -338,6 +349,7 @@ pub enum Response {
     Connected { id: String },
     Ok,
     State { board: FileRoot },
+    Rendered { text: String },
     Saved { path: String },
     Undone { done: bool },
     Redone { done: bool },
@@ -383,6 +395,13 @@ pub struct App {
     /// board's top-left corner so a board authored anywhere on the
     /// plane (negative coordinates included) opens showing its content.
     pub camera: (i32, i32),
+    /// Every box in the current multi-selection (from a shift+drag
+    /// rubber band on empty canvas) — dragged together, deleted
+    /// together. Cleared by any plain click that isn't on a member.
+    pub multi: Vec<ShapeId>,
+    /// A rubber-band selection being dragged out right now: press
+    /// point and current point, in screen cells.
+    pub selecting: Option<((u16, u16), (u16, u16))>,
     /// Whether the minimap overlay is shown — `m` toggles it.
     pub minimap: bool,
     /// Within-session undo for the open table grid: snapshots of the
@@ -491,6 +510,8 @@ impl App {
             status,
             canvas_area: Rect::default(),
             camera,
+            multi: Vec::new(),
+            selecting: None,
             minimap: true,
             minimap_drag: None,
             table_undo: Vec::new(),
@@ -788,6 +809,41 @@ impl App {
                 touched = Some(id);
                 Ok(Response::Ok)
             }
+            Request::DeleteMany { ids } => {
+                for id in &ids {
+                    self.canvas.node(id).ok_or_else(|| format!("no such node: {id}"))?;
+                }
+                for id in &ids {
+                    removed_edges.extend(
+                        self.canvas
+                            .edges
+                            .iter()
+                            .filter(|e| &e.from == id || &e.to == id)
+                            .map(|e| e.id.clone()),
+                    );
+                    self.canvas.delete(id);
+                    if self.selected == Some(Selected::Node(id.clone())) {
+                        self.selected = None;
+                    }
+                }
+                removed_edges.sort();
+                removed_edges.dedup();
+                touched_also.extend(ids);
+                Ok(Response::Ok)
+            }
+            Request::MoveBy { ids, dx, dy } => {
+                for id in &ids {
+                    self.canvas.node(id).ok_or_else(|| format!("no such node: {id}"))?;
+                }
+                for id in &ids {
+                    if let Some(node) = self.canvas.node_mut(id) {
+                        node.rect.x += dx;
+                        node.rect.y += dy;
+                    }
+                }
+                touched_also.extend(ids);
+                Ok(Response::Ok)
+            }
             Request::SetLabel { id, label } => {
                 let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
                 edge.label = label.filter(|l| !l.is_empty());
@@ -858,6 +914,7 @@ impl App {
                 Ok(Response::Ok)
             }
             Request::State => Ok(Response::State { board: canvas_io::to_file(&self.canvas) }),
+            Request::Render => Ok(Response::Rendered { text: crate::render::to_ascii(self) }),
             Request::Save => {
                 self.save();
                 Ok(Response::Saved {
@@ -1427,6 +1484,15 @@ impl App {
                 };
             }
 
+            // A press on a member keeps the multi-selection alive (it
+            // may be the start of dragging the whole party); a press
+            // anywhere else dissolves it, same as clicking away from a
+            // single selection.
+            let keeps_multi = matches!(&hit, Some((HitTarget::Move(id), _)) if self.multi.contains(id));
+            if !keeps_multi {
+                self.multi.clear();
+            }
+
             match &hit {
                 Some((HitTarget::Move(_), rect)) => {
                     self.grab_offset = (
@@ -1444,6 +1510,14 @@ impl App {
                     if let Some((edge_id, _)) = self.edge_hits.at(ev.column, ev.row) {
                         self.press_on_edge = Some((edge_id, ev.column, ev.row));
                         self.drawing = None;
+                    } else if ev.modifiers.contains(KeyModifiers::SHIFT) {
+                        // Shift+drag on empty canvas rubber-bands a
+                        // multi-selection instead of drawing a box.
+                        self.press_on_edge = None;
+                        self.drawing = None;
+                        self.selecting = canvas_area
+                            .contains(Position::new(ev.column, ev.row))
+                            .then_some(((ev.column, ev.row), (ev.column, ev.row)));
                     } else {
                         self.press_on_edge = None;
                         self.drawing = canvas_area
@@ -1454,12 +1528,15 @@ impl App {
             }
         }
 
-        if let MouseEventKind::Drag(MouseButton::Left) = ev.kind
-            && let Some((start, _)) = self.drawing
-        {
+        if let MouseEventKind::Drag(MouseButton::Left) = ev.kind {
             let cx = ev.column.clamp(canvas_area.x, canvas_area.right().saturating_sub(1));
             let cy = ev.row.clamp(canvas_area.y, canvas_area.bottom().saturating_sub(1));
-            self.drawing = Some((start, (cx, cy)));
+            if let Some((start, _)) = self.drawing {
+                self.drawing = Some((start, (cx, cy)));
+            }
+            if let Some((start, _)) = self.selecting {
+                self.selecting = Some((start, (cx, cy)));
+            }
         }
 
         match self.drag.on_mouse(ev, hit) {
@@ -1548,7 +1625,15 @@ impl App {
                 if let Some(node) = self.canvas.node(&id) {
                     let (w, h) = (node.rect.width, node.rect.height);
                     let (wx, wy) = self.to_world(x.saturating_sub(self.grab_offset.0), y.saturating_sub(self.grab_offset.1));
-                    let _ = self.dispatch(Request::SetRect { id, x: wx, y: wy, w, h });
+                    if self.multi.contains(&id) {
+                        // Dragging any member moves the whole party by
+                        // the same delta, as one undo step.
+                        let (dx, dy) = (wx - node.rect.x, wy - node.rect.y);
+                        let ids = self.multi.clone();
+                        let _ = self.dispatch(Request::MoveBy { ids, dx, dy });
+                    } else {
+                        let _ = self.dispatch(Request::SetRect { id, x: wx, y: wy, w, h });
+                    }
                 }
             }
             Did::Drop {
@@ -1620,6 +1705,27 @@ impl App {
                 self.minimap_drag = None;
             }
             _ => {}
+        }
+
+        if let MouseEventKind::Up(MouseButton::Left) = ev.kind
+            && let Some((start, end)) = self.selecting.take()
+        {
+            let (sx0, sy0) = (start.0.min(end.0), start.1.min(end.1));
+            let (sx1, sy1) = (start.0.max(end.0), start.1.max(end.1));
+            let (wx0, wy0) = self.to_world(sx0, sy0);
+            let (wx1, wy1) = self.to_world(sx1, sy1);
+            self.multi = self
+                .canvas
+                .nodes
+                .iter()
+                .filter(|n| n.rect.x >= wx0 && n.rect.y >= wy0 && n.rect.right() <= wx1 + 1 && n.rect.bottom() <= wy1 + 1)
+                .map(|n| n.id.clone())
+                .collect();
+            let _ = self.dispatch(Request::Select { id: None });
+            self.status = match self.multi.len() {
+                0 => "nothing inside the selection".to_string(),
+                n => format!("{n} boxes selected — drag any to move all, d deletes all"),
+            };
         }
 
         if let MouseEventKind::Up(MouseButton::Left) = ev.kind {
@@ -1830,6 +1936,13 @@ impl App {
                 // missed its window, say) can fire it by accident. The
                 // box vanishing with no explanation read as data loss;
                 // vanishing with "ctrl+z" on screen reads as a slip.
+                KeyCode::Char('d') | KeyCode::Delete if !self.multi.is_empty() => {
+                    let ids = std::mem::take(&mut self.multi);
+                    let n = ids.len();
+                    if self.dispatch(Request::DeleteMany { ids }).is_ok() {
+                        self.status = format!("{n} boxes deleted — ctrl+z to undo");
+                    }
+                }
                 KeyCode::Char('d') | KeyCode::Delete => match self.selected.clone() {
                     Some(Selected::Node(id)) => {
                         if self.dispatch(Request::Delete { id }).is_ok() {
@@ -1868,7 +1981,9 @@ impl App {
                 KeyCode::Up => self.camera.1 -= PAN_STEP_Y,
                 KeyCode::Down => self.camera.1 += PAN_STEP_Y,
                 KeyCode::Esc => {
-                    if self.color_picker.take().is_some() {
+                    if !self.multi.is_empty() {
+                        self.multi.clear();
+                    } else if self.color_picker.take().is_some() {
                         self.hover_swatch = None;
                     } else if self.selected.is_some() {
                         let _ = self.dispatch(Request::Select { id: None });

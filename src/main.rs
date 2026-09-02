@@ -34,6 +34,14 @@ fn main() -> io::Result<()> {
         print_schema();
         return Ok(());
     }
+    // The board as plain text on stdout — pipe it into a doc, a PR, a
+    // pager. The `--api` request `render` returns the same thing
+    // wrapped in JSON.
+    if args.iter().any(|a| a == "--render") {
+        let mut app = App::new(path);
+        println!("{}", render::to_ascii(&mut app));
+        return Ok(());
+    }
     if let Some(i) = args.iter().position(|a| a == "--api") {
         let Some(json) = args.get(i + 1) else {
             eprintln!("--api needs a JSON argument");

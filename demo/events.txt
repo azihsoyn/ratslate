@@ -1,0 +1,35 @@
+# draw box 1
+1.0 \x1b[<0;6;4M
+0.15 \x1b[<32;16;6M
+0.15 \x1b[<32;26;8M
+0.1 \x1b[<0;26;8m
+0.6 ratslate
+0.7 \x1b
+0.5 c
+0.5 c
+# draw box 2
+0.8 \x1b[<0;10;16M
+0.15 \x1b[<32;22;18M
+0.15 \x1b[<32;36;21M
+0.1 \x1b[<0;36;21m
+0.5 boxes & arrows
+0.7 \x1b
+# connect box1 -> box2 (shift+drag)
+0.8 \x1b[<4;12;6M
+0.2 \x1b[<36;16;11M
+0.2 \x1b[<36;20;17M
+0.15 \x1b[<4;20;17m
+# edit a table cell (double-click Alice's Age)
+1.0 \x1b[<0;64;6M
+0.05 \x1b[<0;64;6m
+0.15 \x1b[<0;64;6M
+0.05 \x1b[<0;64;6m
+0.4 \x7f\x7f
+0.3 31
+0.6 \t
+0.3 \x7f\x7f\x7f\x7f\x7f
+0.3 Kyoto
+0.7 \x1b
+0.8 \x1b
+# quit (auto-saves)
+1.4 q

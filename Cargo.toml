@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "An infinite canvas in the terminal: boxes, arrows and text, placed with the mouse, written out as ASCII"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/azihsoyn/ratslate"
+readme = "README.md"
+keywords = ["tui", "canvas", "whiteboard", "json-canvas", "ratatui"]
+categories = ["command-line-utilities", "visualization"]
 
 [dependencies]
 anyhow = "1.0"

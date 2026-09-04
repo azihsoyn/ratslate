@@ -535,8 +535,11 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
                 // One space of breathing room on each side of the
                 // content, not just a bare column butted up against the
                 // divider — `col_widths`/`render_size` already size the
-                // box assuming this padding is here.
-                let mut text = format!(" {content:<w$}");
+                // box assuming this padding is here. Padded by display
+                // cells, not chars: `{:<w$}` counts chars, which left
+                // CJK cells overflowing their own column.
+                let pad = w.saturating_sub(crate::table::display_width(content));
+                let mut text = format!(" {content}{}", " ".repeat(pad));
                 if is_cursor && line_idx + 1 == lines.len().max(1) {
                     text.push('▏');
                 } else {
@@ -995,7 +998,7 @@ fn draw_edges(
             && mx >= 0
             && my >= 0
         {
-            let width = shown.chars().count().min(u16::MAX as usize) as u16;
+            let width = crate::table::display_width(&shown).min(u16::MAX as usize) as u16;
             frame.render_widget(Paragraph::new(shown).style(style), Rect::new(mx as u16, my as u16, width, 1));
         }
 

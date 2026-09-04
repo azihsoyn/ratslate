@@ -103,8 +103,17 @@ pub fn cell_lines(s: &str) -> Vec<&str> {
     s.split(CELL_BREAK).collect()
 }
 
+/// A string's width in terminal cells — CJK and other wide glyphs
+/// count as two. Everything that lays out the grid (column widths, box
+/// sizing, padding) measures with this; counting chars instead put
+/// every divider next to a Japanese cell in the wrong column.
+pub fn display_width(s: &str) -> usize {
+    use ratatui::buffer::CellWidth;
+    s.cell_width() as usize
+}
+
 fn cell_width(s: &str) -> usize {
-    cell_lines(s).into_iter().map(|l| l.chars().count()).max().unwrap_or(0)
+    cell_lines(s).into_iter().map(display_width).max().unwrap_or(0)
 }
 
 /// How many display lines a row needs — the tallest of its own cells,

@@ -962,6 +962,35 @@ impl App {
     /// directory, since JSON Canvas file paths are vault-relative.
     /// Everything else has nothing to open and says so.
     fn open_selected(&mut self) {
+        // With RATSLATE_OPENER set, `o` hands content to that command
+        // instead of the OS opener — and gains reach: any node's text,
+        // or the very table cell under the cursor, not just file and
+        // link boxes. That's the hook that turns a board into a
+        // launcher for whatever the opener script understands (jump to
+        // a terminal pane, open a ticket, anything nameable in text).
+        if let Ok(opener) = std::env::var("RATSLATE_OPENER")
+            && !opener.is_empty()
+        {
+            let content = self
+                .hovered_cell_content()
+                .or_else(|| self.selected_content());
+            let Some(content) = content else {
+                self.status = "nothing selected to open".to_string();
+                return;
+            };
+            let spawned = std::process::Command::new(&opener)
+                .arg(&content)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match spawned {
+                Ok(_) => self.status = format!("{opener} ← {}", content.lines().next().unwrap_or("")),
+                Err(e) => self.status = format!("couldn't run {opener}: {e}"),
+            }
+            return;
+        }
+
         let Some(Selected::Node(id)) = &self.selected else {
             self.status = "nothing selected to open".to_string();
             return;
@@ -1017,6 +1046,30 @@ impl App {
         match spawned {
             Ok(_) => self.status = format!("{} {target}", if created { "created and opened" } else { "opened" }),
             Err(e) => self.status = format!("couldn't open {target}: {e}"),
+        }
+    }
+
+    /// The raw content of the table cell under the cursor, when the
+    /// cursor is over one — for `o` and any other action that wants
+    /// "the thing pointed at" over "the box selected".
+    fn hovered_cell_content(&self) -> Option<String> {
+        let (id, anchor) = self.hover_cell.as_ref()?;
+        let (row, col) = (anchor.row?, anchor.col?);
+        let (_, table) = self.table_cache.get(id)?;
+        table.as_ref()?.get(row)?.get(col).cloned()
+    }
+
+    /// What the selection holds, as text: a text box's text, a file
+    /// box's path, a link's URL, a group's label, a connector's label.
+    fn selected_content(&self) -> Option<String> {
+        match self.selected.as_ref()? {
+            Selected::Node(id) => match &self.canvas.node(id)?.kind {
+                NodeKind::Text(t) => Some(t.clone()),
+                NodeKind::File { path, .. } => Some(path.clone()),
+                NodeKind::Link(url) => Some(url.clone()),
+                NodeKind::Group { label, .. } => label.clone(),
+            },
+            Selected::Edge(id) => self.canvas.edge(id)?.label.clone(),
         }
     }
 

@@ -60,6 +60,14 @@ A JSON array runs as a batch, applied in order, replied to in order.
 Nothing is written to disk until a `save` request says so — `--api` is
 safe to use for a read-only `state` query.
 
+## Boards as launchers
+
+Set `RATSLATE_OPENER` to any command and `o` hands it what's selected —
+a box's text, a file's path, a link's URL, or the exact table cell
+under the cursor. The opener decides what "open" means: jump to a
+terminal pane, open a ticket, anything nameable in text. Unset, `o`
+opens file and link boxes through the OS as usual.
+
 ## Humans and agents, live
 
 Edits sync through a CRDT sidecar (`.canvas.crdt`, [yrs](https://github.com/y-crdt/y-crdt)):

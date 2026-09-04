@@ -1089,6 +1089,8 @@ dependencies = [
 [[package]]
 name = "ratatui-dnd"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aa2805994bdc0a8faefb6db1476a53bd342aff0917ff2571e11ed7b4e4a7e7f"
 dependencies = [
  "crossterm",
  "ratatui",

@@ -1383,11 +1383,27 @@ pub fn to_ascii(app: &mut App) -> String {
         render(frame, app, Rect::new(0, 0, w, h), Rect::new(0, 0, 0, 0));
     });
 
+    // A wide glyph (CJK and friends) occupies two buffer cells: its
+    // own, then a hidden filler cell. Concatenating every cell's
+    // symbol turned each filler into a stray space — "タスク" came out
+    // "タ ス ク " — so filler cells behind a wide symbol are skipped,
+    // the same way `TestBackend`'s own debug view renders itself.
+    use ratatui::buffer::CellWidth;
     let buffer = term.backend().buffer();
     let mut lines: Vec<String> = buffer
         .content
         .chunks(w as usize)
-        .map(|row| row.iter().map(|c| c.symbol()).collect::<String>().trim_end().to_string())
+        .map(|row| {
+            let mut line = String::new();
+            let mut skip: u16 = 0;
+            for cell in row {
+                if skip == 0 {
+                    line.push_str(cell.symbol());
+                }
+                skip = skip.max(cell.cell_width()).saturating_sub(1);
+            }
+            line.trim_end().to_string()
+        })
         .collect();
     while lines.last().is_some_and(String::is_empty) {
         lines.pop();

@@ -78,7 +78,8 @@ merge live, field by field, instead of overwriting each other's saves. The
 ## Install
 
 ```sh
-cargo install ratslate
+brew install azihsoyn/tap/ratslate   # Homebrew (macOS/Linux)
+cargo install ratslate               # or from crates.io
 ```
 
 ## License

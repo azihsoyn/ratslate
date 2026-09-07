@@ -303,9 +303,50 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         draw_drag_preview(frame, (anchor_node, srect), None, (cx, cy), None);
     }
 
+    draw_tab_bar(frame, app, canvas_area);
+
     draw_minimap(frame, app, &overrides);
 
     draw_status(frame, app, status_area);
+}
+
+/// One board, several pages: the tab bar sits along the canvas's top
+/// edge once any tabs exist, each name clickable, `+` for a fresh page
+/// off to the right of everything. Drawn over the content — it's
+/// chrome, like the minimap, not part of the board.
+fn draw_tab_bar(frame: &mut Frame, app: &mut App, canvas_area: Rect) {
+    if app.canvas.tabs.is_empty() {
+        return;
+    }
+    let mut x = canvas_area.x;
+    let y = canvas_area.y;
+    let dim = Style::default().fg(RColor::DarkGray);
+    for (i, tab) in app.canvas.tabs.iter().enumerate() {
+        let label = format!(" {} ", tab.name);
+        let w = crate::table::display_width(&label).min(u16::MAX as usize) as u16;
+        let rect = Rect::new(x, y, w, 1).intersection(canvas_area);
+        if rect.is_empty() {
+            break;
+        }
+        let style = if i == app.active_tab {
+            Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            dim
+        };
+        frame.render_widget(Paragraph::new(label).style(style), rect);
+        app.hits.put(rect, HitTarget::TabGoto(i));
+        x += w;
+        let sep = Rect::new(x, y, 1, 1).intersection(canvas_area);
+        if !sep.is_empty() {
+            frame.render_widget(Paragraph::new("│").style(dim), sep);
+        }
+        x += 1;
+    }
+    let plus = Rect::new(x, y, 3, 1).intersection(canvas_area);
+    if !plus.is_empty() {
+        frame.render_widget(Paragraph::new(" + ").style(dim), plus);
+        app.hits.put(plus, HitTarget::TabNew);
+    }
 }
 
 /// A small overlay in the canvas's bottom-right corner: every box as a
@@ -1339,7 +1380,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Editing(_) => "EDIT (Esc to leave)",
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · o open file/link · y copy · g group · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · T/tab pages · o open file/link · y copy · g group · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

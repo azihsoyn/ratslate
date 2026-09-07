@@ -75,6 +75,10 @@ pub enum HitTarget {
     /// jumps the camera so that spot of the world sits at the center
     /// of the view.
     Minimap,
+    /// One tab in the tab bar — a click jumps the camera to its page.
+    TabGoto(usize),
+    /// The tab bar's `+`: a new page, off to the right of everything.
+    TabNew,
 }
 
 /// What one of a table's row/column buttons does, always relative to
@@ -150,7 +154,9 @@ impl HitTarget {
             | HitTarget::TableMenu(..)
             | HitTarget::TableCell(..)
             | HitTarget::AnchorDot(..)
-            | HitTarget::Minimap => None,
+            | HitTarget::Minimap
+            | HitTarget::TabGoto(_)
+            | HitTarget::TabNew => None,
         }
     }
 }
@@ -267,6 +273,14 @@ pub enum Request {
     Reattach { id: String, end: String, node: ShapeId },
     /// Select a box or a connector, or clear the selection with `null`.
     Select { id: Option<Selected> },
+    /// Add a tab: a named camera position, one board's way of holding
+    /// several "pages". Name defaults to the next number.
+    AddTab {
+        #[serde(default)]
+        name: Option<String>,
+        x: i32,
+        y: i32,
+    },
     /// The whole board, as JSON Canvas.
     State,
     /// The whole board drawn to plain text — the same rendering the
@@ -402,6 +416,10 @@ pub struct App {
     /// A rubber-band selection being dragged out right now: press
     /// point and current point, in screen cells.
     pub selecting: Option<((u16, u16), (u16, u16))>,
+    /// Which tab the camera last jumped to — only meaningful while
+    /// `canvas.tabs` is non-empty, and purely a highlight: panning
+    /// away doesn't clear it.
+    pub active_tab: usize,
     /// Whether the minimap overlay is shown — `m` toggles it.
     pub minimap: bool,
     /// Within-session undo for the open table grid: snapshots of the
@@ -512,6 +530,7 @@ impl App {
             camera,
             multi: Vec::new(),
             selecting: None,
+            active_tab: 0,
             minimap: true,
             minimap_drag: None,
             table_undo: Vec::new(),
@@ -913,6 +932,11 @@ impl App {
                 self.selected = id;
                 Ok(Response::Ok)
             }
+            Request::AddTab { name, x, y } => {
+                let name = name.filter(|n| !n.is_empty()).unwrap_or_else(|| (self.canvas.tabs.len() + 1).to_string());
+                self.canvas.tabs.push(crate::model::TabMark { name, x, y });
+                Ok(Response::Ok)
+            }
             Request::State => Ok(Response::State { board: canvas_io::to_file(&self.canvas) }),
             Request::Render => Ok(Response::Rendered { text: crate::render::to_ascii(self) }),
             Request::Save => {
@@ -1133,6 +1157,44 @@ impl App {
             let parsed = crate::table::parse(text).map(std::rc::Rc::new);
             self.table_cache.insert(node.id.clone(), (text.clone(), parsed));
         }
+    }
+
+    /// Jumps the camera to a tab's own saved spot.
+    fn tab_goto(&mut self, i: usize) {
+        let Some(tab) = self.canvas.tabs.get(i) else { return };
+        self.camera = (tab.x, tab.y);
+        self.active_tab = i;
+        self.status = format!("tab {} — {}", i + 1, tab.name);
+    }
+
+    /// Steps to the next/previous tab, wrapping around.
+    fn tab_cycle(&mut self, backward: bool) {
+        let n = self.canvas.tabs.len();
+        if n == 0 {
+            return;
+        }
+        let i = if backward { (self.active_tab + n - 1) % n } else { (self.active_tab + 1) % n };
+        self.tab_goto(i);
+    }
+
+    /// A new page: empty plane just right of everything the board
+    /// holds. The first press also enrolls the current view as tab 1 —
+    /// what was being drawn becomes page one the moment pages exist.
+    fn tab_new(&mut self) {
+        if self.canvas.tabs.is_empty() {
+            let (cx, cy) = self.camera;
+            let _ = self.dispatch(Request::AddTab { name: None, x: cx, y: cy });
+        }
+        // At least a full viewport past everything — content and other
+        // pages both — or the neighbouring page's boxes peek in at the
+        // edge of this one.
+        let vw = self.canvas_area.width.max(40) as i32 + 8;
+        let content_right = self.canvas.nodes.iter().map(|n| n.rect.right()).max().unwrap_or(self.camera.0);
+        let tabs_right = self.canvas.tabs.iter().map(|t| t.x + vw).max().unwrap_or(self.camera.0);
+        let x = (content_right + 8).max(tabs_right).max(self.camera.0 + vw);
+        let y = self.camera.1;
+        let _ = self.dispatch(Request::AddTab { name: None, x, y });
+        self.tab_goto(self.canvas.tabs.len().saturating_sub(1));
     }
 
     /// Centers the view on whatever world point this minimap cell
@@ -1632,6 +1694,12 @@ impl App {
                     }
                 }
             }
+            Did::Click(HitTarget::TabGoto(i)) => {
+                self.tab_goto(i);
+            }
+            Did::Click(HitTarget::TabNew) => {
+                self.tab_new();
+            }
             Did::Click(HitTarget::Minimap) => {
                 self.minimap_jump(ev.column, ev.row);
                 self.minimap_drag = None;
@@ -2023,6 +2091,9 @@ impl App {
                         }
                     }
                 }
+                KeyCode::Tab => self.tab_cycle(false),
+                KeyCode::BackTab => self.tab_cycle(true),
+                KeyCode::Char('T') => self.tab_new(),
                 KeyCode::Char('o') => self.open_selected(),
                 KeyCode::Char('y') => self.yank_selected(),
                 KeyCode::Char('m') => self.minimap = !self.minimap,

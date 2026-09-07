@@ -99,6 +99,10 @@ pub struct MinimapLayout {
     pub inner: Rect,
     /// World bounds `(x0, y0, x1, y1)` the inner area maps onto.
     world: (i32, i32, i32, i32),
+    /// The x-slice of plane belonging to the page on show — dots for
+    /// boxes outside it aren't drawn at all, rather than clamped onto
+    /// this page's map edge as if they lived here.
+    pub page: (i32, i32),
 }
 
 impl MinimapLayout {
@@ -1227,21 +1231,44 @@ impl App {
         let map_area = Rect::new(area.right() - w, area.bottom() - h, w, h);
         let inner = Rect::new(map_area.x + 1, map_area.y + 1, map_area.width - 2, map_area.height - 2);
 
-        // The world stretch shown: everything on the board plus the
-        // current viewport, so the "you are here" rectangle can never
-        // wander off its own map.
+        // The world stretch shown: the current page's content plus the
+        // viewport, so the "you are here" rectangle can never wander
+        // off its own map. With tabs, "the page" is the slice of plane
+        // between this tab and the next one to its right — squeezing
+        // every page into one map made it useless on all of them, and
+        // crossing pages is the tab bar's job anyway.
+        let page = self.page_range();
         let view = WorldRect::new(self.camera.0, self.camera.1, area.width, area.height);
         let mut x0 = view.x;
         let mut y0 = view.y;
         let mut x1 = view.right();
         let mut y1 = view.bottom();
         for n in &self.canvas.nodes {
+            if n.rect.right() <= page.0 || n.rect.x >= page.1 {
+                continue;
+            }
             x0 = x0.min(n.rect.x);
             y0 = y0.min(n.rect.y);
             x1 = x1.max(n.rect.right());
             y1 = y1.max(n.rect.bottom());
         }
-        Some(MinimapLayout { area: map_area, inner, world: (x0, y0, x1, y1) })
+        Some(MinimapLayout { area: map_area, inner, world: (x0, y0, x1, y1), page })
+    }
+
+    /// The x-slice of the plane the active tab owns: from its own
+    /// camera mark to the next tab's, rightward. The leftmost page
+    /// extends to minus infinity (content can sit left of its mark),
+    /// the rightmost to plus. Without tabs, the whole plane is one
+    /// page.
+    fn page_range(&self) -> (i32, i32) {
+        if self.canvas.tabs.is_empty() {
+            return (i32::MIN, i32::MAX);
+        }
+        let cur = self.canvas.tabs.get(self.active_tab).map(|t| t.x).unwrap_or(self.camera.0);
+        let leftmost = self.canvas.tabs.iter().map(|t| t.x).min().unwrap_or(cur);
+        let x0 = if cur <= leftmost { i32::MIN } else { cur };
+        let x1 = self.canvas.tabs.iter().map(|t| t.x).filter(|&x| x > cur).min().unwrap_or(i32::MAX);
+        (x0, x1)
     }
 
     /// Where a resize-in-progress would land (world coordinates), for

@@ -385,6 +385,9 @@ fn draw_minimap(frame: &mut Frame, app: &mut App, overrides: &std::collections::
     // preview position, not where the model still says it sits.
     for node in &app.canvas.nodes {
         let rect = overrides.get(&node.id).copied().unwrap_or(node.rect);
+        if rect.right() <= layout.page.0 || rect.x >= layout.page.1 {
+            continue;
+        }
         let (cx, cy) = (rect.x + rect.width as i32 / 2, rect.y + rect.height as i32 / 2);
         let (mx, my) = layout.to_map(cx, cy);
         let color = node.color.as_ref().map(ratatui_color).unwrap_or(RColor::Gray);

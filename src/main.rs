@@ -28,7 +28,26 @@ type Backend = CrosstermBackend<io::Stdout>;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let path = args.first().cloned().map(PathBuf::from);
+    // Every non-flag argument is a board. Several at once open as
+    // tabs sharing one camera — flip between "before" and "after"
+    // drawn at the same coordinates. Headless modes use the first.
+    let paths: Vec<PathBuf> = {
+        let mut ps = Vec::new();
+        let mut skip = false;
+        for a in &args {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if a == "--api" {
+                skip = true;
+            } else if !a.starts_with("--") {
+                ps.push(PathBuf::from(a));
+            }
+        }
+        ps
+    };
+    let path = paths.first().cloned();
 
     if args.iter().any(|a| a == "--schema") {
         print_schema();
@@ -55,10 +74,16 @@ fn main() -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut app = App::new(path);
-    let result = run_whiteboard(&mut terminal, &mut app);
-    if app.save_path.is_some() {
-        app.save();
+    let mut apps: Vec<App> = if paths.is_empty() {
+        vec![App::new(None)]
+    } else {
+        paths.iter().map(|p| App::new(Some(p.clone()))).collect()
+    };
+    let result = run_whiteboard(&mut terminal, &mut apps);
+    for app in &mut apps {
+        if app.save_path.is_some() {
+            app.save();
+        }
     }
 
     disable_raw_mode()?;
@@ -72,8 +97,9 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn run_whiteboard(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
+fn run_whiteboard(terminal: &mut Terminal<Backend>, apps: &mut Vec<App>) -> io::Result<()> {
     let mut canvas_area = Rect::default();
+    let mut active = 0usize;
     // Redraw only when something actually happened — an input event, a
     // change merged from another writer, or the first frame. Any-motion
     // mouse tracking delivers an event for every cell the cursor
@@ -82,6 +108,20 @@ fn run_whiteboard(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result
     // ten times a second for nothing.
     let mut dirty = true;
     loop {
+        let names: Vec<String> = apps
+            .iter()
+            .map(|a| {
+                a.save_path
+                    .as_deref()
+                    .and_then(|p| p.file_stem())
+                    .map(|st| st.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "untitled".to_string())
+            })
+            .collect();
+        let app = &mut apps[active];
+        app.tab_names = names;
+        app.active_tab = active;
+
         dirty |= app.pull_collab();
 
         if dirty {
@@ -124,8 +164,68 @@ fn run_whiteboard(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result
         if app.should_quit {
             break;
         }
+
+        if let Some(action) = app.tab_action.take() {
+            dirty = true;
+            handle_tab_action(apps, &mut active, action);
+        }
     }
     Ok(())
+}
+
+/// The session-level half of the tab bar: switching carries the camera
+/// (and the minimap toggle) so the view stays put while the board
+/// underneath it changes — that's the whole point of stacking several
+/// files on the same coordinates. `New` clones the active board into
+/// the next free `<stem>-N.canvas` beside it, the natural way to start
+/// an "after" from a finished "before".
+fn handle_tab_action(apps: &mut Vec<App>, active: &mut usize, action: app::TabAction) {
+    use app::TabAction;
+    let n = apps.len();
+    let target = match action {
+        TabAction::Goto(i) if i < n => Some(i),
+        TabAction::Goto(_) => None,
+        TabAction::Next if n > 1 => Some((*active + 1) % n),
+        TabAction::Prev if n > 1 => Some((*active + n - 1) % n),
+        TabAction::Next | TabAction::Prev => {
+            apps[*active].status = "only one board open — T clones this one as a new tab".to_string();
+            None
+        }
+        TabAction::New => {
+            let Some(src_path) = apps[*active].save_path.clone() else {
+                apps[*active].status = "no file to clone — open a saved board first".to_string();
+                return;
+            };
+            let stem = src_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "board".into());
+            let ext = src_path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "canvas".into());
+            let dir = src_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+            let mut k = 2;
+            let new_path = loop {
+                let candidate = dir.join(format!("{stem}-{k}.{ext}"));
+                if !candidate.exists() {
+                    break candidate;
+                }
+                k += 1;
+            };
+            if let Err(e) = canvas_io::save(&apps[*active].canvas, &new_path) {
+                apps[*active].status = format!("couldn't clone board: {e}");
+                return;
+            }
+            apps.push(App::new(Some(new_path.clone())));
+            let i = apps.len() - 1;
+            apps[i].status = format!("cloned into {}", new_path.display());
+            Some(i)
+        }
+    };
+    if let Some(i) = target
+        && i != *active
+    {
+        let camera = apps[*active].camera;
+        let minimap = apps[*active].minimap;
+        *active = i;
+        apps[i].camera = camera;
+        apps[i].minimap = minimap;
+    }
 }
 
 /// Headless: apply one request, or a batch of them, without a

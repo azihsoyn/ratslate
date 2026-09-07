@@ -310,19 +310,20 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
     draw_status(frame, app, status_area);
 }
 
-/// One board, several pages: the tab bar sits along the canvas's top
-/// edge once any tabs exist, each name clickable, `+` for a fresh page
-/// off to the right of everything. Drawn over the content — it's
-/// chrome, like the minimap, not part of the board.
+/// Several boards, one view: the tab bar sits along the canvas's top
+/// edge once more than one file is open, each name clickable, `+` for
+/// a fresh board cloned from this one. Drawn over the content — it's
+/// chrome, like the minimap, not part of any board.
 fn draw_tab_bar(frame: &mut Frame, app: &mut App, canvas_area: Rect) {
-    if app.canvas.tabs.is_empty() {
+    if app.tab_names.len() < 2 {
         return;
     }
     let mut x = canvas_area.x;
     let y = canvas_area.y;
     let dim = Style::default().fg(RColor::DarkGray);
-    for (i, tab) in app.canvas.tabs.iter().enumerate() {
-        let label = format!(" {} ", tab.name);
+    let names = app.tab_names.clone();
+    for (i, name) in names.iter().enumerate() {
+        let label = format!(" {name} ");
         let w = crate::table::display_width(&label).min(u16::MAX as usize) as u16;
         let rect = Rect::new(x, y, w, 1).intersection(canvas_area);
         if rect.is_empty() {
@@ -385,9 +386,6 @@ fn draw_minimap(frame: &mut Frame, app: &mut App, overrides: &std::collections::
     // preview position, not where the model still says it sits.
     for node in &app.canvas.nodes {
         let rect = overrides.get(&node.id).copied().unwrap_or(node.rect);
-        if rect.right() <= layout.page.0 || rect.x >= layout.page.1 {
-            continue;
-        }
         let (cx, cy) = (rect.x + rect.width as i32 / 2, rect.y + rect.height as i32 / 2);
         let (mx, my) = layout.to_map(cx, cy);
         let color = node.color.as_ref().map(ratatui_color).unwrap_or(RColor::Gray);
@@ -1383,7 +1381,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Editing(_) => "EDIT (Esc to leave)",
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · T/tab pages · o open file/link · y copy · g group · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · T/tab boards · o open file/link · y copy · g group · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

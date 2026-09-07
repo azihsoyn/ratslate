@@ -164,25 +164,12 @@ pub struct Edge {
     pub label: Option<String>,
 }
 
-/// A tab: a named place on the infinite plane the camera can jump to —
-/// how one board holds several "pages" (a before and an after, say)
-/// without leaving the format. Not part of JSON Canvas; carried in a
-/// `ratslateTabs` field other readers ignore, to whom the board is
-/// simply one canvas with several clusters of content.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TabMark {
-    pub name: String,
-    pub x: i32,
-    pub y: i32,
-}
-
 /// Nodes are drawn (and hit-tested) in this order, so the last one is on
 /// top — the same z-index rule JSON Canvas uses for its `nodes` array.
 #[derive(Debug, Default, Clone)]
 pub struct Canvas {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
-    pub tabs: Vec<TabMark>,
 }
 
 /// A short id with enough randomness that two boards never mint the same

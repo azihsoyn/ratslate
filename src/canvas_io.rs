@@ -7,7 +7,7 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, Side, TabMark, WorldRect};
+use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, Side, WorldRect};
 
 /// A board, in the shape https://jsoncanvas.org/spec/1.0/ describes on
 /// disk — also what `Request::State` hands back over `--api`.
@@ -17,18 +17,6 @@ pub struct FileRoot {
     pub nodes: Vec<FileNode>,
     #[serde(default)]
     pub edges: Vec<FileEdge>,
-    /// Named camera positions — one board's "pages". Not part of JSON
-    /// Canvas; a `ratslate`-prefixed field other readers ignore, to
-    /// whom this is one canvas with several clusters of content.
-    #[serde(rename = "ratslateTabs", default, skip_serializing_if = "Vec::is_empty")]
-    pub tabs: Vec<FileTab>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct FileTab {
-    pub name: String,
-    pub x: i64,
-    pub y: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -170,14 +158,7 @@ fn clamp_u16(v: i64) -> u16 {
 }
 
 fn from_file(root: FileRoot) -> Canvas {
-    let mut canvas = Canvas {
-        tabs: root
-            .tabs
-            .into_iter()
-            .map(|t| TabMark { name: t.name, x: clamp_i32(t.x), y: clamp_i32(t.y) })
-            .collect(),
-        ..Canvas::default()
-    };
+    let mut canvas = Canvas::default();
 
     for fnode in root.nodes {
         let (id, x, y, w, h, color, shape, kind) = match fnode {
@@ -364,11 +345,5 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
         })
         .collect();
 
-    let tabs = canvas
-        .tabs
-        .iter()
-        .map(|t| FileTab { name: t.name.clone(), x: t.x as i64, y: t.y as i64 })
-        .collect();
-
-    FileRoot { nodes, edges, tabs }
+    FileRoot { nodes, edges }
 }

@@ -33,6 +33,19 @@ The canvas is an infinite plane: pan with arrow keys or the mouse wheel, and
 the minimap in the corner (toggle `m`) shows where everything is — click or
 drag it to jump.
 
+## Tabs: several boards, one camera
+
+```sh
+ratslate before.canvas after.canvas
+```
+
+Multiple files open as tabs sharing a single camera — flip with
+Tab/Shift+Tab (or click the bar) and the whole board swaps under an
+unmoving view, so two versions drawn at the same coordinates compare
+like frames of a flip-book. `T` clones the active board into the next
+free `<name>-2.canvas` to start an "after" from a finished "before".
+Every file stays a plain, standalone JSON Canvas.
+
 ## Written out as ASCII
 
 ```sh

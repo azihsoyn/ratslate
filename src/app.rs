@@ -1167,10 +1167,13 @@ impl App {
         self.status = format!("tab {} — {}", i + 1, tab.name);
     }
 
-    /// Steps to the next/previous tab, wrapping around.
+    /// Steps to the next/previous tab, wrapping around. Before any
+    /// pages exist there's nothing to step through — say how to make
+    /// one instead of silently doing nothing.
     fn tab_cycle(&mut self, backward: bool) {
         let n = self.canvas.tabs.len();
         if n == 0 {
+            self.status = "no pages yet — T creates one".to_string();
             return;
         }
         let i = if backward { (self.active_tab + n - 1) % n } else { (self.active_tab + 1) % n };

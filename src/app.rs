@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
 use crate::collab::{Collab, EdgeFields, NodeFields};
-use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, Shape, ShapeId, Side, WorldRect};
+use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, Shape, ShapeId, Side, WorldRect};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
@@ -268,6 +268,10 @@ pub enum Request {
     /// How a connector's line is drawn: "solid", "thick", "double" or
     /// "dashed".
     SetEdgeStyle { id: String, style: String },
+    /// The arrowhead glyph: "plain", "triangle", "open", "dot" or
+    /// "diamond". Which ends actually carry one is still
+    /// `set_edge_ends`' business.
+    SetEdgeArrow { id: String, arrow: String },
     /// Which side of each box a connector leaves from/arrives at —
     /// "top" / "right" / "bottom" / "left", or `null` to go back to
     /// picking automatically based on where the boxes actually sit.
@@ -919,6 +923,12 @@ impl App {
             Request::SetEdgeStyle { id, style } => {
                 let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
                 edge.style = LineStyle::parse(&style);
+                touched_edge = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetEdgeArrow { id, arrow } => {
+                let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
+                edge.arrow = ArrowStyle::parse(&arrow);
                 touched_edge = Some(id);
                 Ok(Response::Ok)
             }
@@ -1709,7 +1719,12 @@ impl App {
             Did::Click(HitTarget::StyleSwatch(target, style)) => {
                 let _ = match target {
                     Selected::Node(id) => self.dispatch(Request::SetShape { id, shape: style }),
-                    Selected::Edge(id) => self.dispatch(Request::SetEdgeStyle { id, style }),
+                    // The one row of swatches carries both line styles
+                    // and arrowheads; the prefix says which this is.
+                    Selected::Edge(id) => match style.strip_prefix("arrow:") {
+                        Some(arrow) => self.dispatch(Request::SetEdgeArrow { id, arrow: arrow.to_string() }),
+                        None => self.dispatch(Request::SetEdgeStyle { id, style }),
+                    },
                 };
                 self.color_picker = None;
                 self.hover_swatch = None;
@@ -2286,6 +2301,7 @@ fn edge_fields(edge: &Edge) -> EdgeFields {
         to_row: edge.to_anchor.and_then(|a| a.row).map(|n| n as i64),
         to_col: edge.to_anchor.and_then(|a| a.col).map(|n| n as i64),
         style: edge.style.as_str().map(str::to_string),
+        arrow: edge.arrow.as_str().map(str::to_string),
         color: edge.color.as_ref().map(|c| c.to_string()),
         label: edge.label.clone(),
     }
@@ -2310,6 +2326,7 @@ fn edge_from_fields(id: String, f: EdgeFields) -> Edge {
         to_end: parse_edge_end(&f.to_end),
         to_anchor: anchor_from_fields(f.to_row, f.to_col),
         style: f.style.as_deref().map(LineStyle::parse).unwrap_or_default(),
+        arrow: f.arrow.as_deref().map(ArrowStyle::parse).unwrap_or_default(),
         color: f.color.as_deref().map(Color::parse),
         label: f.label,
     }

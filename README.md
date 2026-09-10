@@ -19,9 +19,9 @@ exactly where the other tool put it.
   JSON Canvas presets — and border styles: plain, rounded, thick, double or
   dashed (`x` cycles them too).
 - **Connectors** — shift+drag from one box to another. Sides, arrowheads,
-  colors, labels and line styles (solid `──`, thick `━━`, double `══`, dashed
-  `╌╌`) all editable; JSON Canvas `fromSide`/`toSide`/`fromEnd`/`toEnd`
-  respected.
+  colors, labels, line styles (solid `──`, thick `━━`, double `══`, dashed
+  `╌╌`) and arrowhead glyphs (`>` `▶` `▷` `●` `◆`) all editable; JSON Canvas
+  `fromSide`/`toSide`/`fromEnd`/`toEnd` respected.
 - **Tables** — a box whose text is a GFM markdown table renders as a real
   grid. Double-click a cell to edit it spreadsheet-style (Tab/Enter/arrows,
   `+col -col +row -row` buttons, Alt+Enter for a line break, Ctrl+Z inside the

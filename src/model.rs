@@ -143,6 +143,41 @@ impl LineStyle {
     }
 }
 
+/// The glyph an arrowhead is drawn with — carried as `ratslateArrow`,
+/// the same arrangement as `LineStyle`: absent means the plain
+/// `>`-style head every reader already draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArrowStyle {
+    #[default]
+    Plain,
+    Triangle,
+    Open,
+    Dot,
+    Diamond,
+}
+
+impl ArrowStyle {
+    pub fn parse(s: &str) -> ArrowStyle {
+        match s {
+            "triangle" => ArrowStyle::Triangle,
+            "open" => ArrowStyle::Open,
+            "dot" => ArrowStyle::Dot,
+            "diamond" => ArrowStyle::Diamond,
+            _ => ArrowStyle::Plain,
+        }
+    }
+
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            ArrowStyle::Plain => None,
+            ArrowStyle::Triangle => Some("triangle"),
+            ArrowStyle::Open => Some("open"),
+            ArrowStyle::Dot => Some("dot"),
+            ArrowStyle::Diamond => Some("diamond"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum NodeKind {
     Text(String),
@@ -205,6 +240,7 @@ pub struct Edge {
     pub to_end: EdgeEnd,
     pub to_anchor: Option<CellAnchor>,
     pub style: LineStyle,
+    pub arrow: ArrowStyle,
     pub color: Option<Color>,
     pub label: Option<String>,
 }
@@ -273,6 +309,7 @@ impl Canvas {
             to_end: EdgeEnd::Arrow,
             to_anchor: None,
             style: LineStyle::default(),
+            arrow: ArrowStyle::default(),
             color: None,
             label: None,
         });

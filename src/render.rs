@@ -9,7 +9,7 @@ use ratatui::{
 use ratatui_dnd::Hits;
 
 use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected, TableOp, cell_anchor_for};
-use crate::model::{CellAnchor, Color, EdgeEnd, LineStyle, Node, NodeKind, Shape, Side, WorldRect};
+use crate::model::{ArrowStyle, CellAnchor, Color, EdgeEnd, LineStyle, Node, NodeKind, Shape, Side, WorldRect};
 use crate::table::Table;
 
 /// World rect → screen space through the camera. Same `WorldRect` type
@@ -869,6 +869,15 @@ fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16,
         let cx = x + 2 * i as u16;
         put_swatch(cx, hue_y + 2, 2, &format!("{label} "), Style::default(), HitTarget::StyleSwatch(target.clone(), (*value).to_string()));
     }
+    // A connector also gets a row of arrowhead glyphs — stored with an
+    // `arrow:` prefix so one hit-target type serves both rows.
+    if matches!(target, Selected::Edge(_)) {
+        let arrows: &[(&str, &str)] = &[(">", "plain"), ("▶", "triangle"), ("▷", "open"), ("●", "dot"), ("◆", "diamond")];
+        for (i, (label, value)) in arrows.iter().enumerate() {
+            let cx = x + 2 * i as u16;
+            put_swatch(cx, hue_y + 3, 2, &format!("{label} "), Style::default(), HitTarget::StyleSwatch(target.clone(), format!("arrow:{value}")));
+        }
+    }
 
     // What's about to be picked (the hovered swatch), or failing that
     // what's already set — spelled out as hex, next to a filled cell
@@ -1086,7 +1095,7 @@ fn draw_edges(
         .collect();
 
     for i in 0..app.canvas.edges.len() {
-        let (color, to_end, from_end, label, edge_id, explicit_sides, has_from_anchor, has_to_anchor, line_style) = {
+        let (color, to_end, from_end, label, edge_id, explicit_sides, has_from_anchor, has_to_anchor, line_style, arrow_style) = {
             let edge = &app.canvas.edges[i];
             (
                 edge.color.clone(),
@@ -1098,17 +1107,22 @@ fn draw_edges(
                 edge.from_anchor.is_some(),
                 edge.to_anchor.is_some(),
                 edge.style,
+                edge.arrow,
             )
         };
-        // A hovered line-style swatch previews on its connector the
-        // same way a hovered color swatch does.
-        let line_style = match &app.hover_style {
+        // A hovered style swatch previews on its connector the same
+        // way a hovered color swatch does — the `arrow:` prefix says
+        // whether it's proposing a line style or an arrowhead.
+        let (line_style, arrow_style) = match &app.hover_style {
             Some((Selected::Edge(hid), style))
                 if hid == &edge_id && app.color_picker.as_ref() == Some(&Selected::Edge(hid.clone())) =>
             {
-                LineStyle::parse(style)
+                match style.strip_prefix("arrow:") {
+                    Some(arrow) => (line_style, ArrowStyle::parse(arrow)),
+                    None => (LineStyle::parse(style), arrow_style),
+                }
             }
-            _ => line_style,
+            _ => (line_style, arrow_style),
         };
         let Some((from_rect, to_rect)) = rects[i] else { continue };
         if reattaching.is_some_and(|(id, _)| id == &edge_id) {
@@ -1179,7 +1193,7 @@ fn draw_edges(
                 ax -= dx.signum();
                 ay -= dy.signum();
             }
-            put_char(frame, ax, ay, arrow_char(dx, dy), style);
+            put_char(frame, ax, ay, arrow_char(dx, dy, arrow_style), style);
         }
         if from_end == EdgeEnd::Arrow {
             let (dx, dy) = dir_into(0, &mut (1..waypoints.len()));
@@ -1188,7 +1202,7 @@ fn draw_edges(
                 ax -= dx.signum();
                 ay -= dy.signum();
             }
-            put_char(frame, ax, ay, arrow_char(dx, dy), style);
+            put_char(frame, ax, ay, arrow_char(dx, dy, arrow_style), style);
         }
         if has_from_anchor {
             put_char(frame, waypoints[0].0, waypoints[0].1, '●', style);
@@ -1541,12 +1555,36 @@ fn draw_drag_preview(
     if waypoints.len() >= 2 {
         let last = waypoints.len() - 1;
         let (dx, dy) = (waypoints[last].0 - waypoints[last - 1].0, waypoints[last].1 - waypoints[last - 1].1);
-        put_char(frame, waypoints[last].0, waypoints[last].1, arrow_char(dx, dy), style);
+        put_char(frame, waypoints[last].0, waypoints[last].1, arrow_char(dx, dy, ArrowStyle::Plain), style);
     }
 }
 
-fn arrow_char(dx: i32, dy: i32) -> char {
-    if dx.abs() >= dy.abs() {
+fn arrow_char(dx: i32, dy: i32, style: ArrowStyle) -> char {
+    let horizontal = dx.abs() >= dy.abs();
+    match style {
+        ArrowStyle::Dot => return '●',
+        ArrowStyle::Diamond => return '◆',
+        ArrowStyle::Triangle => {
+            return if horizontal {
+                if dx >= 0 { '▶' } else { '◀' }
+            } else if dy >= 0 {
+                '▼'
+            } else {
+                '▲'
+            };
+        }
+        ArrowStyle::Open => {
+            return if horizontal {
+                if dx >= 0 { '▷' } else { '◁' }
+            } else if dy >= 0 {
+                '▽'
+            } else {
+                '△'
+            };
+        }
+        ArrowStyle::Plain => {}
+    }
+    if horizontal {
         if dx >= 0 { '>' } else { '<' }
     } else if dy >= 0 {
         'v'

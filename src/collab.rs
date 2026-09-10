@@ -65,6 +65,7 @@ pub struct EdgeFields {
     pub to_row: Option<i64>,
     pub to_col: Option<i64>,
     pub style: Option<String>,
+    pub arrow: Option<String>,
     pub color: Option<String>,
     pub label: Option<String>,
 }
@@ -208,7 +209,7 @@ impl Collab {
             Some(n) => Any::BigInt(n),
             None => Any::Null,
         };
-        let entry: [(Arc<str>, In); 13] = [
+        let entry: [(Arc<str>, In); 14] = [
             (Arc::from("from"), In::Any(Any::String(Arc::from(f.from.as_str())))),
             (Arc::from("to"), In::Any(Any::String(Arc::from(f.to.as_str())))),
             (Arc::from("from_side"), In::Any(opt_string(&f.from_side))),
@@ -220,6 +221,7 @@ impl Collab {
             (Arc::from("to_row"), In::Any(opt_int(f.to_row))),
             (Arc::from("to_col"), In::Any(opt_int(f.to_col))),
             (Arc::from("style"), In::Any(opt_string(&f.style))),
+            (Arc::from("arrow"), In::Any(opt_string(&f.arrow))),
             (Arc::from("color"), In::Any(opt_string(&f.color))),
             (Arc::from("label"), In::Any(opt_string(&f.label))),
         ];
@@ -271,6 +273,7 @@ impl Collab {
                     to_row: get_opt_int("to_row"),
                     to_col: get_opt_int("to_col"),
                     style: get_opt_str("style"),
+                    arrow: get_opt_str("arrow"),
                     color: get_opt_str("color"),
                     label: get_opt_str("label"),
                 },

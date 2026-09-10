@@ -1381,7 +1381,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Editing(_) => "EDIT (Esc to leave)",
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · T/tab boards · o open file/link · y copy · g group · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · T/tab boards · o open file/link · y copy · g group · l auto-layout · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

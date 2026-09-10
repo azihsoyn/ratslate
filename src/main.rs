@@ -1,5 +1,6 @@
 mod app;
 mod canvas_io;
+mod layout;
 mod collab;
 mod model;
 mod render;

@@ -284,6 +284,10 @@ pub enum Request {
     Reattach { id: String, end: String, node: ShapeId },
     /// Select a box or a connector, or clear the selection with `null`.
     Select { id: Option<Selected> },
+    /// Rearrange every box (groups aside) into a layered left-to-right
+    /// graph layout — pour in nodes and edges with any coordinates,
+    /// then ask for this and get a readable diagram. One undo step.
+    Layout,
     /// The whole board, as JSON Canvas.
     State,
     /// The whole board drawn to plain text — the same rendering the
@@ -939,6 +943,16 @@ impl App {
             }
             Request::Select { id } => {
                 self.selected = id;
+                Ok(Response::Ok)
+            }
+            Request::Layout => {
+                for (id, x, y) in crate::layout::layered(&self.canvas) {
+                    if let Some(node) = self.canvas.node_mut(&id) {
+                        node.rect.x = x;
+                        node.rect.y = y;
+                        touched_also.push(id);
+                    }
+                }
                 Ok(Response::Ok)
             }
             Request::State => Ok(Response::State { board: canvas_io::to_file(&self.canvas) }),
@@ -2060,6 +2074,11 @@ impl App {
                 KeyCode::Tab => self.tab_action = Some(TabAction::Next),
                 KeyCode::BackTab => self.tab_action = Some(TabAction::Prev),
                 KeyCode::Char('T') => self.tab_action = Some(TabAction::New),
+                KeyCode::Char('l') => {
+                    if self.dispatch(Request::Layout).is_ok() {
+                        self.status = "auto-layout — ctrl+z to undo".to_string();
+                    }
+                }
                 KeyCode::Char('o') => self.open_selected(),
                 KeyCode::Char('y') => self.yank_selected(),
                 KeyCode::Char('m') => self.minimap = !self.minimap,

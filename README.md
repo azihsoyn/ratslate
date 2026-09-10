@@ -33,6 +33,11 @@ The canvas is an infinite plane: pan with arrow keys or the mouse wheel, and
 the minimap in the corner (toggle `m`) shows where everything is — click or
 drag it to jump.
 
+Press `l` (or send `{"type":"layout"}` through `--api`) for auto-layout: a
+layered left-to-right arrangement of whatever's connected to what — so an
+agent can pour in nodes and edges without computing a single coordinate, and a
+hand-drawn board can untangle itself. One undo step.
+
 ## Tabs: several boards, one camera
 
 ```sh

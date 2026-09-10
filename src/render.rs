@@ -869,13 +869,19 @@ fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16,
         let cx = x + 2 * i as u16;
         put_swatch(cx, hue_y + 2, 2, &format!("{label} "), Style::default(), HitTarget::StyleSwatch(target.clone(), (*value).to_string()));
     }
-    // A connector also gets a row of arrowhead glyphs — stored with an
-    // `arrow:` prefix so one hit-target type serves both rows.
+    // A connector also gets a row of arrowhead glyphs and a row of
+    // end configurations — stored with `arrow:`/`ends:` prefixes so
+    // one hit-target type serves every row.
     if matches!(target, Selected::Edge(_)) {
         let arrows: &[(&str, &str)] = &[(">", "plain"), ("▶", "triangle"), ("▷", "open"), ("●", "dot"), ("◆", "diamond")];
         for (i, (label, value)) in arrows.iter().enumerate() {
             let cx = x + 2 * i as u16;
             put_swatch(cx, hue_y + 3, 2, &format!("{label} "), Style::default(), HitTarget::StyleSwatch(target.clone(), format!("arrow:{value}")));
+        }
+        let ends: &[(&str, &str)] = &[("→", "to"), ("↔", "both"), ("←", "from"), ("─", "none")];
+        for (i, (label, value)) in ends.iter().enumerate() {
+            let cx = x + 2 * i as u16;
+            put_swatch(cx, hue_y + 4, 2, &format!("{label} "), Style::default(), HitTarget::StyleSwatch(target.clone(), format!("ends:{value}")));
         }
     }
 
@@ -1113,16 +1119,20 @@ fn draw_edges(
         // A hovered style swatch previews on its connector the same
         // way a hovered color swatch does — the `arrow:` prefix says
         // whether it's proposing a line style or an arrowhead.
-        let (line_style, arrow_style) = match &app.hover_style {
+        let (line_style, arrow_style, from_end, to_end) = match &app.hover_style {
             Some((Selected::Edge(hid), style))
                 if hid == &edge_id && app.color_picker.as_ref() == Some(&Selected::Edge(hid.clone())) =>
             {
-                match style.strip_prefix("arrow:") {
-                    Some(arrow) => (line_style, ArrowStyle::parse(arrow)),
-                    None => (LineStyle::parse(style), arrow_style),
+                if let Some(arrow) = style.strip_prefix("arrow:") {
+                    (line_style, ArrowStyle::parse(arrow), from_end, to_end)
+                } else if let Some(ends) = style.strip_prefix("ends:") {
+                    let (f, t) = crate::app::ends_pair(ends);
+                    (line_style, arrow_style, parse_edge_end_str(f), parse_edge_end_str(t))
+                } else {
+                    (LineStyle::parse(style), arrow_style, from_end, to_end)
                 }
             }
-            _ => (line_style, arrow_style),
+            _ => (line_style, arrow_style, from_end, to_end),
         };
         let Some((from_rect, to_rect)) = rects[i] else { continue };
         if reattaching.is_some_and(|(id, _)| id == &edge_id) {
@@ -1557,6 +1567,10 @@ fn draw_drag_preview(
         let (dx, dy) = (waypoints[last].0 - waypoints[last - 1].0, waypoints[last].1 - waypoints[last - 1].1);
         put_char(frame, waypoints[last].0, waypoints[last].1, arrow_char(dx, dy, ArrowStyle::Plain), style);
     }
+}
+
+fn parse_edge_end_str(s: &str) -> EdgeEnd {
+    if s == "arrow" { EdgeEnd::Arrow } else { EdgeEnd::None }
 }
 
 fn arrow_char(dx: i32, dy: i32, style: ArrowStyle) -> char {

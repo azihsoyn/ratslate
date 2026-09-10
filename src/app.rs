@@ -1719,12 +1719,23 @@ impl App {
             Did::Click(HitTarget::StyleSwatch(target, style)) => {
                 let _ = match target {
                     Selected::Node(id) => self.dispatch(Request::SetShape { id, shape: style }),
-                    // The one row of swatches carries both line styles
-                    // and arrowheads; the prefix says which this is.
-                    Selected::Edge(id) => match style.strip_prefix("arrow:") {
-                        Some(arrow) => self.dispatch(Request::SetEdgeArrow { id, arrow: arrow.to_string() }),
-                        None => self.dispatch(Request::SetEdgeStyle { id, style }),
-                    },
+                    // A connector's swatch rows carry line styles,
+                    // arrowhead glyphs and end configurations; the
+                    // prefix says which this is.
+                    Selected::Edge(id) => {
+                        if let Some(arrow) = style.strip_prefix("arrow:") {
+                            self.dispatch(Request::SetEdgeArrow { id, arrow: arrow.to_string() })
+                        } else if let Some(ends) = style.strip_prefix("ends:") {
+                            let (from_end, to_end) = ends_pair(ends);
+                            self.dispatch(Request::SetEdgeEnds {
+                                id,
+                                from_end: from_end.to_string(),
+                                to_end: to_end.to_string(),
+                            })
+                        } else {
+                            self.dispatch(Request::SetEdgeStyle { id, style })
+                        }
+                    }
                 };
                 self.color_picker = None;
                 self.hover_swatch = None;
@@ -2357,6 +2368,17 @@ fn color_hue(color: &Color) -> Option<f32> {
         60.0 * ((r - g) / d + 4.0)
     };
     Some(if h < 0.0 { h + 360.0 } else { h })
+}
+
+/// Which ends carry an arrowhead, by the name a picker swatch stores:
+/// "to" (the default forward arrow), "both", "from" or "none".
+pub(crate) fn ends_pair(s: &str) -> (&'static str, &'static str) {
+    match s {
+        "both" => ("arrow", "arrow"),
+        "from" => ("arrow", "none"),
+        "none" => ("none", "none"),
+        _ => ("none", "arrow"),
+    }
 }
 
 fn side_to_string(s: Side) -> &'static str {

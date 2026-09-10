@@ -197,14 +197,15 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             Mode::EditingCell(id, r, c) if id == &node.id => Some((*r, *c)),
             _ => None,
         };
+        let shape = preview_shape(app, &node.id).unwrap_or(node.shape);
         if table_cursor.is_some() {
-            let view = TableView { node, rect: clipped, selected, table: &app.editing_table, cursor: table_cursor, editing_text: &app.editing_text, preview };
+            let view = TableView { node, shape, rect: clipped, selected, table: &app.editing_table, cursor: table_cursor, editing_text: &app.editing_text, preview };
             draw_table_node(frame, view, &mut app.hits);
         } else if let Some(table) = app.table_cache.get(&node.id).and_then(|(_, t)| t.clone()) {
-            let view = TableView { node, rect: clipped, selected, table: &table, cursor: None, editing_text: "", preview };
+            let view = TableView { node, shape, rect: clipped, selected, table: &table, cursor: None, editing_text: "", preview };
             draw_table_node(frame, view, &mut app.hits);
         } else {
-            draw_node(frame, node, clipped, selected, editing, &app.editing_text, preview);
+            draw_node(frame, node, shape, clipped, selected, editing.then_some(app.editing_text.as_str()), preview);
         }
     }
 
@@ -446,6 +447,20 @@ const DASHED_BORDER: ratatui::symbols::border::Set = ratatui::symbols::border::S
     horizontal_bottom: "╌",
 };
 
+/// The border or line style a hovered style swatch is proposing for
+/// this node, while its picker is open — the live-preview counterpart
+/// of what `hover_swatch` does for color.
+fn preview_shape(app: &App, id: &str) -> Option<Shape> {
+    let (target, style) = app.hover_style.as_ref()?;
+    if app.color_picker.as_ref() != Some(target) {
+        return None;
+    }
+    match target {
+        Selected::Node(nid) if nid == id => Some(Shape::parse(style)),
+        _ => None,
+    }
+}
+
 fn shaped(block: Block<'_>, shape: Shape) -> Block<'_> {
     match shape {
         Shape::Rectangle => block,
@@ -459,17 +474,17 @@ fn shaped(block: Block<'_>, shape: Shape) -> Block<'_> {
 /// `rect` is the node's place on screen, already translated through
 /// the camera — the node's own `rect` is world coordinates and never
 /// drawn from directly.
-fn draw_node(frame: &mut Frame, node: &Node, rect: Rect, selected: bool, editing: bool, editing_text: &str, preview: Option<Option<RColor>>) {
+fn draw_node(frame: &mut Frame, node: &Node, shape: Shape, rect: Rect, selected: bool, editing: Option<&str>, preview: Option<Option<RColor>>) {
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
-    let block = shaped(Block::bordered().border_style(border_style), node.shape);
+    let block = shaped(Block::bordered().border_style(border_style), shape);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let mut text = if editing { editing_text.to_string() } else { display_text(node) };
-    if editing {
-        text.push('▏');
-    }
+    let text = match editing {
+        Some(t) => format!("{t}▏"),
+        None => display_text(node),
+    };
     if !text.is_empty() {
         frame.render_widget(
             Paragraph::new(text).style(base).wrap(Wrap { trim: false }),
@@ -509,6 +524,9 @@ fn draw_group_node(frame: &mut Frame, node: &Node, rect: Rect, selected: bool, e
 /// `hits` stays a separate parameter since it's mutated, not read.
 struct TableView<'a> {
     node: &'a Node,
+    /// The node's own shape, or the one a hovered style swatch is
+    /// proposing — resolved by the caller.
+    shape: Shape,
     /// The node's place on screen, already translated through the
     /// camera and known to be fully visible.
     rect: Rect,
@@ -524,10 +542,10 @@ struct TableView<'a> {
 /// one open in `Mode::EditingCell`, is the live cell — shown reversed,
 /// with `editing_text` (not the table's own stale copy) as its content.
 fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget>) {
-    let TableView { node, rect, selected, table, cursor, editing_text, preview } = view;
+    let TableView { node, shape, rect, selected, table, cursor, editing_text, preview } = view;
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
-    let block = shaped(Block::bordered().border_style(border_style), node.shape);
+    let block = shaped(Block::bordered().border_style(border_style), shape);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -668,7 +686,7 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
     // has to match the border's own weight — a `┬` on a thick or
     // double frame reads as a break in the line, so those get the
     // mixed-weight `┯`/`╤` family instead.
-    let (tee_down, tee_up, tee_right, tee_left) = match node.shape {
+    let (tee_down, tee_up, tee_right, tee_left) = match shape {
         Shape::Thick => ("┯", "┷", "┠", "┨"),
         Shape::Double => ("╤", "╧", "╟", "╢"),
         _ => ("┬", "┴", "├", "┤"),
@@ -1077,6 +1095,16 @@ fn draw_edges(
                 edge.to_anchor.is_some(),
                 edge.style,
             )
+        };
+        // A hovered line-style swatch previews on its connector the
+        // same way a hovered color swatch does.
+        let line_style = match &app.hover_style {
+            Some((Selected::Edge(hid), style))
+                if hid == &edge_id && app.color_picker.as_ref() == Some(&Selected::Edge(hid.clone())) =>
+            {
+                LineStyle::parse(style)
+            }
+            _ => line_style,
         };
         let Some((from_rect, to_rect)) = rects[i] else { continue };
         if reattaching.is_some_and(|(id, _)| id == &edge_id) {

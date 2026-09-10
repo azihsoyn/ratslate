@@ -406,6 +406,10 @@ pub struct App {
     /// from — set from the target's own color when the picker opens,
     /// then steered by clicks on the hue strip.
     pub picker_hue: f32,
+    /// The style swatch the cursor is over right now, if any — its
+    /// value drawn on the target as a live preview, exactly like
+    /// `hover_swatch` does for color.
+    pub hover_style: Option<(Selected, String)>,
     /// The table cell the cursor is over right now, if any — its own
     /// row's and column's candidate anchor points preview while it's
     /// hovered (just those, not every row and column of the table, so
@@ -545,6 +549,7 @@ impl App {
             selected: None,
             color_picker: None,
             hover_swatch: None,
+            hover_style: None,
             picker_hue: 210.0,
             hover_cell: None,
             mode: Mode::Normal,
@@ -1534,10 +1539,15 @@ impl App {
     /// redrawing for each of those is what made just waving the cursor
     /// around feel heavy.
     pub fn on_mouse(&mut self, ev: MouseEvent, canvas_area: Rect) -> bool {
-        let hover_before = (self.hover_swatch.clone(), self.hover_cell.clone());
+        let hover_before = (self.hover_swatch.clone(), self.hover_cell.clone(), self.hover_style.clone());
         if let MouseEventKind::Moved = ev.kind {
-            self.hover_swatch = match self.hits.at(ev.column, ev.row) {
-                Some((HitTarget::ColorSwatch(target, color), _)) => Some((target, color.map(|c| Color::parse(&c)))),
+            let hit = self.hits.at(ev.column, ev.row);
+            self.hover_swatch = match &hit {
+                Some((HitTarget::ColorSwatch(target, color), _)) => Some((target.clone(), color.clone().map(|c| Color::parse(&c)))),
+                _ => None,
+            };
+            self.hover_style = match hit {
+                Some((HitTarget::StyleSwatch(target, style), _)) => Some((target, style)),
                 _ => None,
             };
         }
@@ -1934,7 +1944,7 @@ impl App {
         // Every kind of event but plain movement acts on something;
         // movement only matters when it changed what's hovered.
         match ev.kind {
-            MouseEventKind::Moved => hover_before != (self.hover_swatch.clone(), self.hover_cell.clone()),
+            MouseEventKind::Moved => hover_before != (self.hover_swatch.clone(), self.hover_cell.clone(), self.hover_style.clone()),
             _ => true,
         }
     }

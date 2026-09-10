@@ -60,6 +60,9 @@ pub enum HitTarget {
     /// One style swatch in an open picker — a border shape for a box,
     /// a line style for a connector.
     StyleSwatch(Selected, String),
+    /// One cell of the picker's hue strip — clicking it re-tints the
+    /// gradient field without closing the picker. Hue in degrees.
+    HueSwatch(Selected, u16),
     /// A row/column button on an open table editor — `Ctrl`+arrow does
     /// the same thing, but plenty of terminals never forward that
     /// combination at all, so this is the reliable way to reach it.
@@ -166,6 +169,7 @@ impl HitTarget {
             | HitTarget::ColorMenu(_)
             | HitTarget::ColorSwatch(..)
             | HitTarget::StyleSwatch(..)
+            | HitTarget::HueSwatch(..)
             | HitTarget::TableMenu(..)
             | HitTarget::TableCell(..)
             | HitTarget::AnchorDot(..)
@@ -398,6 +402,10 @@ pub struct App {
     /// picking one isn't a guess. `Some((target, None))` previews
     /// clearing the color.
     pub hover_swatch: Option<(Selected, Option<Color>)>,
+    /// The hue the open picker's gradient field is currently mixed
+    /// from — set from the target's own color when the picker opens,
+    /// then steered by clicks on the hue strip.
+    pub picker_hue: f32,
     /// The table cell the cursor is over right now, if any — its own
     /// row's and column's candidate anchor points preview while it's
     /// hovered (just those, not every row and column of the table, so
@@ -537,6 +545,7 @@ impl App {
             selected: None,
             color_picker: None,
             hover_swatch: None,
+            picker_hue: 210.0,
             hover_cell: None,
             mode: Mode::Normal,
             editing_text: String::new(),
@@ -1658,7 +1667,25 @@ impl App {
                 }
             }
             Did::Click(HitTarget::ColorMenu(target)) => {
-                self.color_picker = if self.color_picker.as_ref() == Some(&target) { None } else { Some(target) };
+                let opening = self.color_picker.as_ref() != Some(&target);
+                if opening {
+                    // Start the gradient at the color the thing
+                    // already is, so the field opens showing the
+                    // neighborhood of the current pick rather than an
+                    // arbitrary corner of the spectrum.
+                    let current = match &target {
+                        Selected::Node(id) => self.canvas.node(id).and_then(|n| n.color.clone()),
+                        Selected::Edge(id) => self.canvas.edge(id).and_then(|e| e.color.clone()),
+                    };
+                    if let Some(h) = current.as_ref().and_then(color_hue) {
+                        self.picker_hue = h;
+                    }
+                }
+                self.color_picker = if opening { Some(target) } else { None };
+                self.hover_swatch = None;
+            }
+            Did::Click(HitTarget::HueSwatch(_, hue)) => {
+                self.picker_hue = hue as f32;
                 self.hover_swatch = None;
             }
             Did::Click(HitTarget::ColorSwatch(target, color)) => {
@@ -2276,6 +2303,33 @@ fn edge_from_fields(id: String, f: EdgeFields) -> Edge {
         color: f.color.as_deref().map(Color::parse),
         label: f.label,
     }
+}
+
+/// The hue (0..360) of a color, for seeding the picker's gradient —
+/// `None` for presets and for grays, which have no hue of their own.
+fn color_hue(color: &Color) -> Option<f32> {
+    let Color::Hex(hex) = color else { return None };
+    let hex = hex.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    if d < f32::EPSILON {
+        return None;
+    }
+    let h = if max == r {
+        60.0 * (((g - b) / d) % 6.0)
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    Some(if h < 0.0 { h + 360.0 } else { h })
 }
 
 fn side_to_string(s: Side) -> &'static str {

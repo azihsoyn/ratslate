@@ -14,9 +14,10 @@ exactly where the other tool put it.
 ## What's on a board
 
 - **Boxes** — drag empty canvas to place one, type into it, double-click to
-  edit. `c` cycles colors, or use the `●` button for a picker with hex swatches
-  and border styles — plain, rounded, thick, double or dashed (`x` cycles them
-  too).
+  edit. `c` cycles colors, or use the `●` button for a real color picker — a
+  truecolor gradient field with a hue strip and live preview, plus the six
+  JSON Canvas presets — and border styles: plain, rounded, thick, double or
+  dashed (`x` cycles them too).
 - **Connectors** — shift+drag from one box to another. Sides, arrowheads,
   colors, labels and line styles (solid `──`, thick `━━`, double `══`, dashed
   `╌╌`) all editable; JSON Canvas `fromSide`/`toSide`/`fromEnd`/`toEnd`

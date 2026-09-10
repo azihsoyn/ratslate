@@ -771,39 +771,72 @@ fn display_text(node: &Node) -> String {
     }
 }
 
-/// Common colors beyond the six JSON Canvas presets — the whole reason
-/// for a picker instead of just cycling `c`, since a hex color is
-/// otherwise only reachable from `--api`.
-const HEX_SWATCHES: [&str; 14] = [
-    "#ffffff", "#c0c0c0", "#808080", "#404040", "#000000", "#8b5a2b", "#64748b",
-    "#e11d48", "#f59e0b", "#84cc16", "#14b8a6", "#0ea5e9", "#a855f7", "#ff69b4",
-];
+/// The gradient field's footprint: `FIELD_W` columns of saturation by
+/// `FIELD_H` rows of value, one truecolor background cell per sample —
+/// a real color picker, just at terminal-cell resolution. Terminals
+/// without 24-bit color quantize it to their nearest palette entry,
+/// same as they do any RGB the app emits.
+const FIELD_W: u16 = 24;
+const FIELD_H: u16 = 8;
 
-/// Below the `●` button: clear + the 6 presets, two rows of extra hex
-/// swatches, then a row of styles — border shapes for a box, line
-/// styles for a connector. Each swatch is its own hit target,
-/// registered fresh every frame like everything else `render` draws.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let hp = (h.rem_euclid(360.0)) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    (((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8)
+}
+
+/// Below the `●` button: clear + the 6 JSON Canvas presets, then a
+/// saturation/value gradient field mixed from the picker's current
+/// hue, a hue strip to steer it, a readout of the exact hex under the
+/// cursor, and a row of styles — border shapes for a box, line styles
+/// for a connector. Every field cell is an ordinary `ColorSwatch`
+/// carrying its own hex, so hovering the gradient live-previews the
+/// box exactly like the old fixed swatches did.
 fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16, y: u16, canvas_area: Rect) {
-    let mut put_swatch = |cx: u16, cy: u16, label: &str, style: Style, color: Option<String>| {
-        let rect = Rect::new(cx, cy, 2, 1).intersection(canvas_area);
+    let hue = app.picker_hue;
+    let mut put_swatch = |cx: u16, cy: u16, w: u16, label: &str, style: Style, hit: HitTarget| {
+        let rect = Rect::new(cx, cy, w, 1).intersection(canvas_area);
         if rect.is_empty() {
             return;
         }
-        app.hits.put(rect, HitTarget::ColorSwatch(target.clone(), color));
+        app.hits.put(rect, hit);
         frame.render_widget(Paragraph::new(label).style(style), rect);
     };
 
-    put_swatch(x, y, "╳ ", Style::default(), None);
+    put_swatch(x, y, 2, "╳ ", Style::default(), HitTarget::ColorSwatch(target.clone(), None));
     for preset in 1..=6u8 {
         let cx = x + 2 * preset as u16;
         let style = Style::default().bg(ratatui_color(&Color::Preset(preset)));
-        put_swatch(cx, y, "  ", style, Some(preset.to_string()));
+        put_swatch(cx, y, 2, "  ", style, HitTarget::ColorSwatch(target.clone(), Some(preset.to_string())));
     }
-    for (i, hex) in HEX_SWATCHES.iter().enumerate() {
-        let cx = x + 2 * (i % 7) as u16;
-        let cy = y + 1 + (i / 7) as u16;
-        let style = Style::default().bg(ratatui_color(&Color::Hex((*hex).to_string())));
-        put_swatch(cx, cy, "  ", style, Some((*hex).to_string()));
+
+    for gy in 0..FIELD_H {
+        for gx in 0..FIELD_W {
+            let sat = gx as f32 / (FIELD_W - 1) as f32;
+            let val = 1.0 - gy as f32 / (FIELD_H - 1) as f32;
+            let (r, g, b) = hsv_to_rgb(hue, sat, val);
+            let hex = format!("#{r:02x}{g:02x}{b:02x}");
+            let style = Style::default().bg(RColor::Rgb(r, g, b));
+            put_swatch(x + gx, y + 1 + gy, 1, " ", style, HitTarget::ColorSwatch(target.clone(), Some(hex)));
+        }
+    }
+
+    let hue_y = y + 1 + FIELD_H;
+    for gx in 0..FIELD_W {
+        let h = (gx as f32 + 0.5) / FIELD_W as f32 * 360.0;
+        let (r, g, b) = hsv_to_rgb(h, 1.0, 1.0);
+        let style = Style::default().bg(RColor::Rgb(r, g, b));
+        put_swatch(x + gx, hue_y, 1, " ", style, HitTarget::HueSwatch(target.clone(), h as u16));
     }
 
     let styles: &[(&str, &str)] = match &target {
@@ -811,12 +844,31 @@ fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16,
         Selected::Edge(_) => &[("─", "solid"), ("━", "thick"), ("═", "double"), ("╌", "dashed")],
     };
     for (i, (label, value)) in styles.iter().enumerate() {
-        let rect = Rect::new(x + 2 * i as u16, y + 3, 2, 1).intersection(canvas_area);
-        if rect.is_empty() {
-            continue;
+        let cx = x + 2 * i as u16;
+        put_swatch(cx, hue_y + 2, 2, &format!("{label} "), Style::default(), HitTarget::StyleSwatch(target.clone(), (*value).to_string()));
+    }
+
+    // What's about to be picked (the hovered swatch), or failing that
+    // what's already set — spelled out as hex, next to a filled cell
+    // of it, so the exact value is copyable knowledge and not just a
+    // patch of color. Drawn last: it's the one row that writes through
+    // `frame` directly, after the swatch closure's borrow ends.
+    let shown: Option<Color> = match &app.hover_swatch {
+        Some((t, c)) if t == &target => c.clone(),
+        _ => match &target {
+            Selected::Node(id) => app.canvas.node(id).and_then(|n| n.color.clone()),
+            Selected::Edge(id) => app.canvas.edge(id).and_then(|e| e.color.clone()),
+        },
+    };
+    if let Some(color) = shown {
+        let rect = Rect::new(x, hue_y + 1, FIELD_W, 1).intersection(canvas_area);
+        if !rect.is_empty() {
+            let line = Line::from(vec![
+                Span::styled("  ", Style::default().bg(ratatui_color(&color))),
+                Span::raw(format!(" {color}")),
+            ]);
+            frame.render_widget(Paragraph::new(line), rect);
         }
-        app.hits.put(rect, HitTarget::StyleSwatch(target.clone(), (*value).to_string()));
-        frame.render_widget(Paragraph::new(format!("{label} ")), rect);
     }
 }
 

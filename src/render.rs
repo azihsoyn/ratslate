@@ -219,7 +219,11 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
     if let Some(Selected::Node(id)) = app.selected.clone()
         && let Some(node) = app.canvas.node(&id)
     {
-        let srect = to_screen(node.rect, camera, canvas_area);
+        // Mid-drag the box draws at its override position, so its `●`
+        // button has to ride along — anchored to `node.rect` it stayed
+        // parked at the spot the box was picked up from.
+        let world = overrides.get(&id).copied().unwrap_or(node.rect);
+        let srect = to_screen(world, camera, canvas_area);
         let target = Selected::Node(id.clone());
         let (bx, by) = (srect.right(), srect.y);
         if bx >= 0

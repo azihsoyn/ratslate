@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
 use crate::collab::{Collab, EdgeFields, NodeFields};
-use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, ShapeId, Side, WorldRect};
+use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, Shape, ShapeId, Side, WorldRect};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
@@ -57,6 +57,9 @@ pub enum HitTarget {
     /// preset is `Some("1")`..`Some("6")`; anything else is a literal
     /// hex string.
     ColorSwatch(Selected, Option<String>),
+    /// One style swatch in an open picker — a border shape for a box,
+    /// a line style for a connector.
+    StyleSwatch(Selected, String),
     /// A row/column button on an open table editor — `Ctrl`+arrow does
     /// the same thing, but plenty of terminals never forward that
     /// combination at all, so this is the reliable way to reach it.
@@ -162,6 +165,7 @@ impl HitTarget {
             HitTarget::Reattach(..)
             | HitTarget::ColorMenu(_)
             | HitTarget::ColorSwatch(..)
+            | HitTarget::StyleSwatch(..)
             | HitTarget::TableMenu(..)
             | HitTarget::TableCell(..)
             | HitTarget::AnchorDot(..)
@@ -257,6 +261,9 @@ pub enum Request {
     SetEdgeColor { id: String, color: Option<String> },
     /// Which ends carry an arrowhead: "none" or "arrow", for each end.
     SetEdgeEnds { id: String, from_end: String, to_end: String },
+    /// How a connector's line is drawn: "solid", "thick", "double" or
+    /// "dashed".
+    SetEdgeStyle { id: String, style: String },
     /// Which side of each box a connector leaves from/arrives at —
     /// "top" / "right" / "bottom" / "left", or `null` to go back to
     /// picking automatically based on where the boxes actually sit.
@@ -892,6 +899,12 @@ impl App {
                 let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
                 edge.from_end = parse_edge_end(&from_end);
                 edge.to_end = parse_edge_end(&to_end);
+                touched_edge = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetEdgeStyle { id, style } => {
+                let edge = self.canvas.edge_mut(&id).ok_or_else(|| format!("no such connector: {id}"))?;
+                edge.style = LineStyle::parse(&style);
                 touched_edge = Some(id);
                 Ok(Response::Ok)
             }
@@ -1656,6 +1669,14 @@ impl App {
                 self.color_picker = None;
                 self.hover_swatch = None;
             }
+            Did::Click(HitTarget::StyleSwatch(target, style)) => {
+                let _ = match target {
+                    Selected::Node(id) => self.dispatch(Request::SetShape { id, shape: style }),
+                    Selected::Edge(id) => self.dispatch(Request::SetEdgeStyle { id, style }),
+                };
+                self.color_picker = None;
+                self.hover_swatch = None;
+            }
             Did::Click(HitTarget::TableCell(id, row, col)) => {
                 self.color_picker = None;
                 self.hover_swatch = None;
@@ -2227,6 +2248,7 @@ fn edge_fields(edge: &Edge) -> EdgeFields {
         from_col: edge.from_anchor.and_then(|a| a.col).map(|n| n as i64),
         to_row: edge.to_anchor.and_then(|a| a.row).map(|n| n as i64),
         to_col: edge.to_anchor.and_then(|a| a.col).map(|n| n as i64),
+        style: edge.style.as_str().map(str::to_string),
         color: edge.color.as_ref().map(|c| c.to_string()),
         label: edge.label.clone(),
     }
@@ -2250,6 +2272,7 @@ fn edge_from_fields(id: String, f: EdgeFields) -> Edge {
         to_side: f.to_side.as_deref().and_then(parse_side),
         to_end: parse_edge_end(&f.to_end),
         to_anchor: anchor_from_fields(f.to_row, f.to_col),
+        style: f.style.as_deref().map(LineStyle::parse).unwrap_or_default(),
         color: f.color.as_deref().map(Color::parse),
         label: f.label,
     }

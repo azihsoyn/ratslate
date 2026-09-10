@@ -7,7 +7,7 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, Node, NodeKind, Shape, Side, WorldRect};
+use crate::model::{Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, Shape, Side, WorldRect};
 
 /// A board, in the shape https://jsoncanvas.org/spec/1.0/ describes on
 /// disk — also what `Request::State` hands back over `--api`.
@@ -111,6 +111,8 @@ pub struct FileEdge {
     pub to_end: Option<String>,
     #[serde(rename = "ratslateToAnchor", skip_serializing_if = "Option::is_none")]
     pub to_anchor: Option<FileAnchor>,
+    #[serde(rename = "ratslateStyle", skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,6 +260,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 EdgeEnd::Arrow
             },
             to_anchor: fedge.to_anchor.map(|a| CellAnchor { row: a.row, col: a.col }),
+            style: fedge.style.as_deref().map(LineStyle::parse).unwrap_or_default(),
             color: fedge.color.as_deref().map(Color::parse),
             label: fedge.label,
         });
@@ -340,6 +343,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
             to_side: e.to_side.map(side_to_string).map(str::to_string),
             to_end: (e.to_end == EdgeEnd::None).then(|| "none".to_string()),
             to_anchor: e.to_anchor.map(|a| FileAnchor { row: a.row, col: a.col }),
+            style: e.style.as_str().map(str::to_string),
             color: e.color.as_ref().map(Color::to_string),
             label: e.label.clone(),
         })

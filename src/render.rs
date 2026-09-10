@@ -9,7 +9,7 @@ use ratatui::{
 use ratatui_dnd::Hits;
 
 use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected, TableOp, cell_anchor_for};
-use crate::model::{CellAnchor, Color, EdgeEnd, Node, NodeKind, Shape, Side, WorldRect};
+use crate::model::{CellAnchor, Color, EdgeEnd, LineStyle, Node, NodeKind, Shape, Side, WorldRect};
 use crate::table::Table;
 
 /// World rect → screen space through the camera. Same `WorldRect` type
@@ -150,7 +150,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         }
     }
 
-    draw_edges(frame, app, &overrides, reattaching.as_ref(), canvas_area);
+    let selected_edge_ui = draw_edges(frame, app, &overrides, reattaching.as_ref(), canvas_area);
 
     // Groups first, whatever the array order says — they're fences
     // around other boxes, and drawing one after its members would put
@@ -235,6 +235,21 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             if app.color_picker.as_ref() == Some(&target) {
                 draw_color_picker(frame, app, target, bx as u16, by as u16 + 1, canvas_area);
             }
+        }
+    }
+
+    if let Some((mx, my, target, color)) = selected_edge_ui {
+        let (bx, by) = (mx, my - 1);
+        let button = Rect::new(bx, by, 1, 1).intersection(canvas_area);
+        if !button.is_empty() {
+            app.hits.put(button, HitTarget::ColorMenu(target.clone()));
+            let dot_color = color.as_ref().map(ratatui_color).unwrap_or(RColor::White);
+            frame.render_widget(Paragraph::new("●").style(Style::default().fg(dot_color)), button);
+        }
+        if app.color_picker.as_ref() == Some(&target) {
+            // Below the label line (if any), not the button's own row
+            // right above it, so a picker never covers either.
+            draw_color_picker(frame, app, target, bx, my + 1, canvas_area);
         }
     }
 
@@ -418,16 +433,36 @@ fn node_style(color: Option<&Color>, selected: bool, preview: Option<Option<RCol
     (base, border_style)
 }
 
+/// The border set a shape asks for — dashed has no `BorderType` of its
+/// own, so it's a custom set: dashed runs, plain corners.
+const DASHED_BORDER: ratatui::symbols::border::Set = ratatui::symbols::border::Set {
+    top_left: "┌",
+    top_right: "┐",
+    bottom_left: "└",
+    bottom_right: "┘",
+    vertical_left: "╎",
+    vertical_right: "╎",
+    horizontal_top: "╌",
+    horizontal_bottom: "╌",
+};
+
+fn shaped(block: Block<'_>, shape: Shape) -> Block<'_> {
+    match shape {
+        Shape::Rectangle => block,
+        Shape::Rounded => block.border_type(BorderType::Rounded),
+        Shape::Thick => block.border_type(BorderType::Thick),
+        Shape::Double => block.border_type(BorderType::Double),
+        Shape::Dashed => block.border_set(DASHED_BORDER),
+    }
+}
+
 /// `rect` is the node's place on screen, already translated through
 /// the camera — the node's own `rect` is world coordinates and never
 /// drawn from directly.
 fn draw_node(frame: &mut Frame, node: &Node, rect: Rect, selected: bool, editing: bool, editing_text: &str, preview: Option<Option<RColor>>) {
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
-    let mut block = Block::bordered().border_style(border_style);
-    if node.shape == Shape::Rounded {
-        block = block.border_type(BorderType::Rounded);
-    }
+    let block = shaped(Block::bordered().border_style(border_style), node.shape);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -492,10 +527,7 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
     let TableView { node, rect, selected, table, cursor, editing_text, preview } = view;
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
-    let mut block = Block::bordered().border_style(border_style);
-    if node.shape == Shape::Rounded {
-        block = block.border_type(BorderType::Rounded);
-    }
+    let block = shaped(Block::bordered().border_style(border_style), node.shape);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -632,10 +664,19 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
         }
     }
 
+    // Where the plain inner grid meets the border, the junction glyph
+    // has to match the border's own weight — a `┬` on a thick or
+    // double frame reads as a break in the line, so those get the
+    // mixed-weight `┯`/`╤` family instead.
+    let (tee_down, tee_up, tee_right, tee_left) = match node.shape {
+        Shape::Thick => ("┯", "┷", "┠", "┨"),
+        Shape::Double => ("╤", "╧", "╟", "╢"),
+        _ => ("┬", "┴", "├", "┤"),
+    };
     let buf = frame.buffer_mut();
     for &dx in &divider_xs {
         if let Some(cell) = buf.cell_mut((dx, rect.y)) {
-            cell.set_symbol("┬");
+            cell.set_symbol(tee_down);
         }
     }
     // The bottom border only gets `┴` junctions when the grid actually
@@ -647,18 +688,18 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
             if rect.bottom() > rect.y
                 && let Some(cell) = buf.cell_mut((dx, rect.bottom() - 1))
             {
-                cell.set_symbol("┴");
+                cell.set_symbol(tee_up);
             }
         }
     }
     if let Some(sep_y) = header_sep_y {
         if let Some(cell) = buf.cell_mut((rect.x, sep_y)) {
-            cell.set_symbol("├");
+            cell.set_symbol(tee_right);
         }
         if rect.right() > rect.x
             && let Some(cell) = buf.cell_mut((rect.right() - 1, sep_y))
         {
-            cell.set_symbol("┤");
+            cell.set_symbol(tee_left);
         }
     }
 
@@ -730,14 +771,18 @@ fn display_text(node: &Node) -> String {
     }
 }
 
-/// A handful of common colors beyond the six JSON Canvas presets — the
-/// whole reason for a picker instead of just cycling `c`, since a hex
-/// color is otherwise only reachable from `--api`.
-const HEX_SWATCHES: [&str; 6] = ["#ffffff", "#000000", "#808080", "#ff69b4", "#3b82f6", "#8b5a2b"];
+/// Common colors beyond the six JSON Canvas presets — the whole reason
+/// for a picker instead of just cycling `c`, since a hex color is
+/// otherwise only reachable from `--api`.
+const HEX_SWATCHES: [&str; 14] = [
+    "#ffffff", "#c0c0c0", "#808080", "#404040", "#000000", "#8b5a2b", "#64748b",
+    "#e11d48", "#f59e0b", "#84cc16", "#14b8a6", "#0ea5e9", "#a855f7", "#ff69b4",
+];
 
-/// Two rows below the color menu button: clear + the 6 presets, then 6
-/// extra hex swatches. Each swatch is its own hit target, registered
-/// fresh every frame like everything else `render` draws.
+/// Below the `●` button: clear + the 6 presets, two rows of extra hex
+/// swatches, then a row of styles — border shapes for a box, line
+/// styles for a connector. Each swatch is its own hit target,
+/// registered fresh every frame like everything else `render` draws.
 fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16, y: u16, canvas_area: Rect) {
     let mut put_swatch = |cx: u16, cy: u16, label: &str, style: Style, color: Option<String>| {
         let rect = Rect::new(cx, cy, 2, 1).intersection(canvas_area);
@@ -755,9 +800,23 @@ fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16,
         put_swatch(cx, y, "  ", style, Some(preset.to_string()));
     }
     for (i, hex) in HEX_SWATCHES.iter().enumerate() {
-        let cx = x + 2 * i as u16;
+        let cx = x + 2 * (i % 7) as u16;
+        let cy = y + 1 + (i / 7) as u16;
         let style = Style::default().bg(ratatui_color(&Color::Hex((*hex).to_string())));
-        put_swatch(cx, y + 1, "  ", style, Some((*hex).to_string()));
+        put_swatch(cx, cy, "  ", style, Some((*hex).to_string()));
+    }
+
+    let styles: &[(&str, &str)] = match &target {
+        Selected::Node(_) => &[("┌", "rectangle"), ("╭", "rounded"), ("┏", "thick"), ("╔", "double"), ("╌", "dashed")],
+        Selected::Edge(_) => &[("─", "solid"), ("━", "thick"), ("═", "double"), ("╌", "dashed")],
+    };
+    for (i, (label, value)) in styles.iter().enumerate() {
+        let rect = Rect::new(x + 2 * i as u16, y + 3, 2, 1).intersection(canvas_area);
+        if rect.is_empty() {
+            continue;
+        }
+        app.hits.put(rect, HitTarget::StyleSwatch(target.clone(), (*value).to_string()));
+        frame.render_widget(Paragraph::new(format!("{label} ")), rect);
     }
 }
 
@@ -805,13 +864,18 @@ fn draw_ghost(frame: &mut Frame, rect: Rect, color: Option<&Color>) {
     frame.render_widget(Block::bordered().border_style(style), rect);
 }
 
+/// Draws every connector; returns the selected one's `●` button spot
+/// and current color, if any — the button and its picker are drawn by
+/// the caller *after* the node pass, or a box sitting past the edge in
+/// z-order would paint (and hit-test) right over them.
 fn draw_edges(
     frame: &mut Frame,
     app: &mut App,
     overrides: &std::collections::HashMap<String, WorldRect>,
     reattaching: Option<&(String, Endpoint)>,
     canvas_area: Rect,
-) {
+) -> Option<(u16, u16, Selected, Option<Color>)> {
+    let mut selected_edge_ui = None;
     // Screen-space rects throughout — everything downstream (routing,
     // glyph placement, hit registration) is bounded per-cell, so a box
     // off the visible canvas simply routes to coordinates whose glyphs
@@ -948,7 +1012,7 @@ fn draw_edges(
         .collect();
 
     for i in 0..app.canvas.edges.len() {
-        let (color, to_end, from_end, label, edge_id, explicit_sides, has_from_anchor, has_to_anchor) = {
+        let (color, to_end, from_end, label, edge_id, explicit_sides, has_from_anchor, has_to_anchor, line_style) = {
             let edge = &app.canvas.edges[i];
             (
                 edge.color.clone(),
@@ -959,6 +1023,7 @@ fn draw_edges(
                 edge.from_side.zip(edge.to_side).or(if anchored[i] { sides[i] } else { None }),
                 edge.from_anchor.is_some(),
                 edge.to_anchor.is_some(),
+                edge.style,
             )
         };
         let Some((from_rect, to_rect)) = rects[i] else { continue };
@@ -992,6 +1057,7 @@ fn draw_edges(
             .filter(|&(x, y, _)| {
                 !obstacles.iter().any(|(id, r)| id != &edge_from && id != &edge_to && inside(*r, x, y))
             })
+            .map(|(x, y, ch)| (x, y, styled_glyph(ch, line_style)))
             .collect();
 
         for &(x, y, ch) in &glyphs {
@@ -1063,20 +1129,10 @@ fn draw_edges(
         }
 
         if selected && mx >= 0 && my > 0 {
-            let (bx, by) = (mx as u16, my as u16 - 1);
-            let button = Rect::new(bx, by, 1, 1).intersection(canvas_area);
-            if !button.is_empty() {
-                app.hits.put(button, HitTarget::ColorMenu(target.clone()));
-                let dot_color = color.as_ref().map(ratatui_color).unwrap_or(RColor::White);
-                frame.render_widget(Paragraph::new("●").style(Style::default().fg(dot_color)), button);
-            }
-            if app.color_picker.as_ref() == Some(&target) {
-                // Below the label line (if any), not the button's own
-                // row right above it, so a picker never covers either.
-                draw_color_picker(frame, app, target.clone(), bx, my as u16 + 1, canvas_area);
-            }
+            selected_edge_ui = Some((mx as u16, my as u16, target.clone(), color.clone()));
         }
     }
+    selected_edge_ui
 }
 
 fn rect_at(x: i32, y: i32) -> Rect {
@@ -1274,6 +1330,39 @@ fn route_glyphs(waypoints: &[(i32, i32)]) -> Vec<(i32, i32, char)> {
         }
     }
     out
+}
+
+/// The plain routing glyphs, re-spelled in a connector's line style.
+/// Arrowheads and anchor dots keep their own glyphs — only the line
+/// itself changes weight. Dashed has no bend glyphs of its own, so its
+/// corners stay plain.
+fn styled_glyph(ch: char, style: LineStyle) -> char {
+    match style {
+        LineStyle::Solid => ch,
+        LineStyle::Thick => match ch {
+            '─' => '━',
+            '│' => '┃',
+            '┌' => '┏',
+            '┐' => '┓',
+            '└' => '┗',
+            '┘' => '┛',
+            c => c,
+        },
+        LineStyle::Double => match ch {
+            '─' => '═',
+            '│' => '║',
+            '┌' => '╔',
+            '┐' => '╗',
+            '└' => '╚',
+            '┘' => '╝',
+            c => c,
+        },
+        LineStyle::Dashed => match ch {
+            '─' => '╌',
+            '│' => '╎',
+            c => c,
+        },
+    }
 }
 
 fn corner_char(prev: (i32, i32), corner: (i32, i32), next: (i32, i32)) -> char {

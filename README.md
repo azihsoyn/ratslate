@@ -14,10 +14,13 @@ exactly where the other tool put it.
 ## What's on a board
 
 - **Boxes** — drag empty canvas to place one, type into it, double-click to
-  edit. `c` cycles colors, or use the `●` button for a picker with hex swatches.
+  edit. `c` cycles colors, or use the `●` button for a picker with hex swatches
+  and border styles — plain, rounded, thick, double or dashed (`x` cycles them
+  too).
 - **Connectors** — shift+drag from one box to another. Sides, arrowheads,
-  colors and labels all editable; JSON Canvas `fromSide`/`toSide`/`fromEnd`/
-  `toEnd` respected.
+  colors, labels and line styles (solid `──`, thick `━━`, double `══`, dashed
+  `╌╌`) all editable; JSON Canvas `fromSide`/`toSide`/`fromEnd`/`toEnd`
+  respected.
 - **Tables** — a box whose text is a GFM markdown table renders as a real
   grid. Double-click a cell to edit it spreadsheet-style (Tab/Enter/arrows,
   `+col -col +row -row` buttons, Alt+Enter for a line break, Ctrl+Z inside the

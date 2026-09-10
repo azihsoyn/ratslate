@@ -74,19 +74,28 @@ pub enum Shape {
     #[default]
     Rectangle,
     Rounded,
+    Thick,
+    Double,
+    Dashed,
 }
 
 impl Shape {
     pub fn cycle(self) -> Shape {
         match self {
             Shape::Rectangle => Shape::Rounded,
-            Shape::Rounded => Shape::Rectangle,
+            Shape::Rounded => Shape::Thick,
+            Shape::Thick => Shape::Double,
+            Shape::Double => Shape::Dashed,
+            Shape::Dashed => Shape::Rectangle,
         }
     }
 
     pub fn parse(s: &str) -> Shape {
         match s {
             "rounded" => Shape::Rounded,
+            "thick" => Shape::Thick,
+            "double" => Shape::Double,
+            "dashed" => Shape::Dashed,
             _ => Shape::Rectangle,
         }
     }
@@ -95,6 +104,41 @@ impl Shape {
         match self {
             Shape::Rectangle => None,
             Shape::Rounded => Some("rounded"),
+            Shape::Thick => Some("thick"),
+            Shape::Double => Some("double"),
+            Shape::Dashed => Some("dashed"),
+        }
+    }
+}
+
+/// A connector's line — same arrangement as `Shape`: an extra
+/// `ratslateStyle` field on the edge that a reader who doesn't know it
+/// just ignores, drawing the connector as the plain line it always was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineStyle {
+    #[default]
+    Solid,
+    Thick,
+    Double,
+    Dashed,
+}
+
+impl LineStyle {
+    pub fn parse(s: &str) -> LineStyle {
+        match s {
+            "thick" => LineStyle::Thick,
+            "double" => LineStyle::Double,
+            "dashed" => LineStyle::Dashed,
+            _ => LineStyle::Solid,
+        }
+    }
+
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            LineStyle::Solid => None,
+            LineStyle::Thick => Some("thick"),
+            LineStyle::Double => Some("double"),
+            LineStyle::Dashed => Some("dashed"),
         }
     }
 }
@@ -160,6 +204,7 @@ pub struct Edge {
     pub to_side: Option<Side>,
     pub to_end: EdgeEnd,
     pub to_anchor: Option<CellAnchor>,
+    pub style: LineStyle,
     pub color: Option<Color>,
     pub label: Option<String>,
 }
@@ -227,6 +272,7 @@ impl Canvas {
             to_side: None,
             to_end: EdgeEnd::Arrow,
             to_anchor: None,
+            style: LineStyle::default(),
             color: None,
             label: None,
         });

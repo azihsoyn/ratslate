@@ -936,6 +936,17 @@ fn draw_edges(
         anchored[i] = from_anchored.is_some() || to_anchored.is_some();
     }
 
+    // Every box an edge might cross. A connector's line disappearing
+    // behind an unrelated box reads as "it goes under"; the same line
+    // drawn over the box's border and text reads as garbage inside it.
+    let obstacles: Vec<(String, WorldRect)> = app
+        .canvas
+        .nodes
+        .iter()
+        .filter(|n| !matches!(n.kind, NodeKind::Group { .. }))
+        .filter_map(|n| Some((n.id.clone(), rect_of(&n.id)?)))
+        .collect();
+
     for i in 0..app.canvas.edges.len() {
         let (color, to_end, from_end, label, edge_id, explicit_sides, has_from_anchor, has_to_anchor) = {
             let edge = &app.canvas.edges[i];
@@ -970,10 +981,17 @@ fn draw_edges(
         if selected {
             style = Style::default().fg(shown_color.unwrap_or(RColor::Cyan)).add_modifier(Modifier::BOLD);
         }
+        let (edge_from, edge_to) = {
+            let e = &app.canvas.edges[i];
+            (e.from.clone(), e.to.clone())
+        };
         let waypoints = route(from_rect, to_rect, from_frac[i], to_frac[i], explicit_sides);
         let glyphs: Vec<(i32, i32, char)> = route_glyphs(&waypoints)
             .into_iter()
             .filter(|&(x, y, _)| !inside(from_rect, x, y) && !inside(to_rect, x, y))
+            .filter(|&(x, y, _)| {
+                !obstacles.iter().any(|(id, r)| id != &edge_from && id != &edge_to && inside(*r, x, y))
+            })
             .collect();
 
         for &(x, y, ch) in &glyphs {

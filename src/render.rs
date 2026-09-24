@@ -173,6 +173,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         // wrong, and the `Move` hit above is still enough to grab it
         // and drag it back into view.
         if !fully_visible(srect, canvas_area) {
+            frame.render_widget(Clear, clipped);
             frame.render_widget(Block::bordered(), clipped);
             continue;
         }
@@ -481,6 +482,10 @@ fn shaped(block: Block<'_>, shape: Shape) -> Block<'_> {
 fn draw_node(frame: &mut Frame, node: &Node, shape: Shape, rect: Rect, selected: bool, editing: Option<&str>, preview: Option<Option<RColor>>) {
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
+    // A box is opaque: whatever sits under it in the z-order stops
+    // here, instead of bleeding through the interior cells the border
+    // and text don't happen to touch.
+    frame.render_widget(Clear, rect);
     let block = shaped(Block::bordered().border_style(border_style), shape);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -549,6 +554,7 @@ fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget
     let TableView { node, shape, rect, selected, table, cursor, editing_text, preview } = view;
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
+    frame.render_widget(Clear, rect);
     let block = shaped(Block::bordered().border_style(border_style), shape);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -1624,7 +1630,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Editing(_) => "EDIT (Esc to leave)",
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · T/tab boards · o open file/link · y copy · g group · l auto-layout · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · T/tab boards · o open file/link · y copy · g group · [/] z-order ({/} back/front) · l auto-layout · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

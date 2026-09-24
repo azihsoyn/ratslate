@@ -245,6 +245,27 @@ pub struct Edge {
     pub label: Option<String>,
 }
 
+/// One step or all the way, either direction, within the z-order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZMove {
+    Up,
+    Down,
+    Front,
+    Back,
+}
+
+impl ZMove {
+    pub fn parse(s: &str) -> Option<ZMove> {
+        match s {
+            "up" => Some(ZMove::Up),
+            "down" => Some(ZMove::Down),
+            "front" => Some(ZMove::Front),
+            "back" => Some(ZMove::Back),
+            _ => None,
+        }
+    }
+}
+
 /// Nodes are drawn (and hit-tested) in this order, so the last one is on
 /// top — the same z-index rule JSON Canvas uses for its `nodes` array.
 #[derive(Debug, Default, Clone)]
@@ -314,6 +335,37 @@ impl Canvas {
             label: None,
         });
         id
+    }
+
+    /// Moves a box within the stacking order. The `nodes` array *is*
+    /// the z-order — JSON Canvas's own rule, last one on top — so this
+    /// is nothing but an array move, and every other reader (Obsidian
+    /// included) sees the same stacking. `false` if the id is unknown.
+    pub fn reorder(&mut self, id: &str, to: ZMove) -> bool {
+        let Some(i) = self.nodes.iter().position(|n| n.id == id) else {
+            return false;
+        };
+        match to {
+            ZMove::Up => {
+                if i + 1 < self.nodes.len() {
+                    self.nodes.swap(i, i + 1);
+                }
+            }
+            ZMove::Down => {
+                if i > 0 {
+                    self.nodes.swap(i - 1, i);
+                }
+            }
+            ZMove::Front => {
+                let node = self.nodes.remove(i);
+                self.nodes.push(node);
+            }
+            ZMove::Back => {
+                let node = self.nodes.remove(i);
+                self.nodes.insert(0, node);
+            }
+        }
+        true
     }
 
     pub fn delete(&mut self, id: &str) {

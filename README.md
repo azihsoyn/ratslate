@@ -30,6 +30,10 @@ exactly where the other tool put it.
   anchored when things move.
 - **Groups** — draw a box around things, press `g`. Moving the fence moves
   everything inside it.
+- **Stacking** — boxes are opaque and stack in JSON Canvas node order.
+  `[`/`]` move a selected box one step back/forward, `{`/`}` all the way;
+  the API spells it `reorder`. The order round-trips through Obsidian
+  unchanged.
 - **Files & links** — JSON Canvas file/link cards: `o` opens them (creating
   the file if it doesn't exist yet), `y` copies the path or URL.
 

@@ -50,6 +50,11 @@ pub struct NodeFields {
     pub shape: String,
     /// "text" | "file" | "link" | "group".
     pub kind: String,
+    /// The node's position in the canvas's `nodes` array — its
+    /// z-order. The CRDT map has no order of its own, so without this
+    /// every merge dealt the stacking (and the saved file's node
+    /// order) in whatever order the map felt like iterating.
+    pub z: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -133,7 +138,7 @@ impl Collab {
             Some(sp) => Any::String(Arc::from(sp.as_str())),
             None => Any::Null,
         };
-        let entry: [(Arc<str>, In); 9] = [
+        let entry: [(Arc<str>, In); 10] = [
             (Arc::from("x"), In::Any(Any::BigInt(f.x))),
             (Arc::from("y"), In::Any(Any::BigInt(f.y))),
             (Arc::from("w"), In::Any(Any::BigInt(f.w))),
@@ -143,6 +148,7 @@ impl Collab {
             (Arc::from("color"), In::Any(color)),
             (Arc::from("shape"), In::Any(Any::String(Arc::from(f.shape.as_str())))),
             (Arc::from("kind"), In::Any(Any::String(Arc::from(f.kind.as_str())))),
+            (Arc::from("z"), In::Any(Any::BigInt(f.z))),
         ];
         {
             let mut txn = self.doc.transact_mut();
@@ -193,9 +199,14 @@ impl Collab {
                     color,
                     shape: get_str("shape"),
                     kind: get_str("kind"),
+                    z: get_i64("z"),
                 },
             ));
         }
+        // Back into z-order. A `.crdt` from before z existed reads
+        // every node as 0; the id tiebreak at least keeps that stable,
+        // and the first sync writes real positions.
+        out.sort_by(|a, b| a.1.z.cmp(&b.1.z).then_with(|| a.0.cmp(&b.0)));
         out
     }
 

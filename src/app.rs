@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
 use crate::collab::{Collab, EdgeFields, NodeFields};
-use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, Shape, ShapeId, Side, WorldRect};
+use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, Shape, ShapeId, Side, WorldRect, ZMove};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
@@ -299,6 +299,11 @@ pub enum Request {
     Reattach { id: String, end: String, node: ShapeId },
     /// Select a box or a connector, or clear the selection with `null`.
     Select { id: Option<Selected> },
+    /// Move a box within the stacking order: "up" (one step toward
+    /// the front), "down", "front" or "back". The `nodes` array is the
+    /// z-order — later is on top, JSON Canvas's own rule — so the
+    /// result round-trips through any other reader unchanged.
+    Reorder { id: ShapeId, to: String },
     /// Rearrange every box (groups aside) into a layered left-to-right
     /// graph layout — pour in nodes and edges with any coordinates,
     /// then ask for this and get a readable diagram. One undo step.
@@ -518,8 +523,8 @@ impl App {
                 // First run for this board: seed the CRDT from whatever
                 // the JSON file already had, so later merges have a
                 // common ancestor instead of starting from nothing.
-                for node in &canvas.nodes {
-                    collab.set_node(&node.id, &node_fields(node));
+                for (i, node) in canvas.nodes.iter().enumerate() {
+                    collab.set_node(&node.id, &node_fields(node, i as i64));
                 }
             } else {
                 // The CRDT already has state — possibly ahead of the
@@ -628,8 +633,8 @@ impl App {
     fn sync_node(&mut self, id: &ShapeId) {
         let Some(collab) = &mut self.collab else { return };
         collab.pull();
-        match self.canvas.node(id) {
-            Some(node) => collab.set_node(id, &node_fields(node)),
+        match self.canvas.nodes.iter().position(|n| &n.id == id) {
+            Some(i) => collab.set_node(id, &node_fields(&self.canvas.nodes[i], i as i64)),
             None => collab.remove_node(id),
         }
     }
@@ -654,8 +659,8 @@ impl App {
         let Some(collab) = &mut self.collab else { return };
         collab.pull();
         let current_nodes: std::collections::HashSet<&str> = self.canvas.nodes.iter().map(|n| n.id.as_str()).collect();
-        for node in &self.canvas.nodes {
-            collab.set_node(&node.id, &node_fields(node));
+        for (i, node) in self.canvas.nodes.iter().enumerate() {
+            collab.set_node(&node.id, &node_fields(node, i as i64));
         }
         let stale_nodes: Vec<String> = collab
             .snapshot()
@@ -982,6 +987,18 @@ impl App {
                 self.selected = id;
                 Ok(Response::Ok)
             }
+            Request::Reorder { id, to } => {
+                let mv = ZMove::parse(&to).ok_or_else(|| format!("unknown position: {to} — use up, down, front or back"))?;
+                if self.canvas.reorder(&id, mv) {
+                    // One move renumbers everyone below it, so every
+                    // node's z resyncs — boards are small, and a stale
+                    // z is exactly the bug this field exists to kill.
+                    touched_also.extend(self.canvas.nodes.iter().map(|n| n.id.clone()));
+                    Ok(Response::Ok)
+                } else {
+                    Err(format!("no such node: {id}"))
+                }
+            }
             Request::Layout => {
                 for (id, x, y) in crate::layout::layered(&self.canvas) {
                     if let Some(node) = self.canvas.node_mut(&id) {
@@ -1040,6 +1057,17 @@ impl App {
     /// a file box, its path — resolved against the board file's own
     /// directory, since JSON Canvas file paths are vault-relative.
     /// Everything else has nothing to open and says so.
+    /// `[`/`]`/`{`/`}` on a selected box — one dispatch, plus a status
+    /// line saying what just happened, since a z-move with nothing
+    /// overlapping is otherwise invisible.
+    fn reorder_selected(&mut self, to: &str, said: &str) {
+        if let Some(Selected::Node(id)) = self.selected.clone()
+            && self.dispatch(Request::Reorder { id, to: to.to_string() }).is_ok()
+        {
+            self.status = said.to_string();
+        }
+    }
+
     fn open_selected(&mut self) {
         // With RATSLATE_OPENER set, `o` hands content to that command
         // instead of the OS opener — and gains reach: any node's text,
@@ -2163,6 +2191,10 @@ impl App {
                         self.status = "auto-layout — ctrl+z to undo".to_string();
                     }
                 }
+                KeyCode::Char(']') => self.reorder_selected("up", "raised — later boxes draw on top"),
+                KeyCode::Char('[') => self.reorder_selected("down", "lowered — later boxes draw on top"),
+                KeyCode::Char('}') => self.reorder_selected("front", "to the front"),
+                KeyCode::Char('{') => self.reorder_selected("back", "to the back"),
                 KeyCode::Char('o') => self.open_selected(),
                 KeyCode::Char('y') => self.yank_selected(),
                 KeyCode::Char('m') => self.minimap = !self.minimap,
@@ -2258,7 +2290,7 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
     content_lines.max(1) + 2
 }
 
-fn node_fields(node: &Node) -> NodeFields {
+fn node_fields(node: &Node, z: i64) -> NodeFields {
     let (kind, text, subpath) = match &node.kind {
         NodeKind::Text(t) => ("text", t.clone(), None),
         NodeKind::File { path, subpath } => ("file", path.clone(), subpath.clone()),
@@ -2275,6 +2307,7 @@ fn node_fields(node: &Node) -> NodeFields {
         color: node.color.as_ref().map(|c| c.to_string()),
         shape: node.shape.as_str().unwrap_or("rectangle").to_string(),
         kind: kind.to_string(),
+        z,
     }
 }
 

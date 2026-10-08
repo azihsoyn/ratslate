@@ -11,6 +11,15 @@ Obsidian's Canvas uses, so a board can round-trip through Obsidian — negative
 coordinates, groups, file and link cards included, every coordinate saved back
 exactly where the other tool put it.
 
+```sh
+brew install azihsoyn/tap/ratslate   # Homebrew (macOS/Linux)
+cargo install ratslate               # or from crates.io
+ratslate board.canvas                # then: drag empty space to draw a box
+```
+
+Needs a terminal with mouse reporting (most modern ones: iTerm2, kitty,
+Alacritty, WezTerm, GNOME Terminal, Windows Terminal, tmux).
+
 ## What's on a board
 
 - **Boxes** — drag empty canvas to place one, type into it, double-click to

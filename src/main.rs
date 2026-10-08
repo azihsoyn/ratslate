@@ -118,11 +118,20 @@ fn main() -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
+    // Ask the terminal once, up front, what image protocol and font
+    // cell size it has — image file cards render through this. A
+    // terminal that can't draw images (or doesn't answer) leaves it
+    // `None` and those cards fall back to a labeled box.
+    let picker = ratatui_image::picker::Picker::from_query_stdio().ok();
+
     let mut apps: Vec<App> = if paths.is_empty() {
         vec![App::new(None)]
     } else {
         paths.iter().map(|p| App::new(Some(p.clone()))).collect()
     };
+    for app in &mut apps {
+        app.picker = picker.clone();
+    }
     if let Some(canvas) = import_graph
         && let Some(first) = apps.first_mut()
     {

@@ -49,6 +49,14 @@ Alacritty, WezTerm, GNOME Terminal, Windows Terminal, tmux).
   comes along.
 - **Files & links** — JSON Canvas file/link cards: `o` opens them (creating
   the file if it doesn't exist yet), `y` copies the path or URL.
+- **Images** — a file card pointing at an image (`.png`, `.jpg`, `.gif`,
+  `.webp`, `.bmp`) shows the actual picture, scaled to the box and moved or
+  resized with the mouse like anything else — the same image cards an
+  Obsidian canvas has. Needs a terminal with image support (kitty graphics
+  or compatible: kitty, Ghostty, WezTerm, recent iTerm2); elsewhere the card
+  falls back to a labeled box. Drop one on a board with
+  `--api '{"type":"set_file","id":"…","file":"photo.png"}'`, or just open a
+  canvas that already has image cards.
 
 The canvas is an infinite plane: pan with arrow keys or the mouse wheel, and
 the minimap in the corner (toggle `m`) shows where everything is — click or

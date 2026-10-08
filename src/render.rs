@@ -159,6 +159,11 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
     // status for them.
     let mut draw_order: Vec<usize> = (0..app.canvas.nodes.len()).collect();
     draw_order.sort_by_key(|&i| !matches!(app.canvas.nodes[i].kind, NodeKind::Group { .. }));
+    // Taken out of `app` for the loop so an image can be drawn inline,
+    // at its own node's turn in z-order, without the borrow checker
+    // objecting to `app.canvas` and `app.image_cache` at once. Put back
+    // right after.
+    let mut image_cache = std::mem::take(&mut app.image_cache);
     for i in draw_order {
         let node = &app.canvas.nodes[i];
         if hidden_id.as_deref() == Some(node.id.as_str()) {
@@ -194,6 +199,39 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             continue;
         }
 
+        // An image file card: a framed box with the picture drawn
+        // inside it. Only when the terminal can draw images and the
+        // file decodes — otherwise it falls through to the ordinary
+        // file-card box, which now reads "[image] name.png".
+        if let NodeKind::File { path, .. } = &node.kind
+            && crate::app::is_image_path(path)
+            && let Some(picker) = &app.picker
+        {
+            let entry = image_cache.entry(node.id.clone()).or_insert_with(|| (path.clone(), crate::app::build_image_protocol(picker, path)));
+            if entry.0 != *path {
+                *entry = (path.clone(), crate::app::build_image_protocol(picker, path));
+            }
+            if let Some(proto) = &mut entry.1 {
+                let (_, border_style) = node_style(node.color.as_ref(), selected, preview);
+                let block = shaped(Block::bordered().border_style(border_style), node.shape);
+                let inner = block.inner(clipped);
+                frame.render_widget(Clear, clipped);
+                frame.render_widget(block, clipped);
+                app.hits.put(clipped, HitTarget::Move(node.id.clone()));
+                for (corner, rect) in corner_rects(clipped) {
+                    app.hits.put(rect, HitTarget::Resize(node.id.clone(), corner));
+                }
+                // Scale (not Fit): fill the box the user drew, enlarging
+                // a small image too, aspect ratio kept.
+                frame.render_stateful_widget(
+                    ratatui_image::StatefulImage::new().resize(ratatui_image::Resize::Scale(None)),
+                    inner,
+                    proto,
+                );
+                continue;
+            }
+        }
+
         let table_cursor = match &app.mode {
             Mode::EditingCell(id, r, c) if id == &node.id => Some((*r, *c)),
             _ => None,
@@ -209,6 +247,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             draw_node(frame, node, shape, clipped, selected, editing.then_some(app.editing_text.as_str()), preview);
         }
     }
+    app.image_cache = image_cache;
 
     if let Mode::EditingCell(id, _, _) = app.mode.clone()
         && let Some(node) = app.canvas.node(&id)
@@ -790,7 +829,10 @@ fn draw_table_menu(frame: &mut Frame, app: &mut App, id: &str, node_rect: Rect, 
 fn display_text(node: &Node) -> String {
     match &node.kind {
         NodeKind::Text(t) => t.clone(),
-        NodeKind::File { path, .. } => format!("[file] {path}"),
+        NodeKind::File { path, .. } => {
+            let tag = if crate::app::is_image_path(path) { "image" } else { "file" };
+            format!("[{tag}] {path}")
+        }
         NodeKind::Link(url) => format!("[link] {url}"),
         NodeKind::Group { label, .. } => match label {
             Some(l) => format!("[group] {l}"),

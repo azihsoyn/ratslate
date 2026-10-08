@@ -445,6 +445,16 @@ pub struct App {
     /// tool (Obsidian writing the same file) from the saves we make
     /// ourselves, and reload only the former.
     canvas_mtime: Option<SystemTime>,
+    /// The terminal's image capabilities, queried once at startup —
+    /// `None` when the terminal can't draw images (or we're headless),
+    /// in which case image file cards fall back to a labeled box.
+    pub picker: Option<ratatui_image::picker::Picker>,
+    /// Per-node decoded-image render state, keyed by node id. The
+    /// stored path is what it was built from, so a card repointed at a
+    /// different image rebuilds; `None` means that path failed to load
+    /// (missing or not an image), so it falls back to a box without
+    /// retrying every frame.
+    pub image_cache: std::collections::HashMap<ShapeId, (String, Option<ratatui_image::protocol::StatefulProtocol>)>,
     pub editing_text: String,
     /// The whole grid staged for `Mode::EditingCell`, `editing_text`
     /// mirroring whichever one cell is live right now. Empty outside
@@ -582,6 +592,8 @@ impl App {
             mode: Mode::Normal,
             search_hit: 0,
             canvas_mtime: save_path.as_deref().and_then(file_mtime),
+            picker: None,
+            image_cache: std::collections::HashMap::new(),
             editing_text: String::new(),
             editing_table: Vec::new(),
             should_quit: false,
@@ -2477,6 +2489,26 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
 /// the clock the file watcher runs on.
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Whether a path names a raster image ratslate can draw — by
+/// extension, since that's all the file card carries. The same set the
+/// `image` crate's codecs are built for.
+pub fn is_image_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Decodes an image file into a render protocol for this terminal, or
+/// `None` if it can't be read or decoded — the caller then falls back
+/// to a labeled box. Built once per card and cached; the resize to the
+/// box happens later, per frame, inside the widget.
+pub fn build_image_protocol(
+    picker: &ratatui_image::picker::Picker,
+    path: &str,
+) -> Option<ratatui_image::protocol::StatefulProtocol> {
+    let img = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?;
+    Some(picker.new_resize_protocol(img))
 }
 
 /// The text a box is searched by — the same content the box shows, so

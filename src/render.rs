@@ -185,7 +185,13 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         for (corner, rect) in corner_rects(clipped) {
             app.hits.put(rect, HitTarget::Resize(node.id.clone(), corner));
         }
-        let selected = matches!(&app.selected, Some(Selected::Node(id)) if id == &node.id) || app.multi.contains(&node.id);
+        // A box lights up when it's selected, part of the multi-select,
+        // or an endpoint of the selected connector — so selecting an
+        // edge shows at a glance which two boxes it ties together.
+        let related = matches!(&app.selected, Some(Selected::Edge(eid)) if app.canvas.edge(eid).is_some_and(|e| e.from == node.id || e.to == node.id));
+        let selected = related
+            || matches!(&app.selected, Some(Selected::Node(id)) if id == &node.id)
+            || app.multi.contains(&node.id);
         let editing = matches!(&app.mode, Mode::Editing(Selected::Node(id)) if id == &node.id);
         let target = Selected::Node(node.id.clone());
         let preview = app
@@ -1198,14 +1204,20 @@ fn draw_edges(
             Some(p) => p,
             None => color.as_ref().map(ratatui_color),
         };
-        let mut style = shown_color.map(|c| Style::default().fg(c)).unwrap_or_default();
-        if selected {
-            style = Style::default().fg(shown_color.unwrap_or(RColor::Cyan)).add_modifier(Modifier::BOLD);
-        }
         let (edge_from, edge_to) = {
             let e = &app.canvas.edges[i];
             (e.from.clone(), e.to.clone())
         };
+        // A connector lights up cyan when the box it's attached to is
+        // the selected one — so selecting a box picks out everything
+        // wired to it, however many lines cross the board.
+        let related = matches!(&app.selected, Some(Selected::Node(nid)) if &edge_from == nid || &edge_to == nid);
+        let mut style = shown_color.map(|c| Style::default().fg(c)).unwrap_or_default();
+        if selected {
+            style = Style::default().fg(shown_color.unwrap_or(RColor::Cyan)).add_modifier(Modifier::BOLD);
+        } else if related {
+            style = Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD);
+        }
         let waypoints = route(from_rect, to_rect, from_frac[i], to_frac[i], explicit_sides);
         let glyphs: Vec<(i32, i32, char)> = route_glyphs(&waypoints)
             .into_iter()
@@ -1768,4 +1780,79 @@ pub fn to_ascii(app: &mut App) -> String {
     app.camera = saved_camera;
     app.minimap = saved_minimap;
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    //! Selecting a box lights up the connectors wired to it, and
+    //! selecting a connector lights up the two boxes it joins — so a
+    //! board with many crossing lines stays legible. These render to an
+    //! in-memory buffer and read back cell colors, since the highlight
+    //! is a color, not a glyph.
+
+    use super::*;
+    use crate::app::{App, Request, Response, Selected};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    /// Two boxes joined by one edge; returns the app plus the ids so a
+    /// test can select one and inspect the result.
+    fn two_boxes_one_edge() -> (App, String, String, String) {
+        let mut app = App::new(None);
+        let place = |app: &mut App, x, y| match app.dispatch(Request::Place { x, y, w: Some(8), h: Some(3) }).unwrap() {
+            Response::Placed { id } => id,
+            _ => unreachable!(),
+        };
+        let a = place(&mut app, 2, 2);
+        let b = place(&mut app, 24, 2);
+        let e = match app.dispatch(Request::Connect { from: a.clone(), to: b.clone() }).unwrap() {
+            Response::Connected { id } => id,
+            _ => unreachable!(),
+        };
+        (app, a, b, e)
+    }
+
+    fn render_buffer(app: &mut App) -> Buffer {
+        let (w, h) = (40u16, 8u16);
+        app.camera = (0, 0);
+        app.minimap = false;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|frame| render(frame, app, Rect::new(0, 0, w, h), Rect::new(0, 0, 0, 0))).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// Does any cell on the connector line between the two boxes (the
+    /// gap columns 10..24 on the middle row) carry a cyan foreground?
+    fn edge_is_cyan(buf: &Buffer) -> bool {
+        (10u16..24).any(|x| buf[(x, 3)].fg == RColor::Cyan)
+    }
+
+    /// Does the far box's border (around column 24) carry a cyan
+    /// foreground — i.e. is box B highlighted?
+    fn box_b_is_cyan(buf: &Buffer) -> bool {
+        (24u16..32).any(|x| (2u16..5).any(|y| buf[(x, y)].fg == RColor::Cyan))
+    }
+
+    #[test]
+    fn selecting_a_box_highlights_its_edges() {
+        let (mut app, a, _b, _e) = two_boxes_one_edge();
+
+        // Nothing selected: the connector is drawn in the default color.
+        assert!(!edge_is_cyan(&render_buffer(&mut app)), "edge should be plain when nothing is selected");
+
+        // Select box A: the connector wired to it lights up.
+        app.dispatch(Request::Select { id: Some(Selected::Node(a)) }).unwrap();
+        assert!(edge_is_cyan(&render_buffer(&mut app)), "selecting a box should highlight its connector");
+    }
+
+    #[test]
+    fn selecting_an_edge_highlights_its_boxes() {
+        let (mut app, _a, _b, e) = two_boxes_one_edge();
+
+        assert!(!box_b_is_cyan(&render_buffer(&mut app)), "box B should be plain when nothing is selected");
+
+        app.dispatch(Request::Select { id: Some(Selected::Edge(e)) }).unwrap();
+        assert!(box_b_is_cyan(&render_buffer(&mut app)), "selecting a connector should highlight the box at its far end");
+    }
 }

@@ -58,6 +58,10 @@ Alacritty, WezTerm, GNOME Terminal, Windows Terminal, tmux).
   `--api '{"type":"set_file","id":"…","file":"photo.png"}'`, or just open a
   canvas that already has image cards.
 
+Selecting a box lights up every connector wired to it, and selecting a
+connector lights up the two boxes it joins — so a board with many crossing
+lines stays legible: click a thing to see what it's tied to.
+
 The canvas is an infinite plane: pan with arrow keys or the mouse wheel, and
 the minimap in the corner (toggle `m`) shows where everything is — click or
 drag it to jump. Press `/` to search: type to filter boxes by their text and

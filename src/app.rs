@@ -2698,3 +2698,106 @@ fn parse_edge_end(s: &str) -> EdgeEnd {
         _ => EdgeEnd::None,
     }
 }
+
+#[cfg(test)]
+mod design_invariants {
+    //! The design rule these tests guard: every incremental change to
+    //! the board goes through the one `dispatch` path, so the TUI and
+    //! `--api` can never disagree about what an edit means. A new
+    //! feature that mutates the canvas some other way (a CLI flag, a
+    //! key handler reaching into `self.canvas` directly — exactly how
+    //! `import` started) fails CI here instead of quietly forking the
+    //! two paths.
+
+    use super::*;
+
+    /// The `Canvas` methods that make an incremental change to the
+    /// board. Whole-board replacement (`self.canvas = …` in undo/redo,
+    /// import, or a CRDT merge) is a different, auditable category and
+    /// isn't covered by this list.
+    const MUTATORS: &[&str] =
+        &["place_text", "connect", "delete", "delete_edge", "reorder", "duplicate", "edit_text", "node_mut", "edge_mut"];
+
+    /// The byte span of the `dispatch` function body, found by matching
+    /// braces from its opening `{`. The board's edit logic all lives
+    /// here; this is what every mutator call must sit inside.
+    fn dispatch_body_span(src: &str) -> (usize, usize) {
+        let sig = src.find("pub fn dispatch(").expect("dispatch fn exists");
+        let open = sig + src[sig..].find('{').expect("dispatch has a body");
+        let mut depth = 0i32;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (open, open + i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("dispatch body never closed");
+    }
+
+    #[test]
+    fn board_mutations_only_go_through_dispatch() {
+        // This file's own text. The test module sits after `dispatch`,
+        // and builds each needle with `format!` rather than writing it
+        // literally, so the test code can't match itself.
+        let src = include_str!("app.rs");
+        let (start, end) = dispatch_body_span(src);
+        let mut violations = Vec::new();
+        for m in MUTATORS {
+            let needle = format!("self.canvas.{m}(");
+            let mut from = 0;
+            while let Some(rel) = src[from..].find(&needle) {
+                let at = from + rel;
+                if at < start || at > end {
+                    let line = src[..at].bytes().filter(|&b| b == b'\n').count() + 1;
+                    violations.push(format!("{needle} at line {line} is outside dispatch()"));
+                }
+                from = at + needle.len();
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "board mutations must go through a Request in dispatch(), not directly:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn mutating_requests_are_reachable_through_the_json_api() {
+        // Each representative request is parsed from JSON the exact way
+        // `--api` parses it, then dispatched — proving the request is
+        // wired into the single API path, not just the enum. A new
+        // mutating request with no JSON reachability (import's old
+        // sin) is caught by adding its line here.
+        let mut app = App::new(None);
+        let run = |app: &mut App, json: &str| {
+            let req: Request = serde_json::from_str(json).unwrap_or_else(|e| panic!("request JSON doesn't parse ({json}): {e}"));
+            // A domain error (e.g. "no such node") is fine — it proves
+            // the request reached dispatch. Only a parse failure, caught
+            // above, means the API can't name it.
+            let _ = app.dispatch(req);
+        };
+        run(&mut app, r#"{"type":"import","text":"graph LR\n A-->B"}"#);
+        run(&mut app, r#"{"type":"place","x":0,"y":0}"#);
+        let id = match app.dispatch(Request::Place { x: 0, y: 0, w: None, h: None }).unwrap() {
+            Response::Placed { id } => id,
+            _ => unreachable!(),
+        };
+        run(&mut app, &format!(r#"{{"type":"set_text","id":"{id}","text":"hi"}}"#));
+        run(&mut app, &format!(r#"{{"type":"set_color","id":"{id}","color":"3"}}"#));
+        run(&mut app, &format!(r#"{{"type":"set_shape","id":"{id}","shape":"thick"}}"#));
+        run(&mut app, &format!(r#"{{"type":"set_rect","id":"{id}","x":1,"y":1,"w":10,"h":3}}"#));
+        run(&mut app, &format!(r#"{{"type":"reorder","id":"{id}","to":"front"}}"#));
+        run(&mut app, &format!(r#"{{"type":"duplicate","ids":["{id}"]}}"#));
+        run(&mut app, &format!(r#"{{"type":"move_by","ids":["{id}"],"dx":2,"dy":2}}"#));
+        run(&mut app, &format!(r#"{{"type":"delete","id":"{id}"}}"#));
+        run(&mut app, r#"{"type":"layout"}"#);
+        run(&mut app, r#"{"type":"undo"}"#);
+        run(&mut app, r#"{"type":"redo"}"#);
+    }
+}

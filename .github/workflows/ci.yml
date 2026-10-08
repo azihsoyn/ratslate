@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+      # The test suite includes the design-invariant checks in
+      # src/app.rs: every incremental board mutation must go through the
+      # one dispatch() path, and every mutating request must be
+      # reachable through the JSON --api. A feature that forks those two
+      # paths fails here.
+      - name: Test
+        run: cargo test --locked

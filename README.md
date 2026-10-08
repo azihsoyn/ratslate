@@ -55,6 +55,21 @@ layered left-to-right arrangement of whatever's connected to what — so an
 agent can pour in nodes and edges without computing a single coordinate, and a
 hand-drawn board can untangle itself. One undo step.
 
+## Import a graph
+
+```sh
+ratslate board.canvas --import graph.mmd    # a Mermaid flowchart
+ratslate board.canvas --import graph.dot    # or a Graphviz DOT digraph
+cat graph.mmd | ratslate board.canvas --import -
+```
+
+A Mermaid flowchart (`graph TD`, `flowchart LR`, `A -->|label| B`, node
+shapes) or a DOT digraph (`A -> B [label="…"]`) becomes an editable
+board, laid out with the same pass the `l` key runs. So a graph that
+already lives as text — in a doc, a README, an agent's output — opens as
+boxes you can nudge with the mouse, then goes back out as `--render`
+ASCII or a JSON Canvas for Obsidian.
+
 ## Tabs: several boards, one camera
 
 ```sh

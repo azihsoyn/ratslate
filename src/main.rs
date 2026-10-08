@@ -1,5 +1,6 @@
 mod app;
 mod canvas_io;
+mod import;
 mod layout;
 mod collab;
 mod model;
@@ -24,6 +25,7 @@ use schemars::schema_for;
 use serde_json::Value;
 
 use app::App;
+use model::Canvas;
 
 type Backend = CrosstermBackend<io::Stdout>;
 
@@ -40,7 +42,10 @@ fn main() -> io::Result<()> {
                 skip = false;
                 continue;
             }
-            if a == "--api" {
+            if a == "--api" || a == "--import" {
+                // These flags take a value argument — skip it, or an
+                // `--import graph.mmd` would open `graph.mmd` as a
+                // second board tab.
                 skip = true;
             } else if !a.starts_with("--") {
                 ps.push(PathBuf::from(a));
@@ -49,6 +54,41 @@ fn main() -> io::Result<()> {
         ps
     };
     let path = paths.first().cloned();
+
+    // A graph description (Mermaid flowchart or DOT) to turn into the
+    // board, read from a file or `-` for stdin. The parsed, auto-laid
+    // graph becomes the board the TUI opens (or `--render` prints), and
+    // saves to the positional path on exit if one was given.
+    let import_graph: Option<Canvas> = match args.iter().position(|a| a == "--import") {
+        Some(i) => {
+            let Some(src) = args.get(i + 1) else {
+                eprintln!("--import needs a file path (or - for stdin)");
+                std::process::exit(2);
+            };
+            let text = if src == "-" {
+                use std::io::Read;
+                let mut s = String::new();
+                io::stdin().read_to_string(&mut s)?;
+                s
+            } else {
+                match std::fs::read_to_string(src) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("can't read {src}: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            };
+            match import::parse(&text) {
+                Ok(canvas) => Some(canvas),
+                Err(e) => {
+                    eprintln!("import failed: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        None => None,
+    };
 
     if args.iter().any(|a| a == "--schema") {
         print_schema();
@@ -59,6 +99,9 @@ fn main() -> io::Result<()> {
     // wrapped in JSON.
     if args.iter().any(|a| a == "--render") {
         let mut app = App::new(path);
+        if let Some(canvas) = import_graph {
+            app.set_imported(canvas);
+        }
         println!("{}", render::to_ascii(&mut app));
         return Ok(());
     }
@@ -80,6 +123,11 @@ fn main() -> io::Result<()> {
     } else {
         paths.iter().map(|p| App::new(Some(p.clone()))).collect()
     };
+    if let Some(canvas) = import_graph
+        && let Some(first) = apps.first_mut()
+    {
+        first.set_imported(canvas);
+    }
     let result = run_whiteboard(&mut terminal, &mut apps);
     for app in &mut apps {
         if app.save_path.is_some() {

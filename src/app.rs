@@ -589,6 +589,25 @@ impl App {
         }
     }
 
+    /// Replaces the whole board with a freshly imported one (from a
+    /// Mermaid/DOT graph), re-seeding the CRDT and re-centering the
+    /// camera on it. The board is marked so exit saves it, same as any
+    /// other edit — an import that opened a new file should land on
+    /// disk without the user hunting for a save key.
+    pub fn set_imported(&mut self, canvas: Canvas) {
+        self.canvas = canvas;
+        self.selected = None;
+        self.mode = Mode::Normal;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.camera = (
+            self.canvas.nodes.iter().map(|n| n.rect.x).min().unwrap_or(0).min(0),
+            self.canvas.nodes.iter().map(|n| n.rect.y).min().unwrap_or(0).min(0),
+        );
+        self.resync_collab_full();
+        self.status = format!("imported {} boxes", self.canvas.nodes.len());
+    }
+
     /// Merges in any node or edge changes another writer has made —
     /// safe to call unconditionally, since CRDT merges never discard a
     /// local change that hasn't reached disk yet. Skipped only

@@ -110,7 +110,7 @@ fn main() -> io::Result<()> {
             eprintln!("--api needs a JSON argument");
             std::process::exit(2);
         };
-        return run_api(path, json);
+        return run_api(path, import_graph, json);
     }
 
     enable_raw_mode()?;
@@ -281,7 +281,7 @@ fn handle_tab_action(apps: &mut Vec<App>, active: &mut usize, action: app::TabAc
 /// terminal. The exact same `dispatch` the TUI's mouse and key
 /// handlers call — this is not a second implementation of what a move
 /// or an edit means, just another way to name one.
-fn run_api(path: Option<PathBuf>, json: &str) -> io::Result<()> {
+fn run_api(path: Option<PathBuf>, import_graph: Option<Canvas>, json: &str) -> io::Result<()> {
     let value: Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(e) => {
@@ -296,6 +296,9 @@ fn run_api(path: Option<PathBuf>, json: &str) -> io::Result<()> {
     };
 
     let mut app = App::new(path);
+    if let Some(canvas) = import_graph {
+        app.set_imported(canvas);
+    }
     let mut results: Vec<Value> = Vec::with_capacity(items.len());
     for item in items {
         let kind = kind_of(&item);

@@ -48,7 +48,8 @@ Alacritty, WezTerm, GNOME Terminal, Windows Terminal, tmux).
 
 The canvas is an infinite plane: pan with arrow keys or the mouse wheel, and
 the minimap in the corner (toggle `m`) shows where everything is — click or
-drag it to jump.
+drag it to jump. Press `/` to search: type to filter boxes by their text and
+the view jumps to the first match, Enter steps through the rest.
 
 Press `l` (or send `{"type":"layout"}` through `--api`) for auto-layout: a
 layered left-to-right arrangement of whatever's connected to what — so an

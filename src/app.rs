@@ -197,6 +197,10 @@ pub enum Mode {
     /// time — `editing_table` holds the whole staged grid, committed
     /// back to the box's text as one GFM table on Esc.
     EditingCell(ShapeId, usize, usize),
+    /// Incremental search: the string holds the live query. Typing
+    /// refines it and jumps the camera to the first box whose text
+    /// contains it; Enter cycles to the next match; Esc leaves.
+    Search(String),
 }
 
 /// Every way the board can change. The TUI's mouse and key handlers
@@ -427,6 +431,9 @@ pub struct App {
     /// survives the cursor actually reaching what it showed.
     pub hover_cell: Option<(ShapeId, CellAnchor)>,
     pub mode: Mode,
+    /// Which match the search is currently parked on, into the live
+    /// match list — advanced by Enter while `Mode::Search` is open.
+    pub search_hit: usize,
     pub editing_text: String,
     /// The whole grid staged for `Mode::EditingCell`, `editing_text`
     /// mirroring whichever one cell is live right now. Empty outside
@@ -562,6 +569,7 @@ impl App {
             picker_hue: 210.0,
             hover_cell: None,
             mode: Mode::Normal,
+            search_hit: 0,
             editing_text: String::new(),
             editing_table: Vec::new(),
             should_quit: false,
@@ -1261,6 +1269,45 @@ impl App {
         }
     }
 
+    /// Every box whose text contains `query` (case-insensitive), in
+    /// board order — the search match list. Groups are searched by
+    /// label, file/link boxes by their path/url, same as what shows in
+    /// the box.
+    pub fn search_matches(&self, query: &str) -> Vec<ShapeId> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let q = query.to_lowercase();
+        self.canvas
+            .nodes
+            .iter()
+            .filter(|n| node_search_text(n).to_lowercase().contains(&q))
+            .map(|n| n.id.clone())
+            .collect()
+    }
+
+    /// Centers the view on a box and selects it — what a search match
+    /// (and Enter to cycle) lands on.
+    fn center_on_node(&mut self, id: &str) {
+        let Some(node) = self.canvas.node(id) else { return };
+        let (cx, cy) = (node.rect.x + node.rect.width as i32 / 2, node.rect.y + node.rect.height as i32 / 2);
+        self.camera = (cx - self.canvas_area.width as i32 / 2, cy - self.canvas_area.height as i32 / 2);
+        self.selected = Some(Selected::Node(id.to_string()));
+    }
+
+    /// Re-runs the current query and parks on match `self.search_hit`,
+    /// centering and selecting it. Clamps the index so refining a query
+    /// down to fewer matches can't point past the end.
+    fn search_jump(&mut self, query: &str) {
+        let matches = self.search_matches(query);
+        if matches.is_empty() {
+            return;
+        }
+        self.search_hit %= matches.len();
+        let id = matches[self.search_hit].clone();
+        self.center_on_node(&id);
+    }
+
     /// Centers the view on whatever world point this minimap cell
     /// stands for.
     fn minimap_jump(&mut self, mx: u16, my: u16) {
@@ -1345,7 +1392,7 @@ impl App {
                 self.table_undo.clear();
                 let _ = self.dispatch(Request::SetText { id, text });
             }
-            Mode::Normal => return,
+            Mode::Normal | Mode::Search(_) => return,
         }
         self.mode = Mode::Normal;
     }
@@ -2051,6 +2098,31 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Search(query) => match key.code {
+                KeyCode::Esc => self.mode = Mode::Normal,
+                // Enter cycles forward through the matches, wrapping —
+                // the query stays up so you can keep stepping or refine
+                // it further.
+                KeyCode::Enter => {
+                    self.search_hit = self.search_hit.wrapping_add(1);
+                    self.search_jump(&query);
+                }
+                KeyCode::Backspace => {
+                    let mut q = query.clone();
+                    q.pop();
+                    self.search_hit = 0;
+                    self.search_jump(&q);
+                    self.mode = Mode::Search(q);
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let mut q = query.clone();
+                    q.push(c);
+                    self.search_hit = 0;
+                    self.search_jump(&q);
+                    self.mode = Mode::Search(q);
+                }
+                _ => {}
+            },
             Mode::EditingCell(id, row, col) => match key.code {
                 KeyCode::Esc => self.commit_edit(),
                 // Undo within the open grid — steps back through the
@@ -2103,6 +2175,10 @@ impl App {
                     self.redo();
                 }
                 KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('/') => {
+                    self.search_hit = 0;
+                    self.mode = Mode::Search(String::new());
+                }
                 KeyCode::Char('s') => {
                     let _ = self.dispatch(Request::Save);
                 }
@@ -2307,6 +2383,17 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         })
         .sum();
     content_lines.max(1) + 2
+}
+
+/// The text a box is searched by — the same content the box shows, so
+/// a match is something the user can actually see on the board.
+fn node_search_text(node: &Node) -> String {
+    match &node.kind {
+        NodeKind::Text(t) => t.clone(),
+        NodeKind::File { path, .. } => path.clone(),
+        NodeKind::Link(url) => url.clone(),
+        NodeKind::Group { label, .. } => label.clone().unwrap_or_default(),
+    }
 }
 
 fn node_fields(node: &Node, z: i64) -> NodeFields {

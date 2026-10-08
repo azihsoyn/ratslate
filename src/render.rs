@@ -1625,12 +1625,29 @@ fn put_char(frame: &mut Frame, x: i32, y: i32, ch: char, style: Style) {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    // Search owns the whole status line while it's open — the query,
+    // which match of how many, and the keys that move through them.
+    if let Mode::Search(query) = &app.mode {
+        let n = app.search_matches(query).len();
+        let pos = if n == 0 { 0 } else { app.search_hit % n + 1 };
+        let count = if query.is_empty() {
+            "type to search".to_string()
+        } else if n == 0 {
+            "no matches".to_string()
+        } else {
+            format!("{pos}/{n}")
+        };
+        let line = format!("/{query}▏  {count}  —  enter: next · esc: done");
+        frame.render_widget(Paragraph::new(line).style(Style::default().fg(RColor::Cyan)), area);
+        return;
+    }
     let mode = match &app.mode {
         Mode::Normal => "NORMAL",
         Mode::Editing(_) => "EDIT (Esc to leave)",
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
+        Mode::Search(_) => "SEARCH",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · T/tab boards · o open file/link · y copy · g group · [/] z-order ({/} back/front) · l auto-layout · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · / search · T/tab boards · o open file/link · y copy · g group · [/] z-order ({/} back/front) · l auto-layout · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),

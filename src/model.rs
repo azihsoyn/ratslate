@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 pub type ShapeId = String;
 
 /// A box's place on the board, in world coordinates — `i32` position
@@ -366,6 +368,43 @@ impl Canvas {
             }
         }
         true
+    }
+
+    /// Clones the named boxes with fresh ids, shifted by `(dx, dy)`,
+    /// and re-creates any edge whose both ends are in the set so a
+    /// duplicated pair keeps its connector. Returns the new node ids in
+    /// the same order as `ids`, for the caller to select. Copies land
+    /// on top (pushed to the end of `nodes`), the natural z-order for
+    /// something just made.
+    pub fn duplicate(&mut self, ids: &[ShapeId], dx: i32, dy: i32) -> Vec<ShapeId> {
+        let mut map: HashMap<String, String> = HashMap::new();
+        let mut new_ids = Vec::new();
+        for id in ids {
+            let Some(src) = self.node(id) else { continue };
+            let mut copy = src.clone();
+            copy.id = fresh_id();
+            copy.rect.x += dx;
+            copy.rect.y += dy;
+            map.insert(id.clone(), copy.id.clone());
+            new_ids.push(copy.id.clone());
+            self.nodes.push(copy);
+        }
+        // Edges fully inside the copied set come along, repointed at the
+        // copies; an edge with one end outside is left on the original
+        // only — there's no obvious box for the loose end to attach to.
+        let internal: Vec<Edge> = self
+            .edges
+            .iter()
+            .filter(|e| map.contains_key(&e.from) && map.contains_key(&e.to))
+            .cloned()
+            .collect();
+        for mut e in internal {
+            e.id = fresh_id();
+            e.from = map[&e.from].clone();
+            e.to = map[&e.to].clone();
+            self.edges.push(e);
+        }
+        new_ids
     }
 
     pub fn delete(&mut self, id: &str) {

@@ -308,6 +308,10 @@ pub enum Request {
     /// z-order — later is on top, JSON Canvas's own rule — so the
     /// result round-trips through any other reader unchanged.
     Reorder { id: ShapeId, to: String },
+    /// Clone boxes with fresh ids, offset a little so the copies don't
+    /// hide the originals. An edge with both ends in the set comes
+    /// along; one with an end outside stays on the original.
+    Duplicate { ids: Vec<ShapeId> },
     /// Rearrange every box (groups aside) into a layered left-to-right
     /// graph layout — pour in nodes and edges with any coordinates,
     /// then ask for this and get a readable diagram. One undo step.
@@ -392,6 +396,7 @@ impl JsonSchema for Selected {
 pub enum Response {
     Placed { id: ShapeId },
     Connected { id: String },
+    Duplicated { ids: Vec<ShapeId> },
     Ok,
     State { board: FileRoot },
     Rendered { text: String },
@@ -782,7 +787,10 @@ impl App {
         }
         let mut touched: Option<ShapeId> = None;
         let mut touched_edge: Option<String> = None;
-        let mut removed_edges: Vec<String> = Vec::new();
+        // Edges that need a CRDT sync as a set: ones deleted (sync_edge
+        // removes an absent edge) and ones freshly created, e.g. a
+        // duplicate's internal connectors.
+        let mut touched_edges: Vec<String> = Vec::new();
         // Nodes moved alongside the one the request named — a group
         // move carries its members, and each needs its own CRDT sync.
         let mut touched_also: Vec<ShapeId> = Vec::new();
@@ -884,7 +892,7 @@ impl App {
                 Ok(Response::Connected { id })
             }
             Request::Delete { id } => {
-                removed_edges = self
+                touched_edges = self
                     .canvas
                     .edges
                     .iter()
@@ -903,7 +911,7 @@ impl App {
                     self.canvas.node(id).ok_or_else(|| format!("no such node: {id}"))?;
                 }
                 for id in &ids {
-                    removed_edges.extend(
+                    touched_edges.extend(
                         self.canvas
                             .edges
                             .iter()
@@ -915,8 +923,8 @@ impl App {
                         self.selected = None;
                     }
                 }
-                removed_edges.sort();
-                removed_edges.dedup();
+                touched_edges.sort();
+                touched_edges.dedup();
                 touched_also.extend(ids);
                 Ok(Response::Ok)
             }
@@ -983,7 +991,7 @@ impl App {
                 if self.selected == Some(Selected::Edge(id.clone())) {
                     self.selected = None;
                 }
-                removed_edges.push(id);
+                touched_edges.push(id);
                 Ok(Response::Ok)
             }
             Request::Reattach { id, end, node } => {
@@ -1026,6 +1034,20 @@ impl App {
                     Err(format!("no such node: {id}"))
                 }
             }
+            Request::Duplicate { ids } => {
+                let edges_before: std::collections::HashSet<String> = self.canvas.edges.iter().map(|e| e.id.clone()).collect();
+                let new_ids = self.canvas.duplicate(&ids, 2, 2);
+                if new_ids.is_empty() {
+                    return Err("nothing to duplicate".to_string());
+                }
+                touched_also.extend(new_ids.iter().cloned());
+                touched_edges.extend(self.canvas.edges.iter().map(|e| e.id.clone()).filter(|id| !edges_before.contains(id)));
+                // Select the copies so the very next drag moves them,
+                // not the originals they're sitting on top of.
+                self.multi = new_ids.clone();
+                self.selected = new_ids.first().map(|id| Selected::Node(id.clone()));
+                Ok(Response::Duplicated { ids: new_ids })
+            }
             Request::Layout => {
                 for (id, x, y) in crate::layout::layered(&self.canvas) {
                     if let Some(node) = self.canvas.node_mut(&id) {
@@ -1057,7 +1079,7 @@ impl App {
             if let Some(id) = &touched_edge {
                 self.sync_edge(id);
             }
-            for id in &removed_edges {
+            for id in &touched_edges {
                 self.sync_edge(id);
             }
         }
@@ -2178,6 +2200,23 @@ impl App {
                 KeyCode::Char('/') => {
                     self.search_hit = 0;
                     self.mode = Mode::Search(String::new());
+                }
+                // Duplicate the selection — the whole multi-selection
+                // if there is one, otherwise the single selected box.
+                KeyCode::Char('D') => {
+                    let ids: Vec<ShapeId> = if !self.multi.is_empty() {
+                        self.multi.clone()
+                    } else if let Some(Selected::Node(id)) = &self.selected {
+                        vec![id.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    if !ids.is_empty() {
+                        let n = ids.len();
+                        if self.dispatch(Request::Duplicate { ids }).is_ok() {
+                            self.status = format!("duplicated {n} — drag to move the copies");
+                        }
+                    }
                 }
                 KeyCode::Char('s') => {
                     let _ = self.dispatch(Request::Save);

@@ -43,6 +43,10 @@ Alacritty, WezTerm, GNOME Terminal, Windows Terminal, tmux).
   `[`/`]` move a selected box one step back/forward, `{`/`}` all the way;
   the API spells it `reorder`. The order round-trips through Obsidian
   unchanged.
+- **Duplicate** — `D` clones the selection (a single box or a whole
+  multi-selection), copies landing just offset from the originals and
+  already selected to drag away. A connector between two copied boxes
+  comes along.
 - **Files & links** — JSON Canvas file/link cards: `o` opens them (creating
   the file if it doesn't exist yet), `y` copies the path or URL.
 

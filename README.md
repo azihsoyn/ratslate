@@ -130,6 +130,10 @@ a person dragging boxes in the TUI and an agent placing them through `--api`
 merge live, field by field, instead of overwriting each other's saves. The
 `.canvas` file itself stays clean JSON Canvas.
 
+And if the `.canvas` is edited by another tool entirely — Obsidian, or a
+script rewriting the file — ratslate notices and reloads it live, so the
+board on screen keeps up with the file on disk.
+
 ## Install
 
 ```sh

@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -439,6 +440,11 @@ pub struct App {
     /// Which match the search is currently parked on, into the live
     /// match list — advanced by Enter while `Mode::Search` is open.
     pub search_hit: usize,
+    /// The `.canvas` file's modification time as of our own last read
+    /// or write — so the main loop can tell an edit made in another
+    /// tool (Obsidian writing the same file) from the saves we make
+    /// ourselves, and reload only the former.
+    canvas_mtime: Option<SystemTime>,
     pub editing_text: String,
     /// The whole grid staged for `Mode::EditingCell`, `editing_text`
     /// mirroring whichever one cell is live right now. Empty outside
@@ -575,6 +581,7 @@ impl App {
             hover_cell: None,
             mode: Mode::Normal,
             search_hit: 0,
+            canvas_mtime: save_path.as_deref().and_then(file_mtime),
             editing_text: String::new(),
             editing_table: Vec::new(),
             should_quit: false,
@@ -733,9 +740,51 @@ impl App {
             return;
         };
         match canvas_io::save(&self.canvas, &path) {
-            Ok(()) => self.status = format!("saved {}", path.display()),
+            Ok(()) => {
+                // Remember the mtime of our own write, so the file
+                // watcher doesn't mistake it for an external edit and
+                // reload the board out from under the user.
+                self.canvas_mtime = file_mtime(&path);
+                self.status = format!("saved {}", path.display());
+            }
             Err(e) => self.status = format!("save failed: {e}"),
         }
+    }
+
+    /// Reloads the board if the `.canvas` file changed on disk since we
+    /// last read or wrote it — an edit made in Obsidian or any other
+    /// JSON Canvas tool shows up live, without quitting and reopening.
+    /// Skipped mid-gesture or mid-edit so it can't yank the board out
+    /// from under an active drag or keystroke. Returns whether anything
+    /// changed, so the caller can skip redrawing. The file is the source
+    /// of truth here: the CRDT is re-seeded from it, which is why this
+    /// is a file-watcher and the live agent path stays the CRDT.
+    pub fn poll_file_reload(&mut self) -> bool {
+        if self.mode != Mode::Normal || self.drag.moving().is_some() || self.drawing.is_some() {
+            return false;
+        }
+        let Some(path) = self.save_path.clone() else { return false };
+        let on_disk = file_mtime(&path);
+        if on_disk.is_none() || on_disk == self.canvas_mtime {
+            return false;
+        }
+        let Ok(canvas) = canvas_io::load(&path) else { return false };
+        self.canvas = canvas;
+        self.canvas_mtime = on_disk;
+        // Keep the view put — an external edit shouldn't jump the
+        // camera — but drop a selection whose box is now gone.
+        let selection_gone = match &self.selected {
+            Some(Selected::Node(id)) => !self.canvas.nodes.iter().any(|n| &n.id == id),
+            Some(Selected::Edge(id)) => !self.canvas.edges.iter().any(|e| &e.id == id),
+            None => true,
+        };
+        if selection_gone {
+            self.selected = None;
+        }
+        self.multi.clear();
+        self.resync_collab_full();
+        self.status = format!("reloaded — {} changed on disk", path.display());
+        true
     }
 
     fn push_undo(&mut self) {
@@ -2422,6 +2471,12 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         })
         .sum();
     content_lines.max(1) + 2
+}
+
+/// The modification time of a file, or `None` if it can't be stat'd —
+/// the clock the file watcher runs on.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// The text a box is searched by — the same content the box shows, so

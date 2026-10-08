@@ -172,6 +172,7 @@ fn run_whiteboard(terminal: &mut Terminal<Backend>, apps: &mut Vec<App>) -> io::
         app.active_tab = active;
 
         dirty |= app.pull_collab();
+        dirty |= app.poll_file_reload();
 
         if dirty {
             terminal.draw(|frame| {

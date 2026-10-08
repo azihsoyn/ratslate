@@ -25,9 +25,19 @@ use schemars::schema_for;
 use serde_json::Value;
 
 use app::App;
-use model::Canvas;
 
 type Backend = CrosstermBackend<io::Stdout>;
+
+/// Applies an `import` request to a headless `App` (no terminal on the
+/// alternate screen yet), printing the parse error and exiting on
+/// failure — the right behavior for `--import` on the command line,
+/// where there's nothing to fall back to.
+fn apply_import_or_exit(app: &mut App, text: String) {
+    if let Err(e) = app.dispatch(app::Request::Import { text }) {
+        eprintln!("import failed: {e}");
+        std::process::exit(2);
+    }
+}
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -56,10 +66,11 @@ fn main() -> io::Result<()> {
     let path = paths.first().cloned();
 
     // A graph description (Mermaid flowchart or DOT) to turn into the
-    // board, read from a file or `-` for stdin. The parsed, auto-laid
-    // graph becomes the board the TUI opens (or `--render` prints), and
-    // saves to the positional path on exit if one was given.
-    let import_graph: Option<Canvas> = match args.iter().position(|a| a == "--import") {
+    // board, read from a file or `-` for stdin. This is just the text
+    // for an `import` request — the same request reachable through
+    // `--api`; the flag reads the source and dispatches it, so there's
+    // one import path, not two.
+    let import_text: Option<String> = match args.iter().position(|a| a == "--import") {
         Some(i) => {
             let Some(src) = args.get(i + 1) else {
                 eprintln!("--import needs a file path (or - for stdin)");
@@ -79,13 +90,7 @@ fn main() -> io::Result<()> {
                     }
                 }
             };
-            match import::parse(&text) {
-                Ok(canvas) => Some(canvas),
-                Err(e) => {
-                    eprintln!("import failed: {e}");
-                    std::process::exit(2);
-                }
-            }
+            Some(text)
         }
         None => None,
     };
@@ -99,8 +104,8 @@ fn main() -> io::Result<()> {
     // wrapped in JSON.
     if args.iter().any(|a| a == "--render") {
         let mut app = App::new(path);
-        if let Some(canvas) = import_graph {
-            app.set_imported(canvas);
+        if let Some(text) = import_text {
+            apply_import_or_exit(&mut app, text);
         }
         println!("{}", render::to_ascii(&mut app));
         return Ok(());
@@ -110,7 +115,7 @@ fn main() -> io::Result<()> {
             eprintln!("--api needs a JSON argument");
             std::process::exit(2);
         };
-        return run_api(path, import_graph, json);
+        return run_api(path, import_text, json);
     }
 
     enable_raw_mode()?;
@@ -132,10 +137,15 @@ fn main() -> io::Result<()> {
     for app in &mut apps {
         app.picker = picker.clone();
     }
-    if let Some(canvas) = import_graph
+    if let Some(text) = import_text
         && let Some(first) = apps.first_mut()
     {
-        first.set_imported(canvas);
+        // The terminal is already in the alternate screen here, so a
+        // bad import can't just exit — it reports on the status line
+        // and leaves an empty board to work from.
+        if let Err(e) = first.dispatch(app::Request::Import { text }) {
+            first.status = format!("import failed: {e}");
+        }
     }
     let result = run_whiteboard(&mut terminal, &mut apps);
     for app in &mut apps {
@@ -291,7 +301,7 @@ fn handle_tab_action(apps: &mut Vec<App>, active: &mut usize, action: app::TabAc
 /// terminal. The exact same `dispatch` the TUI's mouse and key
 /// handlers call — this is not a second implementation of what a move
 /// or an edit means, just another way to name one.
-fn run_api(path: Option<PathBuf>, import_graph: Option<Canvas>, json: &str) -> io::Result<()> {
+fn run_api(path: Option<PathBuf>, import_text: Option<String>, json: &str) -> io::Result<()> {
     let value: Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(e) => {
@@ -306,8 +316,8 @@ fn run_api(path: Option<PathBuf>, import_graph: Option<Canvas>, json: &str) -> i
     };
 
     let mut app = App::new(path);
-    if let Some(canvas) = import_graph {
-        app.set_imported(canvas);
+    if let Some(text) = import_text {
+        apply_import_or_exit(&mut app, text);
     }
     let mut results: Vec<Value> = Vec::with_capacity(items.len());
     for item in items {

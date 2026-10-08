@@ -83,6 +83,9 @@ already lives as text — in a doc, a README, an agent's output — opens as
 boxes you can nudge with the mouse, then goes back out as `--render`
 ASCII or a JSON Canvas for Obsidian.
 
+The `--import` flag is sugar for one request: an agent can paste a graph
+straight through the API with `--api '{"type":"import","text":"graph TD\n A-->B"}'`.
+
 ## Tabs: several boards, one camera
 
 ```sh

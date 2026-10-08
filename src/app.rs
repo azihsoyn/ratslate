@@ -313,6 +313,12 @@ pub enum Request {
     /// hide the originals. An edge with both ends in the set comes
     /// along; one with an end outside stays on the original.
     Duplicate { ids: Vec<ShapeId> },
+    /// Replace the whole board with a graph parsed from `text` — a
+    /// Mermaid flowchart or a Graphviz DOT digraph — laid out with the
+    /// same pass the `l` key runs. The `--import` CLI flag is just this
+    /// request fed from a file or stdin, so an agent can paste a graph
+    /// through the API the same way. One undo step.
+    Import { text: String },
     /// Rearrange every box (groups aside) into a layered left-to-right
     /// graph layout — pour in nodes and edges with any coordinates,
     /// then ask for this and get a readable diagram. One undo step.
@@ -626,18 +632,20 @@ impl App {
     /// camera on it. The board is marked so exit saves it, same as any
     /// other edit — an import that opened a new file should land on
     /// disk without the user hunting for a save key.
-    pub fn set_imported(&mut self, canvas: Canvas) {
+    /// Replaces the board with an imported canvas, re-seeding the CRDT
+    /// and re-centering the camera. Shared by the `import` request and
+    /// nothing else — undo is the dispatch layer's job, so this doesn't
+    /// touch the undo stack itself.
+    fn load_imported(&mut self, canvas: Canvas) {
         self.canvas = canvas;
         self.selected = None;
+        self.multi.clear();
         self.mode = Mode::Normal;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
         self.camera = (
             self.canvas.nodes.iter().map(|n| n.rect.x).min().unwrap_or(0).min(0),
             self.canvas.nodes.iter().map(|n| n.rect.y).min().unwrap_or(0).min(0),
         );
         self.resync_collab_full();
-        self.status = format!("imported {} boxes", self.canvas.nodes.len());
     }
 
     /// Merges in any node or edge changes another writer has made —
@@ -1108,6 +1116,18 @@ impl App {
                 self.multi = new_ids.clone();
                 self.selected = new_ids.first().map(|id| Selected::Node(id.clone()));
                 Ok(Response::Duplicated { ids: new_ids })
+            }
+            Request::Import { text } => {
+                let canvas = crate::import::parse(&text)?;
+                let n = canvas.nodes.len();
+                // The import replaces every node and edge, so a
+                // per-item CRDT sync wouldn't know what to remove —
+                // `load_imported` does a full resync instead, and the
+                // dispatch-level push_undo already captured the board
+                // this is replacing.
+                self.load_imported(canvas);
+                self.status = format!("imported {n} boxes");
+                Ok(Response::Ok)
             }
             Request::Layout => {
                 for (id, x, y) in crate::layout::layered(&self.canvas) {

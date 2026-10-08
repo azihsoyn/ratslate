@@ -1,35 +1,19 @@
-# draw box 1
-1.0 \x1b[<0;6;4M
-0.15 \x1b[<32;16;6M
-0.15 \x1b[<32;26;8M
-0.1 \x1b[<0;26;8m
-0.6 ratslate
-0.7 \x1b
-0.5 c
-0.5 c
-# draw box 2
-0.8 \x1b[<0;10;16M
-0.15 \x1b[<32;22;18M
-0.15 \x1b[<32;36;21M
-0.1 \x1b[<0;36;21m
-0.5 boxes & arrows
-0.7 \x1b
-# connect box1 -> box2 (shift+drag)
-0.8 \x1b[<4;12;6M
-0.2 \x1b[<36;16;11M
-0.2 \x1b[<36;20;17M
-0.15 \x1b[<4;20;17m
-# edit a table cell (double-click Alice's Age)
-1.0 \x1b[<0;64;6M
-0.05 \x1b[<0;64;6m
-0.15 \x1b[<0;64;6M
-0.05 \x1b[<0;64;6m
-0.4 \x7f\x7f
-0.3 31
-0.6 \t
-0.3 \x7f\x7f\x7f\x7f\x7f
-0.3 Kyoto
-0.7 \x1b
-0.8 \x1b
+# the board opens already laid out from the mermaid graph.
+# 1. drag the "docs" box to a new spot — its connectors follow
+2.0 \x1b[<0;34;7M
+0.2 \x1b[<32;28;10M
+0.2 \x1b[<32;20;13M
+0.15 \x1b[<0;20;13m
+# 2. select "publish" and give it a color (c cycles)
+1.0 \x1b[<0;66;2M
+0.1 \x1b[<0;66;2m
+0.7 c
+0.6 c
+# 3. select "parse" and color it too
+0.9 \x1b[<0;4;2M
+0.1 \x1b[<0;4;2m
+0.6 c
+# linger so the finished board reads before the render
+1.2 \x1b
 # quit (auto-saves)
-1.4 q
+1.2 q

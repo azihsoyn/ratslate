@@ -5,22 +5,22 @@ against a real `ratslate` in a fixed-size pty, then replayed inside
 [vhs](https://github.com/charmbracelet/vhs):
 
 ```sh
-# 1. demo.canvas (the starting board — just the table) is committed here.
-#    Recording QUITS ratslate, which auto-saves it with the demo's edits
-#    (Alice 30->31, Tokyo->Kyoto), so restore it to pristine first:
-git checkout demo.canvas
-rm -f demo.canvas.crdt
-# 2. record: spawns the command in a 97x33 pty, feeds events.txt, captures output
-python3 record.py demo.cast events.txt sh -c 'ratslate demo.canvas && printf "\n\$ ratslate demo.canvas --render\n\n" && ratslate demo.canvas --render && sleep 3'
-# 3. render: vhs replays the cast and writes demo.gif
+# The board is imported from pipeline.mmd (a Mermaid flowchart, committed
+# here), then edited with the mouse. RATSLATE_NO_IMAGES=1 skips the image
+# capability probe — its terminal queries print as garbage in a dumb pty.
+rm -f pipeline.canvas pipeline.canvas.crdt
+# record: spawns the command in a 97x33 pty, feeds events.txt, captures output
+python3 record.py demo.cast events.txt sh -c 'printf "$ ratslate pipeline.canvas --import pipeline.mmd\n"; RATSLATE_NO_IMAGES=1 ratslate pipeline.canvas --import pipeline.mmd; printf "\n$ ratslate pipeline.canvas --render\n\n"; ratslate pipeline.canvas --render; sleep 3'
+# render: vhs replays the cast and writes ../demo.gif
 vhs demo.tape
-# 4. restore the mutated canvas again before committing
-git checkout demo.canvas && rm -f demo.canvas.crdt
+# tidy the files recording left behind (none of these are committed)
+rm -f pipeline.canvas pipeline.canvas.crdt demo.cast
 ```
 
-The table's position in demo.canvas is load-bearing: events.txt
-double-clicks Alice's Age cell by screen coordinate, so moving the
-table breaks the cell-edit part of the demo.
+events.txt drives the mouse by screen coordinate, and the imported graph
+lands at fixed positions (the layout is deterministic and the camera
+opens at the origin), so the drag/colour targets are load-bearing — if
+the layout changes, the coordinates need to follow.
 
 The tape sleeps 1.2s (hidden) after launching so capture starts once
 ratslate has taken the screen — otherwise frame 0 is the shell prompt

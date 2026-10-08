@@ -1,0 +1,7 @@
+flowchart LR
+  A[parse] --> B[check]
+  B --> C[codegen]
+  B --> D[docs]
+  C --> E[run]
+  D --> F[publish]
+  E --> F

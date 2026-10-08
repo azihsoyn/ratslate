@@ -126,8 +126,15 @@ fn main() -> io::Result<()> {
     // Ask the terminal once, up front, what image protocol and font
     // cell size it has — image file cards render through this. A
     // terminal that can't draw images (or doesn't answer) leaves it
-    // `None` and those cards fall back to a labeled box.
-    let picker = ratatui_image::picker::Picker::from_query_stdio().ok();
+    // `None` and those cards fall back to a labeled box. The query is
+    // skippable with RATSLATE_NO_IMAGES=1 — the probe writes escape
+    // sequences and waits for a reply, which a dumb pty (a recording,
+    // CI) echoes as visible garbage and stalls on.
+    let picker = if std::env::var_os("RATSLATE_NO_IMAGES").is_some() {
+        None
+    } else {
+        ratatui_image::picker::Picker::from_query_stdio().ok()
+    };
 
     let mut apps: Vec<App> = if paths.is_empty() {
         vec![App::new(None)]

@@ -435,6 +435,13 @@ pub struct App {
     /// value drawn on the target as a live preview, exactly like
     /// `hover_swatch` does for color.
     pub hover_style: Option<(Selected, String)>,
+    /// Animation frame counter — advanced by the main loop only while
+    /// something on screen is animating, so an idle board costs nothing.
+    pub tick: u64,
+    /// Connector flow: a bright cell travels along every connector
+    /// toward its arrowhead, so direction reads at a glance on a dense
+    /// board. Toggled with `a`; purely a render effect, never saved.
+    pub flow: bool,
     /// The table cell the cursor is over right now, if any — its own
     /// row's and column's candidate anchor points preview while it's
     /// hovered (just those, not every row and column of the table, so
@@ -600,6 +607,8 @@ impl App {
             canvas_mtime: save_path.as_deref().and_then(file_mtime),
             picker: None,
             image_cache: std::collections::HashMap::new(),
+            tick: 0,
+            flow: false,
             editing_text: String::new(),
             editing_table: Vec::new(),
             should_quit: false,
@@ -769,6 +778,12 @@ impl App {
             }
             Err(e) => self.status = format!("save failed: {e}"),
         }
+    }
+
+    /// Whether anything on screen moves on its own right now — the main
+    /// loop redraws on a timer only while this is true.
+    pub fn animating(&self) -> bool {
+        self.flow && !self.canvas.edges.is_empty()
     }
 
     /// Reloads the board if the `.canvas` file changed on disk since we
@@ -2281,6 +2296,10 @@ impl App {
                 KeyCode::Char('/') => {
                     self.search_hit = 0;
                     self.mode = Mode::Search(String::new());
+                }
+                KeyCode::Char('a') => {
+                    self.flow = !self.flow;
+                    self.status = if self.flow { "connector flow on" } else { "connector flow off" }.to_string();
                 }
                 // Duplicate the selection — the whole multi-selection
                 // if there is one, otherwise the single selected box.

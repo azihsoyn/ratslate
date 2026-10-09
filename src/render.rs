@@ -1306,8 +1306,14 @@ fn draw_edges(
             .map(|(x, y, ch)| (x, y, styled_glyph(ch, line_style)))
             .collect();
 
-        for &(x, y, ch) in &glyphs {
-            put_char(frame, x, y, ch, style);
+        // Flow: every fourth cell along the path, counted from the
+        // source, lights up, and the set slides one cell toward the
+        // arrowhead per tick — the line reads as moving that way.
+        let pulse = Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD);
+        let period = 4u64;
+        for (k, &(x, y, ch)) in glyphs.iter().enumerate() {
+            let lit = app.flow && (k as u64 + period - app.tick % period).is_multiple_of(period);
+            put_char(frame, x, y, ch, if lit { pulse } else { style });
             app.edge_hits.put(rect_at(x, y), edge_id.clone());
         }
         // Handles for dragging either end loose and re-pointing it —
@@ -1954,7 +1960,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
         Mode::Search(_) => "SEARCH",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · / search · T/tab boards · o open file/link · y copy · g group · D duplicate · [/] z-order ({/} back/front) · l auto-layout · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · / search · a flow · T/tab boards · o open file/link · y copy · g group · D duplicate · [/] z-order ({/} back/front) · l auto-layout · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),
@@ -2107,5 +2113,46 @@ mod highlight_tests {
 
         app.dispatch(Request::Select { id: Some(Selected::Edge(e)) }).unwrap();
         assert!(box_b_is_cyan(&render_buffer(&mut app)), "selecting a connector should highlight the box at its far end");
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    //! Connector flow: with `a` on, a bright cell travels along each
+    //! connector toward its arrowhead, one cell per tick.
+    use super::*;
+    use crate::app::{App, Request, Response};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn lit_cells(app: &mut App) -> Vec<u16> {
+        app.camera = (0, 0);
+        app.minimap = false;
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| render(f, app, Rect::new(0, 0, 40, 6), Rect::new(0, 0, 0, 0))).unwrap();
+        let buf = term.backend().buffer().clone();
+        // The connector runs along row 3 between the boxes (cols 10..24).
+        (10u16..24).filter(|&x| buf[(x, 3)].fg == RColor::Cyan).collect()
+    }
+
+    #[test]
+    fn flow_pulses_move_toward_the_arrowhead_each_tick() {
+        let mut app = App::new(None);
+        let place = |app: &mut App, x| match app.dispatch(Request::Place { x, y: 2, w: Some(8), h: Some(3) }).unwrap() {
+            Response::Placed { id } => id,
+            _ => unreachable!(),
+        };
+        let a = place(&mut app, 2);
+        let b = place(&mut app, 24);
+        app.dispatch(Request::Connect { from: a, to: b }).unwrap();
+
+        assert!(lit_cells(&mut app).is_empty(), "no pulses while flow is off");
+        app.flow = true;
+        let t0 = lit_cells(&mut app);
+        app.tick += 1;
+        let t1 = lit_cells(&mut app);
+        assert!(!t0.is_empty() && t0.len() == t1.len(), "same number of pulses each tick");
+        // Each pulse advanced one cell toward the target (the box on the right).
+        assert!(t0.iter().zip(&t1).all(|(p0, p1)| *p1 == *p0 + 1), "pulses should move right: {t0:?} -> {t1:?}");
     }
 }

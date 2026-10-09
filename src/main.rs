@@ -212,7 +212,15 @@ fn run_whiteboard(terminal: &mut Terminal<Backend>, apps: &mut Vec<App>) -> io::
             dirty = false;
         }
 
-        if event::poll(Duration::from_millis(100))? {
+        // While something animates, a quiet poll timeout is a frame:
+        // advance the clock and redraw. Otherwise the timeout is just
+        // the idle wait it always was and nothing is drawn.
+        let polled = event::poll(Duration::from_millis(100))?;
+        if !polled && app.animating() {
+            app.tick = app.tick.wrapping_add(1);
+            dirty = true;
+        }
+        if polled {
             // Handle everything arriving within one frame's budget and
             // draw once at the end. A real mouse streams motion at
             // 60–120Hz, one event at a time — draining only what's

@@ -1294,7 +1294,9 @@ fn draw_edges(
         } else if related {
             style = Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD);
         }
-        let waypoints = route(from_rect, to_rect, from_frac[i], to_frac[i], explicit_sides);
+        let others: Vec<WorldRect> =
+            obstacles.iter().filter(|(id, _)| id != &edge_from && id != &edge_to).map(|(_, r)| *r).collect();
+        let waypoints = route_avoiding(from_rect, to_rect, from_frac[i], to_frac[i], explicit_sides, &others);
         let glyphs: Vec<(i32, i32, char)> = route_glyphs(&waypoints)
             .into_iter()
             .filter(|&(x, y, _)| !inside(from_rect, x, y) && !inside(to_rect, x, y))
@@ -1577,6 +1579,143 @@ fn route(from: WorldRect, to: WorldRect, from_frac: f32, to_frac: f32, sides: Op
     // edges, silently paint over the arrowhead.
     let enter_y = if tcy > fcy { ty0 - 1 } else { ty1 };
     vec![(exit_x, exit_y), (enter_x, exit_y), (enter_x, enter_y)]
+}
+
+/// How far past the two boxes' own extent a detour may swing to get
+/// around something — a bound on the search, not a promise.
+const DETOUR_REACH: i32 = 24;
+
+/// Whether every cell a path would draw stays out of every block.
+fn path_clear(path: &[(i32, i32)], blocks: &[WorldRect]) -> bool {
+    path.len() >= 2 && route_glyphs(path).iter().all(|&(x, y, _)| !blocks.iter().any(|r| inside(*r, x, y)))
+}
+
+/// Drops repeated and collinear interior points so a template that
+/// degenerates (a stub landing on the next waypoint, say) still draws
+/// clean corners.
+fn tidy_path(path: Vec<(i32, i32)>) -> Vec<(i32, i32)> {
+    let mut out: Vec<(i32, i32)> = Vec::with_capacity(path.len());
+    for p in path {
+        if out.last() == Some(&p) {
+            continue;
+        }
+        if out.len() >= 2 {
+            let a = out[out.len() - 2];
+            let b = out[out.len() - 1];
+            if (a.0 == b.0 && b.0 == p.0) || (a.1 == b.1 && b.1 == p.1) {
+                out.pop();
+            }
+        }
+        out.push(p);
+    }
+    out
+}
+
+/// One cell further out from `rect` than `p` already is, on whichever
+/// side `p` sits — the stub a connector leaves (or enters) along, so a
+/// detour turns a cell away from the border rather than hugging it.
+fn step_outward(p: (i32, i32), rect: WorldRect) -> (i32, i32) {
+    if p.0 >= rect.right() {
+        (p.0 + 1, p.1)
+    } else if p.0 < rect.x {
+        (p.0 - 1, p.1)
+    } else if p.1 >= rect.bottom() {
+        (p.0, p.1 + 1)
+    } else {
+        (p.0, p.1 - 1)
+    }
+}
+
+/// [`route`], then a search for a way around whatever that path runs
+/// through. The plain route is kept whenever it's clear. Otherwise the
+/// same two attachment points are joined by, in order of preference:
+/// a single bend; a Z whose middle leg is slid between the boxes; and a
+/// Z whose middle leg swings out past them (which is what carries a
+/// connector around an obstacle, or from a box's left side all the way
+/// round to the other box's right side). The first candidate that
+/// touches no box wins; if none does, the plain route stands and the
+/// caller hides its cells under whatever it crosses, as before.
+/// `others` are the boxes to avoid; the two endpoints' own boxes are
+/// always avoided for the middle of the path.
+fn route_avoiding(
+    from: WorldRect,
+    to: WorldRect,
+    from_frac: f32,
+    to_frac: f32,
+    sides: Option<(Side, Side)>,
+    others: &[WorldRect],
+) -> Vec<(i32, i32)> {
+    let base = route(from, to, from_frac, to_frac, sides);
+    // The endpoints' own boxes count too: a side forced to face away
+    // from the other box (left side to right side, say) makes the plain
+    // route run straight through both, and that has to be rejected
+    // just like running through a bystander.
+    let mut blocks: Vec<WorldRect> = others.to_vec();
+    blocks.push(from);
+    blocks.push(to);
+    if base.len() < 2 || path_clear(&base, &blocks) {
+        return base;
+    }
+
+    let e = base[0];
+    let n = base[base.len() - 1];
+    let e2 = step_outward(e, from);
+    let n2 = step_outward(n, to);
+    let wrap = |mid: Vec<(i32, i32)>| -> Vec<(i32, i32)> {
+        let mut p = vec![e, e2];
+        p.extend(mid);
+        p.push(n2);
+        p.push(n);
+        tidy_path(p)
+    };
+    let try_path = |p: Vec<(i32, i32)>| -> Option<Vec<(i32, i32)>> { path_clear(&p, &blocks).then_some(p) };
+
+    // One bend, either order.
+    for mid in [vec![(n2.0, e2.1)], vec![(e2.0, n2.1)]] {
+        if let Some(p) = try_path(wrap(mid)) {
+            return p;
+        }
+    }
+
+    // A Z: vertical middle leg at some column, or horizontal at some
+    // row. Between the boxes first, spreading out from the midpoint;
+    // then past them, nearest first.
+    let (lo_x, hi_x) = (e2.0.min(n2.0), e2.0.max(n2.0));
+    let (lo_y, hi_y) = (e2.1.min(n2.1), e2.1.max(n2.1));
+    let (box_lo_x, box_hi_x) = (from.x.min(to.x) - 1, from.right().max(to.right()));
+    let (box_lo_y, box_hi_y) = (from.y.min(to.y) - 1, from.bottom().max(to.bottom()));
+    let scan = |lo: i32, hi: i32| -> Vec<i32> {
+        let mid = (lo + hi) / 2;
+        let mut v = vec![mid];
+        for d in 1..=(hi - lo).max(0) {
+            if mid + d <= hi {
+                v.push(mid + d);
+            }
+            if mid - d >= lo {
+                v.push(mid - d);
+            }
+        }
+        v
+    };
+    let beyond = |lo: i32, hi: i32| -> Vec<i32> {
+        let mut v = Vec::new();
+        for d in 1..=DETOUR_REACH {
+            v.push(hi + d);
+            v.push(lo - d);
+        }
+        v
+    };
+    for m in scan(lo_x, hi_x).into_iter().chain(beyond(box_lo_x, box_hi_x)) {
+        if let Some(p) = try_path(wrap(vec![(m, e2.1), (m, n2.1)])) {
+            return p;
+        }
+    }
+    for m in scan(lo_y, hi_y).into_iter().chain(beyond(box_lo_y, box_hi_y)) {
+        if let Some(p) = try_path(wrap(vec![(e2.0, m), (n2.0, m)])) {
+            return p;
+        }
+    }
+    base
 }
 
 /// Walks a waypoint path (each leg strictly horizontal or vertical) and

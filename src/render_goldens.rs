@@ -102,3 +102,80 @@ fn bidirectional_pair_offset_boxes_still_two_rows() {
                               └──────┘
 "#);
 }
+
+#[test]
+fn routes_around_a_box_in_the_way() {
+    let mut app = board(&[(2, 5, 8, 3, "A"), (22, 5, 10, 3, "mid"), (44, 5, 8, 3, "B")], &[(0, 2)]);
+    assert_render(&mut app, r#"
+  ┌──────┐            ┌────────┐            ┌──────┐
+  │A     │─┐          │mid     │          ┌>│B     │
+  └──────┘ │          └────────┘          │ └──────┘
+           │                              │
+           └──────────────────────────────┘
+"#);
+}
+
+#[test]
+fn fan_out_keeps_the_straight_edge_in_the_middle_and_detours_the_rest() {
+    let mut app = board(
+        &[(2, 8, 10, 3, "hub"), (30, 1, 10, 3, "a"), (30, 8, 10, 3, "b"), (30, 15, 10, 3, "c")],
+        &[(0, 1), (0, 2), (0, 3)],
+    );
+    assert_render(&mut app, r#"
+                              ┌────────┐
+                              │a       │
+                              └────────┘
+                                   ^
+             ┌─────────────────────┘
+             │
+             │
+  ┌────────┐─┘                ┌────────┐
+  │hub     │─────────────────>│b       │
+  └────────┘─┐                └────────┘
+             │
+             │
+             └─────────────────────┐
+                                   v
+                              ┌────────┐
+                              │c       │
+                              └────────┘
+"#);
+}
+
+#[test]
+fn fan_in_spreads_across_the_target_and_avoids_siblings() {
+    let mut app = board(
+        &[(2, 1, 8, 3, "s1"), (20, 1, 8, 3, "s2"), (38, 1, 8, 3, "s3"), (14, 12, 24, 3, "target")],
+        &[(0, 3), (1, 3), (2, 3)],
+    );
+    assert_render(&mut app, r#"
+  ┌──────┐          ┌──────┐          ┌──────┐
+  │s1    │─┐        │s2    │   ┌──────│s3    │
+  └──────┘ │        └──────┘   │      └──────┘
+           │            │      │
+           │            │      │
+           │            │      │
+           │            │      │
+           │            │      │
+           │            │      │
+           └────────┐   │      │
+                    v   v      v
+              ┌──────────────────────┐
+              │target                │
+              └──────────────────────┘
+"#);
+}
+
+#[test]
+fn forced_left_to_right_sides_wrap_around_the_outside() {
+    let mut app = board(&[(20, 2, 8, 3, "A"), (40, 2, 8, 3, "B")], &[(0, 1)]);
+    let edge_id = app.canvas.edges[0].id.clone();
+    app.dispatch(Request::SetEdgeSides { id: edge_id, from_side: Some("left".into()), to_side: Some("right".into()) }).unwrap();
+    assert_render(&mut app, r#"
+  ┌──────┐            ┌──────┐
+┌─│A     │            │B     │<┐
+│ └──────┘            └──────┘ │
+│                              │
+└──────────────────────────────┘
+"#);
+}

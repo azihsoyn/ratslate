@@ -5,6 +5,8 @@ mod layout;
 mod collab;
 mod model;
 mod render;
+#[cfg(test)]
+mod render_goldens;
 mod table;
 
 use std::io;

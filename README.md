@@ -150,6 +150,15 @@ And if the `.canvas` is edited by another tool entirely — Obsidian, or a
 script rewriting the file — ratslate notices and reloads it live, so the
 board on screen keeps up with the file on disk.
 
+A few things move so the board reads at a glance. Press `a` and a pulse
+travels along every connector toward its arrowhead, so direction is
+obvious even on a dense board. An agent can mark the box it's on with
+`set_status` — `running` puts a spinner in the box's top border, `ok` a
+check, `failed` a cross. And a box another writer just changed flashes
+for a moment, so you see what the agent did and where. None of this
+costs anything while nothing is moving: the screen only redraws on a
+timer while something animates.
+
 ## Install
 
 ```sh

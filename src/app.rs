@@ -257,9 +257,10 @@ pub enum Request {
     SetColor { id: ShapeId, color: Option<String> },
     /// "rectangle" (the default) or "rounded".
     SetShape { id: ShapeId, shape: String },
-    /// A badge on the box's top border: "running" (a spinner), "ok" or
-    /// "failed", or `null` to clear it — how an agent working a board
-    /// shows which box it's on and how it went.
+    /// A badge on the box's top border: "pending" (not started),
+    /// "running" (a spinner), "ok", "failed", "skipped", or `null` to
+    /// clear it — how an agent working a board shows which box it's on
+    /// and how it went.
     SetStatus { id: ShapeId, status: Option<String> },
     /// Draw an arrow from one box to another.
     Connect { from: ShapeId, to: ShapeId },
@@ -995,7 +996,7 @@ impl App {
             Request::SetStatus { id, status } => {
                 let parsed = match status.as_deref() {
                     None => None,
-                    Some(s) => Some(NodeStatus::parse(s).ok_or_else(|| format!("unknown status: {s} — use running, ok, failed or null"))?),
+                    Some(s) => Some(NodeStatus::parse(s).ok_or_else(|| format!("unknown status: {s} — use pending, running, ok, failed, skipped or null"))?),
                 };
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
                 node.status = parsed;

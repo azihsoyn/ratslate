@@ -200,26 +200,34 @@ pub enum NodeKind {
 /// `ratslateStatus` extension field other readers ignore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
+    /// Queued, waiting on something else — not started.
+    Pending,
     Running,
     Ok,
     Failed,
+    /// Deliberately not run (skipped, cancelled).
+    Skipped,
 }
 
 impl NodeStatus {
     pub fn parse(s: &str) -> Option<NodeStatus> {
         match s {
+            "pending" => Some(NodeStatus::Pending),
             "running" => Some(NodeStatus::Running),
             "ok" => Some(NodeStatus::Ok),
             "failed" => Some(NodeStatus::Failed),
+            "skipped" => Some(NodeStatus::Skipped),
             _ => None,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
+            NodeStatus::Pending => "pending",
             NodeStatus::Running => "running",
             NodeStatus::Ok => "ok",
             NodeStatus::Failed => "failed",
+            NodeStatus::Skipped => "skipped",
         }
     }
 }

@@ -540,9 +540,11 @@ struct Chrome {
 fn status_badge(status: Option<NodeStatus>, tick: u64) -> Option<Span<'static>> {
     const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let (text, color) = match status? {
+        NodeStatus::Pending => ("○", RColor::DarkGray),
         NodeStatus::Running => (SPINNER[(tick % SPINNER.len() as u64) as usize], RColor::Cyan),
         NodeStatus::Ok => ("✓", RColor::Green),
         NodeStatus::Failed => ("✗", RColor::Red),
+        NodeStatus::Skipped => ("⊘", RColor::DarkGray),
     };
     Some(Span::styled(format!(" {text} "), Style::default().fg(color).add_modifier(Modifier::BOLD)))
 }
@@ -1276,7 +1278,17 @@ fn draw_edges(
         .filter_map(|n| Some((n.id.clone(), rect_of(&n.id)?)))
         .collect();
 
-    for i in 0..app.canvas.edges.len() {
+    // Cells connectors drawn so far occupy, so a later one can keep off
+    // their lines (a crossing is fine, running alongside is not).
+    let mut taken: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+    // Later connectors route around earlier ones, so the order has to
+    // be the same however the edges happen to be stored (a CRDT merge
+    // reorders them): by where they start and end on the board.
+    let mut order: Vec<usize> = (0..app.canvas.edges.len()).collect();
+    order.sort_by_key(|&i| {
+        rects[i].map(|(f, t)| (f.y, f.x, t.y, t.x, sides[i].map(|(a, b)| (a as u8, b as u8)))).unwrap_or((i32::MAX, 0, 0, 0, None))
+    });
+    for i in order {
         let (color, to_end, from_end, label, edge_id, explicit_sides, has_from_anchor, has_to_anchor, line_style, arrow_style) = {
             let edge = &app.canvas.edges[i];
             (
@@ -1342,7 +1354,7 @@ fn draw_edges(
         }
         let others: Vec<WorldRect> =
             obstacles.iter().filter(|(id, _)| id != &edge_from && id != &edge_to).map(|(_, r)| *r).collect();
-        let waypoints = route_avoiding(from_rect, to_rect, from_frac[i], to_frac[i], explicit_sides, &others);
+        let waypoints = route_avoiding(from_rect, to_rect, from_frac[i], to_frac[i], explicit_sides, &others, &taken);
         let glyphs: Vec<(i32, i32, char)> = route_glyphs(&waypoints)
             .into_iter()
             .filter(|&(x, y, _)| !inside(from_rect, x, y) && !inside(to_rect, x, y))
@@ -1359,8 +1371,13 @@ fn draw_edges(
         let period = 4u64;
         for (k, &(x, y, ch)) in glyphs.iter().enumerate() {
             let lit = app.flow && (k as u64 + period - app.tick % period).is_multiple_of(period);
+            // Where this line crosses one already drawn, a junction
+            // glyph instead of painting over it — two lines that cross
+            // should still read as two lines.
+            let ch = if taken.contains(&(x, y)) { crossing_glyph(frame, x, y, ch) } else { ch };
             put_char(frame, x, y, ch, if lit { pulse } else { style });
             app.edge_hits.put(rect_at(x, y), edge_id.clone());
+            taken.insert((x, y));
         }
         // Handles for dragging either end loose and re-pointing it —
         // registered after the plain path cells so they win the hit
@@ -1431,6 +1448,63 @@ fn draw_edges(
         }
     }
     selected_edge_ui
+}
+
+/// The arms a plain box-drawing glyph has, as bits: up 1, down 2,
+/// left 4, right 8. `None` for anything that isn't a plain line glyph.
+fn line_arms(c: char) -> Option<u8> {
+    Some(match c {
+        '─' => 4 | 8,
+        '│' => 1 | 2,
+        '┌' => 2 | 8,
+        '┐' => 2 | 4,
+        '└' => 1 | 8,
+        '┘' => 1 | 4,
+        '├' => 1 | 2 | 8,
+        '┤' => 1 | 2 | 4,
+        '┬' => 2 | 4 | 8,
+        '┴' => 1 | 4 | 8,
+        '┼' => 1 | 2 | 4 | 8,
+        _ => return None,
+    })
+}
+
+fn arms_glyph(arms: u8) -> char {
+    match arms {
+        0b1100 => '─',
+        0b0011 => '│',
+        0b1010 => '┌',
+        0b0110 => '┐',
+        0b1001 => '└',
+        0b0101 => '┘',
+        0b1011 => '├',
+        0b0111 => '┤',
+        0b1110 => '┬',
+        0b1101 => '┴',
+        0b1111 => '┼',
+        // One arm only (shouldn't happen for a drawn glyph): draw the run it belongs to.
+        0b0001 | 0b0010 => '│',
+        _ => '─',
+    }
+}
+
+/// `ch` merged with whatever line glyph is already on screen at (x, y),
+/// so two connectors sharing a cell read as two lines meeting rather
+/// than one painting over the other: a run across a run is `┼`, a
+/// corner onto a run is a `├`/`┬`-style junction. Only the plain glyph
+/// family merges; a styled line (thick, double, dashed) or an arrowhead
+/// just keeps `ch`.
+fn crossing_glyph(frame: &mut Frame, x: i32, y: i32, ch: char) -> char {
+    let r = rect_at(x, y);
+    if r.is_empty() {
+        return ch;
+    }
+    let Some(cell) = frame.buffer_mut().cell((r.x, r.y)) else { return ch };
+    let there = cell.symbol().chars().next().unwrap_or(' ');
+    match (line_arms(ch), line_arms(there)) {
+        (Some(a), Some(b)) => arms_glyph(a | b),
+        _ => ch,
+    }
 }
 
 fn rect_at(x: i32, y: i32) -> Rect {
@@ -1696,6 +1770,7 @@ fn route_avoiding(
     to_frac: f32,
     sides: Option<(Side, Side)>,
     others: &[WorldRect],
+    taken: &std::collections::HashSet<(i32, i32)>,
 ) -> Vec<(i32, i32)> {
     let base = route(from, to, from_frac, to_frac, sides);
     // The endpoints' own boxes count too: a side forced to face away
@@ -1705,7 +1780,20 @@ fn route_avoiding(
     let mut blocks: Vec<WorldRect> = others.to_vec();
     blocks.push(from);
     blocks.push(to);
-    if base.len() < 2 || path_clear(&base, &blocks) {
+    // A leg running right along a bystander's border reads as part of
+    // the box, so cells in the one-cell ring around other boxes count
+    // against a candidate — not a veto (sometimes that ring is the only
+    // way through), just a cost, like running along another connector.
+    let rings: Vec<WorldRect> =
+        others.iter().map(|r| WorldRect::new(r.x - 1, r.y - 1, r.width.saturating_add(2), r.height.saturating_add(2))).collect();
+    // How many of a path's cells (ends excluded) another connector is
+    // already drawn on. A crossing costs one cell and is fine; running
+    // along someone else's line costs many and reads as one line.
+    let overlap = |p: &[(i32, i32)]| -> usize {
+        let g = route_glyphs(p);
+        g.iter().skip(1).take(g.len().saturating_sub(2)).filter(|&&(x, y, _)| taken.contains(&(x, y))).count()
+    };
+    if base.len() < 2 || (path_clear(&base, &blocks) && overlap(&base) <= 1) {
         return base;
     }
 
@@ -1713,27 +1801,57 @@ fn route_avoiding(
     let n = base[base.len() - 1];
     let e2 = step_outward(e, from);
     let n2 = step_outward(n, to);
-    let wrap = |mid: Vec<(i32, i32)>| -> Vec<(i32, i32)> {
-        let mut p = vec![e, e2];
+    // Candidates in order of preference; the first that touches no box
+    // and shares at most a crossing with earlier connectors wins. If
+    // none is that clean, the cleanest box-clear one does; if nothing
+    // clears the boxes, the plain route stands and the caller hides its
+    // cells under whatever it crosses, as before.
+    let mut best: Option<(usize, Vec<(i32, i32)>)> = if path_clear(&base, &blocks) { Some((overlap(&base), base.clone())) } else { None };
+    // How many interior cells (the stubs at either end excluded — a
+    // box right next to another is entered through its ring) sit in a
+    // bystander's ring.
+    let hugging = |p: &[(i32, i32)]| -> usize {
+        let g = route_glyphs(p);
+        let n = g.len();
+        g.iter().enumerate().filter(|&(k, &(x, y, _))| k >= 2 && k + 2 < n && rings.iter().any(|r| inside(*r, x, y))).count()
+    };
+    let mut consider = |p: Vec<(i32, i32)>| -> Option<Vec<(i32, i32)>> {
+        if p.len() < 2 || !path_clear(&p, &blocks) {
+            return None;
+        }
+        let cost = overlap(&p) + hugging(&p);
+        if cost <= 1 {
+            return Some(p);
+        }
+        if best.as_ref().is_none_or(|(bo, _)| cost < *bo) {
+            best = Some((cost, p));
+        }
+        None
+    };
+    // Every shape runs between the two stubs, so the line leaves and
+    // arrives square to its box — that's what keeps the arrowhead on
+    // the entry axis.
+    let ends = [(e2, n2)];
+    let wrap = |a: (i32, i32), b: (i32, i32), mid: Vec<(i32, i32)>| -> Vec<(i32, i32)> {
+        let mut p = vec![e, a];
         p.extend(mid);
-        p.push(n2);
+        p.push(b);
         p.push(n);
         tidy_path(p)
     };
-    let try_path = |p: Vec<(i32, i32)>| -> Option<Vec<(i32, i32)>> { path_clear(&p, &blocks).then_some(p) };
 
     // One bend, either order.
-    for mid in [vec![(n2.0, e2.1)], vec![(e2.0, n2.1)]] {
-        if let Some(p) = try_path(wrap(mid)) {
-            return p;
+    for (a, b) in ends {
+        for mid in [vec![(b.0, a.1)], vec![(a.0, b.1)]] {
+            if let Some(p) = consider(wrap(a, b, mid)) {
+                return p;
+            }
         }
     }
 
     // A Z: vertical middle leg at some column, or horizontal at some
     // row. Between the boxes first, spreading out from the midpoint;
     // then past them, nearest first.
-    let (lo_x, hi_x) = (e2.0.min(n2.0), e2.0.max(n2.0));
-    let (lo_y, hi_y) = (e2.1.min(n2.1), e2.1.max(n2.1));
     let (box_lo_x, box_hi_x) = (from.x.min(to.x) - 1, from.right().max(to.right()));
     let (box_lo_y, box_hi_y) = (from.y.min(to.y) - 1, from.bottom().max(to.bottom()));
     let scan = |lo: i32, hi: i32| -> Vec<i32> {
@@ -1757,17 +1875,23 @@ fn route_avoiding(
         }
         v
     };
-    for m in scan(lo_x, hi_x).into_iter().chain(beyond(box_lo_x, box_hi_x)) {
-        if let Some(p) = try_path(wrap(vec![(m, e2.1), (m, n2.1)])) {
-            return p;
+    for (a, b) in ends {
+        let (lo_x, hi_x) = (a.0.min(b.0), a.0.max(b.0));
+        for m in scan(lo_x, hi_x).into_iter().chain(beyond(box_lo_x, box_hi_x)) {
+            if let Some(p) = consider(wrap(a, b, vec![(m, a.1), (m, b.1)])) {
+                return p;
+            }
         }
     }
-    for m in scan(lo_y, hi_y).into_iter().chain(beyond(box_lo_y, box_hi_y)) {
-        if let Some(p) = try_path(wrap(vec![(e2.0, m), (n2.0, m)])) {
-            return p;
+    for (a, b) in ends {
+        let (lo_y, hi_y) = (a.1.min(b.1), a.1.max(b.1));
+        for m in scan(lo_y, hi_y).into_iter().chain(beyond(box_lo_y, box_hi_y)) {
+            if let Some(p) = consider(wrap(a, b, vec![(a.0, m), (b.0, m)])) {
+                return p;
+            }
         }
     }
-    base
+    best.map(|(_, p)| p).unwrap_or(base)
 }
 
 /// Walks a waypoint path (each leg strictly horizontal or vertical) and

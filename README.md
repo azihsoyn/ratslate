@@ -131,6 +131,13 @@ A JSON array runs as a batch, applied in order, replied to in order.
 Nothing is written to disk until a `save` request says so — `--api` is
 safe to use for a read-only `state` query.
 
+## Examples
+
+`examples/gh-actions-board.py` draws a GitHub Actions run as a live board:
+jobs as boxes, `needs:` as connectors, each job's status as its badge,
+updated as the run goes. It's nothing but a loop over `ratslate --api`,
+which is the point — see [examples/README.md](examples/README.md).
+
 ## Boards as launchers
 
 Set `RATSLATE_OPENER` to any command and `o` hands it what's selected —

@@ -146,14 +146,26 @@ def job_yaml_id(job_name, yaml_ids):
 
 
 def box_text(job, with_steps):
+    """A job's box: its name and running time, or with --steps a table
+    headed by the name with one row per step and the step's own badge."""
     name = job["name"]
     if not with_steps:
         d = duration(job)
         return f"{name}\n{d}" if d else name
-    rows = ["| step | |", "| --- | --- |"]
+    rows = [f"| {name} | |", "| --- | --- |"]
     for s in job.get("steps", []):
-        rows.append(f"| {s['name'][:28]} | {GLYPH[status_of(s)]} |")
+        rows.append(f"| {s['name'][:30]} | {GLYPH[status_of(s)]} |")
     return "\n".join(rows)
+
+
+def box_size(job, with_steps):
+    """Wide enough for the longest line, tall enough for every row —
+    tables don't auto-grow from the API, only from the keyboard."""
+    if not with_steps:
+        return 30, 4
+    steps = job.get("steps", [])
+    widest = max([len(job["name"])] + [len(s["name"][:30]) for s in steps])
+    return min(widest + 10, 48), len(steps) + 4
 
 
 def main():
@@ -200,7 +212,7 @@ def main():
         # First sight of a job: a box for it.
         new = [j for j in jobs if j["name"] not in book["boxes"]]
         if new:
-            res = api(args.canvas, [{"type": "place", "x": 0, "y": 0, "w": 30, "h": 4} for _ in new])
+            res = api(args.canvas, [{"type": "place", "x": 0, "y": 0, "w": box_size(j, args.steps)[0], "h": box_size(j, args.steps)[1]} for j in new])
             for j, r in zip(new, res):
                 book["boxes"][j["name"]] = r["result"]["id"]
             # Connectors from `needs`, matrix instances included on both ends.

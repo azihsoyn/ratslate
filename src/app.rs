@@ -13,6 +13,9 @@ use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineSty
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
+/// How many animation ticks (~100ms each) a merged change stays lit.
+const FLASH_TICKS: u64 = 8;
+
 const UNDO_LIMIT: usize = 100;
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 /// How far one pan keypress or wheel tick moves the view — terminal
@@ -446,6 +449,10 @@ pub struct App {
     /// toward its arrowhead, so direction reads at a glance on a dense
     /// board. Toggled with `a`; purely a render effect, never saved.
     pub flow: bool,
+    /// Boxes another writer just changed, each with the tick its
+    /// highlight ends — a merged edit flashes for a moment so a person
+    /// watching the board notices what an agent did, and where.
+    pub flash: std::collections::HashMap<ShapeId, u64>,
     /// The table cell the cursor is over right now, if any — its own
     /// row's and column's candidate anchor points preview while it's
     /// hovered (just those, not every row and column of the table, so
@@ -613,6 +620,7 @@ impl App {
             image_cache: std::collections::HashMap::new(),
             tick: 0,
             flow: false,
+            flash: std::collections::HashMap::new(),
             editing_text: String::new(),
             editing_table: Vec::new(),
             should_quit: false,
@@ -679,6 +687,16 @@ impl App {
         let nodes = collab.snapshot();
         let edges = collab.snapshot_edges();
         self.push_undo();
+        // What each box looked like before the merge, so the ones the
+        // other writer touched (or added) can be flashed.
+        let before: std::collections::HashMap<ShapeId, NodeFields> =
+            self.canvas.nodes.iter().enumerate().map(|(i, n)| (n.id.clone(), node_fields(n, i as i64))).collect();
+        let flash_until = self.tick + FLASH_TICKS;
+        for (id, f) in &nodes {
+            if before.get(id) != Some(f) {
+                self.flash.insert(id.clone(), flash_until);
+            }
+        }
         self.canvas.nodes = nodes.into_iter().map(|(id, f)| node_from_fields(id, f)).collect();
         self.canvas.edges = edges.into_iter().map(|(id, f)| edge_from_fields(id, f)).collect();
         let selection_gone = match &self.selected {
@@ -787,7 +805,15 @@ impl App {
     /// Whether anything on screen moves on its own right now — the main
     /// loop redraws on a timer only while this is true.
     pub fn animating(&self) -> bool {
-        (self.flow && !self.canvas.edges.is_empty()) || self.canvas.nodes.iter().any(|n| n.status == Some(NodeStatus::Running))
+        (self.flow && !self.canvas.edges.is_empty())
+            || !self.flash.is_empty()
+            || self.canvas.nodes.iter().any(|n| n.status == Some(NodeStatus::Running))
+    }
+
+    /// Drops flashes whose time is up. Called at the top of a frame.
+    pub fn expire_flashes(&mut self) {
+        let now = self.tick;
+        self.flash.retain(|_, until| *until > now);
     }
 
     /// Reloads the board if the `.canvas` file changed on disk since we
@@ -2835,5 +2861,47 @@ mod design_invariants {
         run(&mut app, r#"{"type":"layout"}"#);
         run(&mut app, r#"{"type":"undo"}"#);
         run(&mut app, r#"{"type":"redo"}"#);
+    }
+}
+
+#[cfg(test)]
+mod flash_tests {
+    //! A change merged from another writer flashes the box it touched.
+    use super::*;
+
+    #[test]
+    fn merged_change_from_another_writer_flashes_that_box() {
+        let dir = std::env::temp_dir().join(format!("ratslate-flash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("board.canvas");
+
+        // Writer 1 opens the board and places two boxes.
+        let mut a = App::new(Some(path.clone()));
+        let ids: Vec<ShapeId> = (0..2)
+            .map(|i| match a.dispatch(Request::Place { x: i * 20, y: 0, w: None, h: None }).unwrap() {
+                Response::Placed { id } => id,
+                _ => unreachable!(),
+            })
+            .collect();
+        a.pull_collab();
+        assert!(a.flash.is_empty(), "nothing to flash yet");
+
+        // Writer 2 (an agent through --api, say) retexts one of them.
+        let mut b = App::new(Some(path.clone()));
+        b.dispatch(Request::SetText { id: ids[0].clone(), text: "touched by an agent".into() }).unwrap();
+
+        // Writer 1 merges it: exactly that box flashes, and the clock runs.
+        assert!(a.pull_collab(), "the change should merge");
+        assert!(a.flash.contains_key(&ids[0]), "the changed box flashes");
+        assert!(!a.flash.contains_key(&ids[1]), "an untouched box doesn't");
+        assert!(a.animating());
+
+        // It stops once its time is up.
+        a.tick += FLASH_TICKS;
+        a.expire_flashes();
+        assert!(a.flash.is_empty());
+        assert!(!a.animating());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

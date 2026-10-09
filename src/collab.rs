@@ -33,7 +33,7 @@ fn random_client_id() -> u64 {
     std::process::id() as u64
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeFields {
     pub x: i64,
     pub y: i64,

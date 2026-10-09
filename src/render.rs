@@ -49,6 +49,7 @@ fn fully_visible(rect: WorldRect, area: Rect) -> bool {
 
 pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: Rect) {
     app.sync_table_cache();
+    app.expire_flashes();
     app.hits.clear();
     app.edge_hits.clear();
     app.canvas_area = canvas_area;
@@ -242,7 +243,11 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             Mode::EditingCell(id, r, c) if id == &node.id => Some((*r, *c)),
             _ => None,
         };
-        let chrome = Chrome { shape: preview_shape(app, &node.id).unwrap_or(node.shape), badge: status_badge(node.status, app.tick) };
+        let chrome = Chrome {
+            shape: preview_shape(app, &node.id).unwrap_or(node.shape),
+            badge: status_badge(node.status, app.tick),
+            flashing: app.flash.contains_key(&node.id),
+        };
         if table_cursor.is_some() {
             let view = TableView { node, chrome, rect: clipped, selected, table: &app.editing_table, cursor: table_cursor, editing_text: &app.editing_text, preview };
             draw_table_node(frame, view, &mut app.hits);
@@ -466,11 +471,20 @@ fn draw_minimap(frame: &mut Frame, app: &mut App, overrides: &std::collections::
 /// guess. `Some(None)` previews clearing the color; `None` (outer)
 /// means nothing's hovered, so the node's own color shows as normal.
 fn node_style(color: Option<&Color>, selected: bool, preview: Option<Option<RColor>>) -> (Style, Style) {
+    node_style_with(color, selected, preview, false)
+}
+
+/// `node_style`, with the flash another writer's change gets: a bold
+/// yellow border for a moment, distinct from selection's cyan.
+fn node_style_with(color: Option<&Color>, selected: bool, preview: Option<Option<RColor>>, flashing: bool) -> (Style, Style) {
     let shown = match preview {
         Some(p) => p,
         None => color.map(ratatui_color),
     };
     let base = shown.map(|c| Style::default().fg(c)).unwrap_or_default();
+    if flashing {
+        return (base, Style::default().fg(RColor::Yellow).add_modifier(Modifier::BOLD));
+    }
     // Bold-on-whatever-color-it-already-has is easy to miss, especially
     // on a node with no color set at all — selection stays bold and
     // falls back to its own fixed color only when the node has none,
@@ -517,6 +531,8 @@ fn preview_shape(app: &App, id: &str) -> Option<Shape> {
 struct Chrome {
     shape: Shape,
     badge: Option<Span<'static>>,
+    /// Another writer just changed this box.
+    flashing: bool,
 }
 
 /// The glyph for a status, as a styled span — a spinner for running,
@@ -554,7 +570,7 @@ fn shaped(block: Block<'_>, shape: Shape) -> Block<'_> {
 /// the camera — the node's own `rect` is world coordinates and never
 /// drawn from directly.
 fn draw_node(frame: &mut Frame, node: &Node, chrome: Chrome, rect: Rect, selected: bool, editing: Option<&str>, preview: Option<Option<RColor>>) {
-    let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
+    let (base, border_style) = node_style_with(node.color.as_ref(), selected, preview, chrome.flashing);
 
     // A box is opaque: whatever sits under it in the z-order stops
     // here, instead of bleeding through the interior cells the border
@@ -627,7 +643,7 @@ struct TableView<'a> {
 fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget>) {
     let TableView { node, chrome, rect, selected, table, cursor, editing_text, preview } = view;
     let shape = chrome.shape;
-    let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
+    let (base, border_style) = node_style_with(node.color.as_ref(), selected, preview, chrome.flashing);
 
     frame.render_widget(Clear, rect);
     let block = dressed(Block::bordered().border_style(border_style), &chrome);

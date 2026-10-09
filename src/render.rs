@@ -9,7 +9,7 @@ use ratatui::{
 use ratatui_dnd::Hits;
 
 use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected, TableOp, cell_anchor_for};
-use crate::model::{ArrowStyle, CellAnchor, Color, EdgeEnd, LineStyle, Node, NodeKind, Shape, Side, WorldRect};
+use crate::model::{ArrowStyle, CellAnchor, Color, EdgeEnd, LineStyle, Node, NodeKind, NodeStatus, Shape, Side, WorldRect};
 use crate::table::Table;
 
 /// World rect → screen space through the camera. Same `WorldRect` type
@@ -242,15 +242,15 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
             Mode::EditingCell(id, r, c) if id == &node.id => Some((*r, *c)),
             _ => None,
         };
-        let shape = preview_shape(app, &node.id).unwrap_or(node.shape);
+        let chrome = Chrome { shape: preview_shape(app, &node.id).unwrap_or(node.shape), badge: status_badge(node.status, app.tick) };
         if table_cursor.is_some() {
-            let view = TableView { node, shape, rect: clipped, selected, table: &app.editing_table, cursor: table_cursor, editing_text: &app.editing_text, preview };
+            let view = TableView { node, chrome, rect: clipped, selected, table: &app.editing_table, cursor: table_cursor, editing_text: &app.editing_text, preview };
             draw_table_node(frame, view, &mut app.hits);
         } else if let Some(table) = app.table_cache.get(&node.id).and_then(|(_, t)| t.clone()) {
-            let view = TableView { node, shape, rect: clipped, selected, table: &table, cursor: None, editing_text: "", preview };
+            let view = TableView { node, chrome, rect: clipped, selected, table: &table, cursor: None, editing_text: "", preview };
             draw_table_node(frame, view, &mut app.hits);
         } else {
-            draw_node(frame, node, shape, clipped, selected, editing.then_some(app.editing_text.as_str()), preview);
+            draw_node(frame, node, chrome, clipped, selected, editing.then_some(app.editing_text.as_str()), preview);
         }
     }
     app.image_cache = image_cache;
@@ -511,6 +511,35 @@ fn preview_shape(app: &App, id: &str) -> Option<Shape> {
     }
 }
 
+/// What dresses a box's frame beyond its content: the border shape
+/// (possibly a hovered swatch's preview) and the status badge on the
+/// top border, if any. Resolved by the caller, which has the app.
+struct Chrome {
+    shape: Shape,
+    badge: Option<Span<'static>>,
+}
+
+/// The glyph for a status, as a styled span — a spinner for running,
+/// advanced by `tick`, so an agent's box visibly works while it does.
+fn status_badge(status: Option<NodeStatus>, tick: u64) -> Option<Span<'static>> {
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let (text, color) = match status? {
+        NodeStatus::Running => (SPINNER[(tick % SPINNER.len() as u64) as usize], RColor::Cyan),
+        NodeStatus::Ok => ("✓", RColor::Green),
+        NodeStatus::Failed => ("✗", RColor::Red),
+    };
+    Some(Span::styled(format!(" {text} "), Style::default().fg(color).add_modifier(Modifier::BOLD)))
+}
+
+/// `shaped`, plus the status badge set into the top border at the right.
+fn dressed<'a>(block: Block<'a>, chrome: &Chrome) -> Block<'a> {
+    let block = shaped(block, chrome.shape);
+    match &chrome.badge {
+        Some(b) => block.title_top(Line::from(b.clone()).right_aligned()),
+        None => block,
+    }
+}
+
 fn shaped(block: Block<'_>, shape: Shape) -> Block<'_> {
     match shape {
         Shape::Rectangle => block,
@@ -524,14 +553,14 @@ fn shaped(block: Block<'_>, shape: Shape) -> Block<'_> {
 /// `rect` is the node's place on screen, already translated through
 /// the camera — the node's own `rect` is world coordinates and never
 /// drawn from directly.
-fn draw_node(frame: &mut Frame, node: &Node, shape: Shape, rect: Rect, selected: bool, editing: Option<&str>, preview: Option<Option<RColor>>) {
+fn draw_node(frame: &mut Frame, node: &Node, chrome: Chrome, rect: Rect, selected: bool, editing: Option<&str>, preview: Option<Option<RColor>>) {
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
     // A box is opaque: whatever sits under it in the z-order stops
     // here, instead of bleeding through the interior cells the border
     // and text don't happen to touch.
     frame.render_widget(Clear, rect);
-    let block = shaped(Block::bordered().border_style(border_style), shape);
+    let block = dressed(Block::bordered().border_style(border_style), &chrome);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -578,9 +607,9 @@ fn draw_group_node(frame: &mut Frame, node: &Node, rect: Rect, selected: bool, e
 /// `hits` stays a separate parameter since it's mutated, not read.
 struct TableView<'a> {
     node: &'a Node,
-    /// The node's own shape, or the one a hovered style swatch is
-    /// proposing — resolved by the caller.
-    shape: Shape,
+    /// Border shape (own or a hovered swatch's preview) and status
+    /// badge — resolved by the caller.
+    chrome: Chrome,
     /// The node's place on screen, already translated through the
     /// camera and known to be fully visible.
     rect: Rect,
@@ -596,11 +625,12 @@ struct TableView<'a> {
 /// one open in `Mode::EditingCell`, is the live cell — shown reversed,
 /// with `editing_text` (not the table's own stale copy) as its content.
 fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget>) {
-    let TableView { node, shape, rect, selected, table, cursor, editing_text, preview } = view;
+    let TableView { node, chrome, rect, selected, table, cursor, editing_text, preview } = view;
+    let shape = chrome.shape;
     let (base, border_style) = node_style(node.color.as_ref(), selected, preview);
 
     frame.render_widget(Clear, rect);
-    let block = shaped(Block::bordered().border_style(border_style), shape);
+    let block = dressed(Block::bordered().border_style(border_style), &chrome);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -2154,5 +2184,46 @@ mod flow_tests {
         assert!(!t0.is_empty() && t0.len() == t1.len(), "same number of pulses each tick");
         // Each pulse advanced one cell toward the target (the box on the right).
         assert!(t0.iter().zip(&t1).all(|(p0, p1)| *p1 == *p0 + 1), "pulses should move right: {t0:?} -> {t1:?}");
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    //! Status badges sit in a box's top border: a spinner that advances
+    //! with the tick while running, a check when ok, a cross when failed.
+    use super::*;
+    use crate::app::{App, Request, Response};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn top_border(app: &mut App) -> String {
+        app.camera = (0, 0);
+        app.minimap = false;
+        let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
+        term.draw(|f| render(f, app, Rect::new(0, 0, 30, 5), Rect::new(0, 0, 0, 0))).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0u16..30).map(|x| buf[(x, 1)].symbol().to_string()).collect()
+    }
+
+    #[test]
+    fn running_spinner_advances_and_ok_shows_a_check() {
+        let mut app = App::new(None);
+        let id = match app.dispatch(Request::Place { x: 1, y: 1, w: Some(14), h: Some(3) }).unwrap() {
+            Response::Placed { id } => id,
+            _ => unreachable!(),
+        };
+        app.dispatch(Request::SetStatus { id: id.clone(), status: Some("running".into()) }).unwrap();
+        assert!(app.animating(), "a running box keeps the clock ticking");
+        let t0 = top_border(&mut app);
+        app.tick += 1;
+        let t1 = top_border(&mut app);
+        assert!(t0.contains('⠋') && t1.contains('⠙'), "spinner should advance: {t0:?} -> {t1:?}");
+
+        app.dispatch(Request::SetStatus { id: id.clone(), status: Some("ok".into()) }).unwrap();
+        assert!(!app.animating());
+        assert!(top_border(&mut app).contains('✓'));
+
+        app.dispatch(Request::SetStatus { id, status: None }).unwrap();
+        assert!(!top_border(&mut app).contains('✓'), "clearing removes the badge");
     }
 }

@@ -7,7 +7,7 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, Shape, Side, WorldRect};
+use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, NodeStatus, Shape, Side, WorldRect};
 
 /// A board, in the shape https://jsoncanvas.org/spec/1.0/ describes on
 /// disk — also what `Request::State` hands back over `--api`.
@@ -35,6 +35,8 @@ pub enum FileNode {
         /// sees an unknown field and renders a normal text node.
         #[serde(skip_serializing_if = "Option::is_none")]
         shape: Option<String>,
+        #[serde(rename = "ratslateStatus", skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
         text: String,
     },
     File {
@@ -48,6 +50,8 @@ pub enum FileNode {
         file: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         subpath: Option<String>,
+        #[serde(rename = "ratslateStatus", skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     Link {
         id: String,
@@ -58,6 +62,8 @@ pub enum FileNode {
         #[serde(skip_serializing_if = "Option::is_none")]
         color: Option<String>,
         url: String,
+        #[serde(rename = "ratslateStatus", skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     Group {
         id: String,
@@ -165,7 +171,7 @@ fn from_file(root: FileRoot) -> Canvas {
     let mut canvas = Canvas::default();
 
     for fnode in root.nodes {
-        let (id, x, y, w, h, color, shape, kind) = match fnode {
+        let (id, x, y, w, h, color, shape, status, kind) = match fnode {
             FileNode::Text {
                 id,
                 x,
@@ -174,8 +180,9 @@ fn from_file(root: FileRoot) -> Canvas {
                 height,
                 color,
                 shape,
+                status,
                 text,
-            } => (id, x, y, width, height, color, shape, NodeKind::Text(text)),
+            } => (id, x, y, width, height, color, shape, status, NodeKind::Text(text)),
             FileNode::File {
                 id,
                 x,
@@ -185,6 +192,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 color,
                 file,
                 subpath,
+                status,
             } => (
                 id,
                 x,
@@ -193,6 +201,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 height,
                 color,
                 None,
+                status,
                 NodeKind::File { path: file, subpath },
             ),
             FileNode::Link {
@@ -203,7 +212,8 @@ fn from_file(root: FileRoot) -> Canvas {
                 height,
                 color,
                 url,
-            } => (id, x, y, width, height, color, None, NodeKind::Link(url)),
+                status,
+            } => (id, x, y, width, height, color, None, status, NodeKind::Link(url)),
             FileNode::Group {
                 id,
                 x,
@@ -222,6 +232,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 height,
                 color,
                 None,
+                None,
                 NodeKind::Group {
                     label,
                     background,
@@ -238,6 +249,7 @@ fn from_file(root: FileRoot) -> Canvas {
             id,
             rect,
             shape: shape.as_deref().map(Shape::parse).unwrap_or_default(),
+            status: status.as_deref().and_then(NodeStatus::parse),
             color: color.as_deref().map(Color::parse),
             kind,
         });
@@ -293,6 +305,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
                     height,
                     color,
                     shape: n.shape.as_str().map(str::to_string),
+                    status: n.status.map(|s| s.as_str().to_string()),
                     text: text.clone(),
                 },
                 NodeKind::File { path, subpath } => FileNode::File {
@@ -304,6 +317,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
                     color,
                     file: path.clone(),
                     subpath: subpath.clone(),
+                    status: n.status.map(|s| s.as_str().to_string()),
                 },
                 NodeKind::Link(url) => FileNode::Link {
                     id: n.id.clone(),
@@ -313,6 +327,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
                     height,
                     color,
                     url: url.clone(),
+                    status: n.status.map(|s| s.as_str().to_string()),
                 },
                 NodeKind::Group {
                     label,

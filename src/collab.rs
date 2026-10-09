@@ -48,6 +48,8 @@ pub struct NodeFields {
     pub subpath: Option<String>,
     pub color: Option<String>,
     pub shape: String,
+    /// "running" | "ok" | "failed", or none.
+    pub status: Option<String>,
     /// "text" | "file" | "link" | "group".
     pub kind: String,
     /// The node's position in the canvas's `nodes` array — its
@@ -138,7 +140,7 @@ impl Collab {
             Some(sp) => Any::String(Arc::from(sp.as_str())),
             None => Any::Null,
         };
-        let entry: [(Arc<str>, In); 10] = [
+        let entry: [(Arc<str>, In); 11] = [
             (Arc::from("x"), In::Any(Any::BigInt(f.x))),
             (Arc::from("y"), In::Any(Any::BigInt(f.y))),
             (Arc::from("w"), In::Any(Any::BigInt(f.w))),
@@ -149,6 +151,13 @@ impl Collab {
             (Arc::from("shape"), In::Any(Any::String(Arc::from(f.shape.as_str())))),
             (Arc::from("kind"), In::Any(Any::String(Arc::from(f.kind.as_str())))),
             (Arc::from("z"), In::Any(Any::BigInt(f.z))),
+            (
+                Arc::from("status"),
+                In::Any(match &f.status {
+                    Some(st) => Any::String(Arc::from(st.as_str())),
+                    None => Any::Null,
+                }),
+            ),
         ];
         {
             let mut txn = self.doc.transact_mut();
@@ -198,6 +207,10 @@ impl Collab {
                     },
                     color,
                     shape: get_str("shape"),
+                    status: match fields.get("status") {
+                        Some(Any::String(st)) => Some(st.to_string()),
+                        _ => None,
+                    },
                     kind: get_str("kind"),
                     z: get_i64("z"),
                 },

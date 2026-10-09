@@ -124,6 +124,7 @@ ratslate board.canvas --schema     # what a request/response looks like
 ratslate board.canvas --api '{"type":"place","x":2,"y":2}'
 ratslate board.canvas --api '[{"type":"set_text","id":"n1a2b3c4d","text":"hello"},{"type":"save"}]'
 ratslate board.canvas --api '{"type":"render"}'   # the ASCII render, as JSON
+ratslate board.canvas --api '{"type":"set_status","id":"n1a2b3c4d","status":"running"}'   # ⠋ on the box; "ok" ✓, "failed" ✗, null clears
 ```
 
 A JSON array runs as a batch, applied in order, replied to in order.

@@ -195,12 +195,42 @@ pub enum NodeKind {
     },
 }
 
+/// A badge on a box's top border — what an agent driving the board
+/// sets to say "I'm on this one" / "done" / "broke". Carried as a
+/// `ratslateStatus` extension field other readers ignore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeStatus {
+    Running,
+    Ok,
+    Failed,
+}
+
+impl NodeStatus {
+    pub fn parse(s: &str) -> Option<NodeStatus> {
+        match s {
+            "running" => Some(NodeStatus::Running),
+            "ok" => Some(NodeStatus::Ok),
+            "failed" => Some(NodeStatus::Failed),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeStatus::Running => "running",
+            NodeStatus::Ok => "ok",
+            NodeStatus::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: ShapeId,
     pub rect: WorldRect,
     pub color: Option<Color>,
     pub shape: Shape,
+    pub status: Option<NodeStatus>,
     pub kind: NodeKind,
 }
 
@@ -306,6 +336,7 @@ impl Canvas {
             rect: WorldRect::new(x, y, w.unwrap_or(16), h.unwrap_or(3)),
             color: None,
             shape: Shape::default(),
+            status: None,
             kind: NodeKind::Text(String::new()),
         });
         id

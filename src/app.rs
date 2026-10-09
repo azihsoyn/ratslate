@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
 use crate::collab::{Collab, EdgeFields, NodeFields};
-use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, Shape, ShapeId, Side, WorldRect, ZMove};
+use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, NodeStatus, Shape, ShapeId, Side, WorldRect, ZMove};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
@@ -254,6 +254,10 @@ pub enum Request {
     SetColor { id: ShapeId, color: Option<String> },
     /// "rectangle" (the default) or "rounded".
     SetShape { id: ShapeId, shape: String },
+    /// A badge on the box's top border: "running" (a spinner), "ok" or
+    /// "failed", or `null` to clear it — how an agent working a board
+    /// shows which box it's on and how it went.
+    SetStatus { id: ShapeId, status: Option<String> },
     /// Draw an arrow from one box to another.
     Connect { from: ShapeId, to: ShapeId },
     /// Remove a box and any connectors touching it.
@@ -783,7 +787,7 @@ impl App {
     /// Whether anything on screen moves on its own right now — the main
     /// loop redraws on a timer only while this is true.
     pub fn animating(&self) -> bool {
-        self.flow && !self.canvas.edges.is_empty()
+        (self.flow && !self.canvas.edges.is_empty()) || self.canvas.nodes.iter().any(|n| n.status == Some(NodeStatus::Running))
     }
 
     /// Reloads the board if the `.canvas` file changed on disk since we
@@ -959,6 +963,16 @@ impl App {
             Request::SetColor { id, color } => {
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
                 node.color = color.as_deref().map(Color::parse);
+                touched = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetStatus { id, status } => {
+                let parsed = match status.as_deref() {
+                    None => None,
+                    Some(s) => Some(NodeStatus::parse(s).ok_or_else(|| format!("unknown status: {s} — use running, ok, failed or null"))?),
+                };
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                node.status = parsed;
                 touched = Some(id);
                 Ok(Response::Ok)
             }
@@ -2577,6 +2591,7 @@ fn node_fields(node: &Node, z: i64) -> NodeFields {
         subpath,
         color: node.color.as_ref().map(|c| c.to_string()),
         shape: node.shape.as_str().unwrap_or("rectangle").to_string(),
+        status: node.status.map(|s| s.as_str().to_string()),
         kind: kind.to_string(),
         z,
     }
@@ -2599,6 +2614,7 @@ fn node_from_fields(id: String, f: NodeFields) -> Node {
         ),
         color: f.color.as_deref().map(Color::parse),
         shape: Shape::parse(&f.shape),
+        status: f.status.as_deref().and_then(NodeStatus::parse),
         kind,
     }
 }
@@ -2810,6 +2826,7 @@ mod design_invariants {
         run(&mut app, &format!(r#"{{"type":"set_text","id":"{id}","text":"hi"}}"#));
         run(&mut app, &format!(r#"{{"type":"set_color","id":"{id}","color":"3"}}"#));
         run(&mut app, &format!(r#"{{"type":"set_shape","id":"{id}","shape":"thick"}}"#));
+        run(&mut app, &format!(r#"{{"type":"set_status","id":"{id}","status":"running"}}"#));
         run(&mut app, &format!(r#"{{"type":"set_rect","id":"{id}","x":1,"y":1,"w":10,"h":3}}"#));
         run(&mut app, &format!(r#"{{"type":"reorder","id":"{id}","to":"front"}}"#));
         run(&mut app, &format!(r#"{{"type":"duplicate","ids":["{id}"]}}"#));

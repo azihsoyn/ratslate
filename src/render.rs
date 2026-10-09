@@ -1063,24 +1063,100 @@ fn draw_edges(
 
     let mut from_frac = vec![0.5f32; app.canvas.edges.len()];
     let mut to_frac = vec![0.5f32; app.canvas.edges.len()];
-    let mut from_groups: std::collections::HashMap<(String, Side), Vec<usize>> = std::collections::HashMap::new();
-    let mut to_groups: std::collections::HashMap<(String, Side), Vec<usize>> = std::collections::HashMap::new();
+    // Every connector touching a (box, side), whichever direction it
+    // runs — an arriving edge shares the side with a leaving one, and
+    // A→B and B→A used to land on the same row because each was the
+    // only *leaving* edge on its side. Grouping both ends together, in
+    // an order both boxes agree on, gives each a slot of its own.
+    let mut slots: std::collections::HashMap<(String, Side), Vec<usize>> = std::collections::HashMap::new();
     for (i, edge) in app.canvas.edges.iter().enumerate() {
         if let Some((fs, ts)) = sides[i] {
-            from_groups.entry((edge.from.clone(), fs)).or_default().push(i);
-            to_groups.entry((edge.to.clone(), ts)).or_default().push(i);
+            slots.entry((edge.from.clone(), fs)).or_default().push(i);
+            if edge.to != edge.from || ts != fs {
+                slots.entry((edge.to.clone(), ts)).or_default().push(i);
+            }
         }
     }
-    for idxs in from_groups.into_values() {
-        let n = idxs.len();
-        for (k, i) in idxs.into_iter().enumerate() {
-            from_frac[i] = (k + 1) as f32 / (n + 1) as f32;
+    for ((box_id, side), mut idxs) in slots {
+        let Some(rect) = rect_of(&box_id) else { continue };
+        // Connectors that run straight across to the other box take
+        // the middle cells; ones that bend away take the outer ones —
+        // an arrowhead that arrives straight should land mid-side, not
+        // beside a corner. Among those, the one whose far box sits
+        // higher (or further left, on a top/bottom side) gets the
+        // earlier slot, so connectors to different boxes don't cross
+        // each other on the way out; ties go to the older connector.
+        // Nothing here depends on an id, so the picture is the same
+        // every run.
+        idxs.sort_by_cached_key(|&i| {
+            let e = &app.canvas.edges[i];
+            let other_id = if e.from == box_id { e.to.clone() } else { e.from.clone() };
+            let (bends, along) = match (rect_of(&other_id), side) {
+                (Some(o), Side::Left | Side::Right) => (!(rect.y.max(o.y) < rect.bottom().min(o.bottom())), center(o).1),
+                (Some(o), Side::Top | Side::Bottom) => (!(rect.x.max(o.x) < rect.right().min(o.right())), center(o).0),
+                (None, _) => (true, 0),
+            };
+            (bends, along, i)
+        });
+        let len = match side {
+            Side::Left | Side::Right => rect.height,
+            Side::Top | Side::Bottom => rect.width,
+        } as i32;
+        let positions = center_first(spread_slots(idxs.len(), len), len);
+        for (k, &i) in idxs.iter().enumerate() {
+            let frac = if len > 1 { positions[k] as f32 / (len - 1) as f32 } else { 0.5 };
+            let e = &app.canvas.edges[i];
+            if e.from == box_id && sides[i].map(|(fs, _)| fs) == Some(side) {
+                from_frac[i] = frac;
+            }
+            if e.to == box_id && sides[i].map(|(_, ts)| ts) == Some(side) {
+                to_frac[i] = frac;
+            }
         }
     }
-    for idxs in to_groups.into_values() {
-        let n = idxs.len();
-        for (k, i) in idxs.into_iter().enumerate() {
-            to_frac[i] = (k + 1) as f32 / (n + 1) as f32;
+
+    // Two or more straight connectors between the same two boxes (A→B
+    // and B→A, or a duplicate) run through one shared overlap, and the
+    // per-side slots above can't see that: a slot on A and a slot on B
+    // are counted from different corners, so with the boxes a row apart
+    // they still landed on the same row. These get their rows handed
+    // out inside the overlap itself, written back as the `from` box's
+    // own fraction so `route` reproduces the exact row.
+    let mut pairs: std::collections::HashMap<(String, String), Vec<usize>> = std::collections::HashMap::new();
+    for (i, edge) in app.canvas.edges.iter().enumerate() {
+        if edge.from_side.is_some() && edge.to_side.is_some() || edge.from_anchor.is_some() || edge.to_anchor.is_some() {
+            continue;
+        }
+        let Some((f, t)) = rects[i] else { continue };
+        let straight = f.y.max(t.y) < f.bottom().min(t.bottom()) || f.x.max(t.x) < f.right().min(t.right());
+        if !straight || edge.from == edge.to {
+            continue;
+        }
+        let key = if edge.from <= edge.to { (edge.from.clone(), edge.to.clone()) } else { (edge.to.clone(), edge.from.clone()) };
+        pairs.entry(key).or_default().push(i);
+    }
+    for ((a_id, b_id), mut idxs) in pairs {
+        if idxs.len() < 2 {
+            continue;
+        }
+        // Creation order, so the picture doesn't depend on random ids.
+        idxs.sort();
+        let (Some(a), Some(b)) = (rect_of(&a_id), rect_of(&b_id)) else { continue };
+        let (lo, hi, vertical_axis) = if a.y.max(b.y) < a.bottom().min(b.bottom()) {
+            (a.y.max(b.y), a.bottom().min(b.bottom()), true)
+        } else {
+            (a.x.max(b.x), a.right().min(b.right()), false)
+        };
+        let len = hi - lo;
+        let positions = center_first(spread_slots(idxs.len(), len), len);
+        for (k, &i) in idxs.iter().enumerate() {
+            let Some((f, _)) = rects[i] else { continue };
+            let cell = lo + positions[k];
+            from_frac[i] = if vertical_axis {
+                (cell - f.y) as f32 / (f.height as i32 - 1).max(1) as f32
+            } else {
+                (cell - f.x) as f32 / (f.width as i32 - 1).max(1) as f32
+            };
         }
     }
 
@@ -1356,6 +1432,40 @@ fn side_toward(this: WorldRect, other: WorldRect, vertical: bool) -> Side {
 /// arrives on — the same three cases [`route`] draws, but usable before
 /// any actual coordinate is picked, so several edges sharing a side can
 /// be spread across it first.
+/// `n` attachment positions along a side `len` cells long, as cell
+/// indices 0..len. Interior cells first — a connector landing on the
+/// border row puts its arrowhead right beside the corner glyph — spaced
+/// evenly, then nudged apart so no two share a cell; only when there are
+/// more connectors than interior cells do they spill onto the ends.
+/// The same positions, nearest the middle of the side first — so the
+/// connectors sorted straight-before-bending take the middle cells.
+fn center_first(mut positions: Vec<i32>, len: i32) -> Vec<i32> {
+    let mid = (len - 1) as f32 / 2.0;
+    positions.sort_by(|a, b| (*a as f32 - mid).abs().partial_cmp(&(*b as f32 - mid).abs()).unwrap().then(a.cmp(b)));
+    positions
+}
+
+fn spread_slots(n: usize, len: i32) -> Vec<i32> {
+    let last = (len - 1).max(0);
+    let (lo, hi) = if len >= 3 && n <= (len - 2) as usize { (1, last - 1) } else { (0, last) };
+    let span = (hi - lo) as f32;
+    let mut out: Vec<i32> = (0..n).map(|k| lo + (((k + 1) as f32 / (n + 1) as f32) * span).round() as i32).collect();
+    let mut used = std::collections::HashSet::new();
+    for p in out.iter_mut() {
+        if used.insert(*p) {
+            continue;
+        }
+        let found = (1..=last).find_map(|d| {
+            [*p + d, *p - d].into_iter().find(|&c| (lo..=hi).contains(&c) && !used.contains(&c))
+        });
+        if let Some(c) = found {
+            *p = c;
+            used.insert(c);
+        }
+    }
+    out
+}
+
 fn sides_for(from: WorldRect, to: WorldRect) -> (Side, Side) {
     let (fx0, fy0, fx1, fy1) = (from.x, from.y, from.right(), from.bottom());
     let (tx0, ty0, tx1, ty1) = (to.x, to.y, to.right(), to.bottom());
@@ -1441,15 +1551,19 @@ fn route(from: WorldRect, to: WorldRect, from_frac: f32, to_frac: f32, sides: Op
     let (fx0, fy0, fx1, fy1) = (from.x, from.y, from.right(), from.bottom());
     let (tx0, ty0, tx1, ty1) = (to.x, to.y, to.right(), to.bottom());
 
+    // Straight-line cases: the slot is a position along `from`'s own
+    // side (what the fan-out spacing handed out), only clamped into the
+    // rows/columns the two boxes actually share — re-scaling it to the
+    // overlap rounded distinct slots back onto one row.
     let (oy0, oy1) = (fy0.max(ty0), fy1.min(ty1));
     if oy0 < oy1 {
-        let y = oy0 + (from_frac * (oy1 - oy0 - 1).max(0) as f32).round() as i32;
+        let y = (fy0 + (from_frac * (fy1 - fy0 - 1).max(0) as f32).round() as i32).clamp(oy0, oy1 - 1);
         return if fx0 <= tx0 { vec![(fx1, y), (tx0 - 1, y)] } else { vec![(fx0 - 1, y), (tx1, y)] };
     }
 
     let (ox0, ox1) = (fx0.max(tx0), fx1.min(tx1));
     if ox0 < ox1 {
-        let x = ox0 + (from_frac * (ox1 - ox0 - 1).max(0) as f32).round() as i32;
+        let x = (fx0 + (from_frac * (fx1 - fx0 - 1).max(0) as f32).round() as i32).clamp(ox0, ox1 - 1);
         return if fy0 <= ty0 { vec![(x, fy1), (x, ty0 - 1)] } else { vec![(x, fy0 - 1), (x, ty1)] };
     }
 

@@ -79,3 +79,26 @@ fn straight_down() {
   └──────┘
 "#);
 }
+
+#[test]
+fn bidirectional_pair_gets_two_rows() {
+    let mut app = board(&[(2, 2, 8, 3, "A"), (30, 2, 8, 3, "B")], &[(0, 1), (1, 0)]);
+    assert_render(&mut app, r#"
+  ┌──────┐                    ┌──────┐
+  │A     │───────────────────>│B     │
+  └──────┘<───────────────────└──────┘
+"#);
+}
+
+#[test]
+fn bidirectional_pair_offset_boxes_still_two_rows() {
+    let mut app = board(&[(2, 2, 8, 5, "A"), (30, 3, 8, 5, "B")], &[(0, 1), (1, 0)]);
+    assert_render(&mut app, r#"
+  ┌──────┐
+  │A     │                    ┌──────┐
+  │      │───────────────────>│B     │
+  │      │<───────────────────│      │
+  └──────┘                    │      │
+                              └──────┘
+"#);
+}

@@ -236,12 +236,51 @@ impl NodeStatus {
     }
 }
 
+/// How a box's color is applied: to its outline and text only (the
+/// default), as a darkened background with the color on top, or as a
+/// solid background with text in black or white to suit. Carried as
+/// `ratslateFill`; without it a box reads as it always did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FillStyle {
+    #[default]
+    None,
+    Tint,
+    Solid,
+}
+
+impl FillStyle {
+    pub fn cycle(self) -> FillStyle {
+        match self {
+            FillStyle::None => FillStyle::Tint,
+            FillStyle::Tint => FillStyle::Solid,
+            FillStyle::Solid => FillStyle::None,
+        }
+    }
+
+    pub fn parse(s: &str) -> FillStyle {
+        match s {
+            "tint" => FillStyle::Tint,
+            "solid" => FillStyle::Solid,
+            _ => FillStyle::None,
+        }
+    }
+
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            FillStyle::None => None,
+            FillStyle::Tint => Some("tint"),
+            FillStyle::Solid => Some("solid"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: ShapeId,
     pub rect: WorldRect,
     pub color: Option<Color>,
     pub shape: Shape,
+    pub fill: FillStyle,
     pub status: Option<NodeStatus>,
     pub kind: NodeKind,
 }
@@ -348,6 +387,7 @@ impl Canvas {
             rect: WorldRect::new(x, y, w.unwrap_or(16), h.unwrap_or(3)),
             color: None,
             shape: Shape::default(),
+            fill: FillStyle::default(),
             status: None,
             kind: NodeKind::Text(String::new()),
         });

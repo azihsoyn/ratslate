@@ -9,7 +9,7 @@ use ratatui::{
 use ratatui_dnd::Hits;
 
 use crate::app::{App, Corner, Endpoint, HitTarget, Mode, Selected, TableOp, cell_anchor_for};
-use crate::model::{ArrowStyle, CellAnchor, Color, EdgeEnd, LineStyle, Node, NodeKind, NodeStatus, Shape, Side, WorldRect};
+use crate::model::{ArrowStyle, CellAnchor, Color, EdgeEnd, FillStyle, LineStyle, Node, NodeKind, NodeStatus, Shape, Side, WorldRect};
 use crate::table::Table;
 
 /// World rect → screen space through the camera. Same `WorldRect` type
@@ -245,6 +245,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         };
         let chrome = Chrome {
             shape: preview_shape(app, &node.id).unwrap_or(node.shape),
+            fill: preview_fill(app, &node.id).unwrap_or(node.fill),
             badge: status_badge(node.status, app.tick),
             flashing: app.flash.contains_key(&node.id),
         };
@@ -477,13 +478,31 @@ fn node_style(color: Option<&Color>, selected: bool, preview: Option<Option<RCol
 /// `node_style`, with the flash another writer's change gets: a bold
 /// yellow border for a moment, distinct from selection's cyan.
 fn node_style_with(color: Option<&Color>, selected: bool, preview: Option<Option<RColor>>, flashing: bool) -> (Style, Style) {
+    node_style_filled(color, selected, preview, flashing, FillStyle::None)
+}
+
+/// `node_style_with`, plus the fill: `Tint` paints a darkened version
+/// of the color behind the box with the color itself on top; `Solid`
+/// paints the color and puts the text in black or white, whichever
+/// reads against it. With no color set there's nothing to fill with
+/// and the box draws as plain.
+fn node_style_filled(color: Option<&Color>, selected: bool, preview: Option<Option<RColor>>, flashing: bool, fill: FillStyle) -> (Style, Style) {
     let shown = match preview {
         Some(p) => p,
         None => color.map(ratatui_color),
     };
-    let base = shown.map(|c| Style::default().fg(c)).unwrap_or_default();
+    let base = match (fill, shown.and_then(rgb_of)) {
+        (FillStyle::Solid, Some((r, g, b))) => {
+            let ink = if 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32 > 150.0 { RColor::Black } else { RColor::White };
+            Style::default().bg(RColor::Rgb(r, g, b)).fg(ink)
+        }
+        (FillStyle::Tint, Some((r, g, b))) => {
+            Style::default().bg(RColor::Rgb(r / 3, g / 3, b / 3)).fg(RColor::Rgb(r, g, b))
+        }
+        _ => shown.map(|c| Style::default().fg(c)).unwrap_or_default(),
+    };
     if flashing {
-        return (base, Style::default().fg(RColor::Yellow).add_modifier(Modifier::BOLD));
+        return (base, base.fg(RColor::Yellow).add_modifier(Modifier::BOLD));
     }
     // Bold-on-whatever-color-it-already-has is easy to miss, especially
     // on a node with no color set at all — selection stays bold and
@@ -491,11 +510,26 @@ fn node_style_with(color: Option<&Color>, selected: bool, preview: Option<Option
     // so picking a new color while still selected actually shows it
     // instead of selection's own color masking it.
     let border_style = if selected {
-        Style::default().fg(shown.unwrap_or(accent())).add_modifier(Modifier::BOLD)
+        base.fg(shown.unwrap_or(accent())).add_modifier(Modifier::BOLD)
     } else {
         base
     };
     (base, border_style)
+}
+
+/// The RGB behind a color, for filling: hex as written, the six JSON
+/// Canvas presets as the values the TUI draws them in.
+fn rgb_of(c: RColor) -> Option<(u8, u8, u8)> {
+    Some(match c {
+        RColor::Rgb(r, g, b) => (r, g, b),
+        RColor::Red => (235, 64, 52),
+        RColor::Yellow => (240, 200, 0),
+        RColor::Green => (60, 180, 75),
+        RColor::Cyan => (0, 180, 200),
+        RColor::Black => (0, 0, 0),
+        RColor::White => (255, 255, 255),
+        _ => return None,
+    })
 }
 
 /// The border set a shape asks for — dashed has no `BorderType` of its
@@ -520,7 +554,20 @@ fn preview_shape(app: &App, id: &str) -> Option<Shape> {
         return None;
     }
     match target {
-        Selected::Node(nid) if nid == id => Some(Shape::parse(style)),
+        Selected::Node(nid) if nid == id && !style.contains(':') => Some(Shape::parse(style)),
+        _ => None,
+    }
+}
+
+/// The fill a hovered `fill:` swatch proposes for this node, while its
+/// picker is open.
+fn preview_fill(app: &App, id: &str) -> Option<FillStyle> {
+    let (target, style) = app.hover_style.as_ref()?;
+    if app.color_picker.as_ref() != Some(target) {
+        return None;
+    }
+    match target {
+        Selected::Node(nid) if nid == id => style.strip_prefix("fill:").map(FillStyle::parse),
         _ => None,
     }
 }
@@ -530,6 +577,8 @@ fn preview_shape(app: &App, id: &str) -> Option<Shape> {
 /// top border, if any. Resolved by the caller, which has the app.
 struct Chrome {
     shape: Shape,
+    /// Own fill, or the one a hovered swatch proposes.
+    fill: FillStyle,
     badge: Option<Span<'static>>,
     /// Another writer just changed this box.
     flashing: bool,
@@ -572,13 +621,13 @@ fn shaped(block: Block<'_>, shape: Shape) -> Block<'_> {
 /// the camera — the node's own `rect` is world coordinates and never
 /// drawn from directly.
 fn draw_node(frame: &mut Frame, node: &Node, chrome: Chrome, rect: Rect, selected: bool, editing: Option<&str>, preview: Option<Option<RColor>>) {
-    let (base, border_style) = node_style_with(node.color.as_ref(), selected, preview, chrome.flashing);
+    let (base, border_style) = node_style_filled(node.color.as_ref(), selected, preview, chrome.flashing, chrome.fill);
 
     // A box is opaque: whatever sits under it in the z-order stops
     // here, instead of bleeding through the interior cells the border
     // and text don't happen to touch.
     frame.render_widget(Clear, rect);
-    let block = dressed(Block::bordered().border_style(border_style), &chrome);
+    let block = dressed(Block::bordered().style(base).border_style(border_style), &chrome);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -645,10 +694,10 @@ struct TableView<'a> {
 fn draw_table_node(frame: &mut Frame, view: TableView, hits: &mut Hits<HitTarget>) {
     let TableView { node, chrome, rect, selected, table, cursor, editing_text, preview } = view;
     let shape = chrome.shape;
-    let (base, border_style) = node_style_with(node.color.as_ref(), selected, preview, chrome.flashing);
+    let (base, border_style) = node_style_filled(node.color.as_ref(), selected, preview, chrome.flashing, chrome.fill);
 
     frame.render_widget(Clear, rect);
-    let block = dressed(Block::bordered().border_style(border_style), &chrome);
+    let block = dressed(Block::bordered().style(base).border_style(border_style), &chrome);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -970,6 +1019,14 @@ fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16,
     for (i, (label, value)) in styles.iter().enumerate() {
         let cx = x + 2 * i as u16;
         put_swatch(cx, hue_y + 2, 2, &format!("{label} "), Style::default(), HitTarget::StyleSwatch(target.clone(), (*value).to_string()));
+    }
+    // A box also gets a row of fills: outline only, tinted, solid.
+    if matches!(target, Selected::Node(_)) {
+        let fills: &[(&str, &str)] = &[("□", "none"), ("▒", "tint"), ("█", "solid")];
+        for (i, (label, value)) in fills.iter().enumerate() {
+            let cx = x + 2 * i as u16;
+            put_swatch(cx, hue_y + 3, 2, &format!("{label} "), Style::default(), HitTarget::StyleSwatch(target.clone(), format!("fill:{value}")));
+        }
     }
     // A connector also gets a row of arrowhead glyphs and a row of
     // end configurations — stored with `arrow:`/`ends:` prefixes so
@@ -2161,7 +2218,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::EditingCell(..) => "TABLE (tab/enter/arrows move · alt+enter line break · ctrl+z undo · +col/-col/+row/-row buttons below · esc done)",
         Mode::Search(_) => "SEARCH",
     };
-    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · / search · a flow · T/tab boards · o open file/link · y copy · g group · D duplicate · [/] z-order ({/} back/front) · l auto-layout · esc then c color / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
+    let hint = "drag empty space to place · click to select · ● button color picker (box or connector) · dbl-click to edit · t table · drag move · shift+drag connect · shift+drag empty select many · corner resize · arrows/wheel pan · m map · / search · a flow · T/tab boards · o open file/link · y copy · g group · D duplicate · [/] z-order ({/} back/front) · l auto-layout · esc then c color / f fill / x shape (or ends, on a connector) / d delete · ctrl+z undo · ctrl+y redo · s save · q/esc quit";
     let line = format!("{mode} — {} — {hint}", app.status);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(RColor::DarkGray)),
@@ -2396,5 +2453,49 @@ mod status_tests {
 
         app.dispatch(Request::SetStatus { id, status: None }).unwrap();
         assert!(!top_border(&mut app).contains('✓'), "clearing removes the badge");
+    }
+}
+
+#[cfg(test)]
+mod fill_tests {
+    //! Fills paint the box's color behind it; solid keeps the text
+    //! readable by picking black or white ink.
+    use super::*;
+    use crate::app::{App, Request, Response};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn interior_cell(app: &mut App) -> (RColor, RColor) {
+        app.camera = (0, 0);
+        app.minimap = false;
+        let mut term = Terminal::new(TestBackend::new(30, 6)).unwrap();
+        term.draw(|f| render(f, app, Rect::new(0, 0, 30, 6), Rect::new(0, 0, 0, 0))).unwrap();
+        let c = &term.backend().buffer().clone()[(5u16, 2u16)];
+        (c.fg, c.bg)
+    }
+
+    #[test]
+    fn solid_fill_paints_the_background_and_picks_readable_ink() {
+        let mut app = App::new(None);
+        let id = match app.dispatch(Request::Place { x: 1, y: 1, w: Some(14), h: Some(3) }).unwrap() {
+            Response::Placed { id } => id,
+            _ => unreachable!(),
+        };
+        app.dispatch(Request::SetText { id: id.clone(), text: "hi".into() }).unwrap();
+        app.dispatch(Request::SetColor { id: id.clone(), color: Some("#ffd75f".into()) }).unwrap();
+        assert_eq!(interior_cell(&mut app).1, RColor::Reset, "no fill: background untouched");
+
+        app.dispatch(Request::SetFill { id: id.clone(), fill: "solid".into() }).unwrap();
+        let (fg, bg) = interior_cell(&mut app);
+        assert_eq!(bg, RColor::Rgb(255, 215, 95));
+        assert_eq!(fg, RColor::Black, "light gold needs black ink");
+
+        app.dispatch(Request::SetColor { id: id.clone(), color: Some("#202060".into()) }).unwrap();
+        assert_eq!(interior_cell(&mut app).0, RColor::White, "dark navy needs white ink");
+
+        app.dispatch(Request::SetFill { id, fill: "tint".into() }).unwrap();
+        let (fg, bg) = interior_cell(&mut app);
+        assert_eq!(bg, RColor::Rgb(0x20 / 3, 0x20 / 3, 0x60 / 3), "tint is the color darkened");
+        assert_eq!(fg, RColor::Rgb(0x20, 0x20, 0x60), "with the color itself on top");
     }
 }

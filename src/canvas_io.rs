@@ -7,7 +7,7 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, NodeStatus, Shape, Side, WorldRect};
+use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, FillStyle, LineStyle, Node, NodeKind, NodeStatus, Shape, Side, WorldRect};
 
 /// A board, in the shape https://jsoncanvas.org/spec/1.0/ describes on
 /// disk — also what `Request::State` hands back over `--api`.
@@ -37,6 +37,8 @@ pub enum FileNode {
         /// unknown field and renders a normal text node.
         #[serde(rename = "ratslateShape", alias = "shape", skip_serializing_if = "Option::is_none")]
         shape: Option<String>,
+        #[serde(rename = "ratslateFill", skip_serializing_if = "Option::is_none")]
+        fill: Option<String>,
         #[serde(rename = "ratslateStatus", skip_serializing_if = "Option::is_none")]
         status: Option<String>,
         text: String,
@@ -52,6 +54,8 @@ pub enum FileNode {
         file: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         subpath: Option<String>,
+        #[serde(rename = "ratslateFill", skip_serializing_if = "Option::is_none")]
+        fill: Option<String>,
         #[serde(rename = "ratslateStatus", skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -64,6 +68,8 @@ pub enum FileNode {
         #[serde(skip_serializing_if = "Option::is_none")]
         color: Option<String>,
         url: String,
+        #[serde(rename = "ratslateFill", skip_serializing_if = "Option::is_none")]
+        fill: Option<String>,
         #[serde(rename = "ratslateStatus", skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -173,7 +179,7 @@ fn from_file(root: FileRoot) -> Canvas {
     let mut canvas = Canvas::default();
 
     for fnode in root.nodes {
-        let (id, x, y, w, h, color, shape, status, kind) = match fnode {
+        let (id, x, y, w, h, color, shape, fill, status, kind) = match fnode {
             FileNode::Text {
                 id,
                 x,
@@ -182,9 +188,10 @@ fn from_file(root: FileRoot) -> Canvas {
                 height,
                 color,
                 shape,
+                fill,
                 status,
                 text,
-            } => (id, x, y, width, height, color, shape, status, NodeKind::Text(text)),
+            } => (id, x, y, width, height, color, shape, fill, status, NodeKind::Text(text)),
             FileNode::File {
                 id,
                 x,
@@ -194,6 +201,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 color,
                 file,
                 subpath,
+                fill,
                 status,
             } => (
                 id,
@@ -203,6 +211,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 height,
                 color,
                 None,
+                fill,
                 status,
                 NodeKind::File { path: file, subpath },
             ),
@@ -214,8 +223,9 @@ fn from_file(root: FileRoot) -> Canvas {
                 height,
                 color,
                 url,
+                fill,
                 status,
-            } => (id, x, y, width, height, color, None, status, NodeKind::Link(url)),
+            } => (id, x, y, width, height, color, None, fill, status, NodeKind::Link(url)),
             FileNode::Group {
                 id,
                 x,
@@ -235,6 +245,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 color,
                 None,
                 None,
+                None,
                 NodeKind::Group {
                     label,
                     background,
@@ -251,6 +262,7 @@ fn from_file(root: FileRoot) -> Canvas {
             id,
             rect,
             shape: shape.as_deref().map(Shape::parse).unwrap_or_default(),
+            fill: fill.as_deref().map(FillStyle::parse).unwrap_or_default(),
             status: status.as_deref().and_then(NodeStatus::parse),
             color: color.as_deref().map(Color::parse),
             kind,
@@ -307,6 +319,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
                     height,
                     color,
                     shape: n.shape.as_str().map(str::to_string),
+                    fill: n.fill.as_str().map(str::to_string),
                     status: n.status.map(|s| s.as_str().to_string()),
                     text: text.clone(),
                 },
@@ -319,6 +332,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
                     color,
                     file: path.clone(),
                     subpath: subpath.clone(),
+                    fill: n.fill.as_str().map(str::to_string),
                     status: n.status.map(|s| s.as_str().to_string()),
                 },
                 NodeKind::Link(url) => FileNode::Link {
@@ -329,6 +343,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
                     height,
                     color,
                     url: url.clone(),
+                    fill: n.fill.as_str().map(str::to_string),
                     status: n.status.map(|s| s.as_str().to_string()),
                 },
                 NodeKind::Group {
@@ -442,6 +457,7 @@ mod compat {
         {
             let n = canvas.node_mut(&a).unwrap();
             n.shape = Shape::Thick;
+            n.fill = FillStyle::Tint;
             n.status = Some(NodeStatus::Running);
             n.color = Some(Color::Hex("#ffd75f".into()));
         }
@@ -475,7 +491,7 @@ mod compat {
         assert!(offenders.is_empty(), "non-spec keys must be ratslate-prefixed: {offenders:?}");
         // And the extras really were written (the test isn't vacuous).
         let s = serde_json::to_string(&out).unwrap();
-        for k in ["ratslateShape", "ratslateStatus", "ratslateStyle", "ratslateArrow", "ratslateFromAnchor", "ratslateToAnchor"] {
+        for k in ["ratslateShape", "ratslateFill", "ratslateStatus", "ratslateStyle", "ratslateArrow", "ratslateFromAnchor", "ratslateToAnchor"] {
             assert!(s.contains(k), "{k} should be in the file");
         }
     }

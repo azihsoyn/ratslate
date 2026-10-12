@@ -25,8 +25,10 @@ Alacritty, WezTerm, GNOME Terminal, Windows Terminal, tmux).
 - **Boxes** — drag empty canvas to place one, type into it, double-click to
   edit. `c` cycles colors, or use the `●` button for a real color picker — a
   truecolor gradient field with a hue strip and live preview, plus the six
-  JSON Canvas presets — and border styles: plain, rounded, thick, double or
-  dashed (`x` cycles them too).
+  JSON Canvas presets — border styles: plain, rounded, thick, double or
+  dashed (`x` cycles them too) — and how the color is applied: outline and
+  text only, a tinted background, or solid (`f` cycles; text goes black or
+  white to stay readable).
 - **Connectors** — shift+drag from one box to another. Sides, arrowheads,
   colors, labels, line styles (solid `──`, rounded bends `╭╯`, thick `━━`,
   double `══`, dashed `╌╌`) and arrowhead glyphs (`>` `▶` `▷` `●` `◆`) all editable; JSON Canvas

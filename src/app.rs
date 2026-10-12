@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas_io::{self, FileRoot};
 use crate::collab::{Collab, EdgeFields, NodeFields};
-use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, LineStyle, Node, NodeKind, NodeStatus, Shape, ShapeId, Side, WorldRect, ZMove};
+use crate::model::{ArrowStyle, Canvas, CellAnchor, Color, Edge, EdgeEnd, FillStyle, LineStyle, Node, NodeKind, NodeStatus, Shape, ShapeId, Side, WorldRect, ZMove};
 
 const MIN_W: u16 = 5;
 const MIN_H: u16 = 3;
@@ -257,6 +257,10 @@ pub enum Request {
     SetColor { id: ShapeId, color: Option<String> },
     /// "rectangle" (the default) or "rounded".
     SetShape { id: ShapeId, shape: String },
+    /// How the box's color is applied: "none" (outline and text, the
+    /// default), "tint" (a darkened background, color on top) or
+    /// "solid" (color background, black or white text to suit).
+    SetFill { id: ShapeId, fill: String },
     /// A badge on the box's top border: "pending" (not started),
     /// "running" (a spinner), "ok", "failed", "skipped", or `null` to
     /// clear it — how an agent working a board shows which box it's on
@@ -990,6 +994,12 @@ impl App {
             Request::SetColor { id, color } => {
                 let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
                 node.color = color.as_deref().map(Color::parse);
+                touched = Some(id);
+                Ok(Response::Ok)
+            }
+            Request::SetFill { id, fill } => {
+                let node = self.canvas.node_mut(&id).ok_or_else(|| format!("no such node: {id}"))?;
+                node.fill = FillStyle::parse(&fill);
                 touched = Some(id);
                 Ok(Response::Ok)
             }
@@ -1971,7 +1981,10 @@ impl App {
             }
             Did::Click(HitTarget::StyleSwatch(target, style)) => {
                 let _ = match target {
-                    Selected::Node(id) => self.dispatch(Request::SetShape { id, shape: style }),
+                    Selected::Node(id) => match style.strip_prefix("fill:") {
+                        Some(fill) => self.dispatch(Request::SetFill { id, fill: fill.to_string() }),
+                        None => self.dispatch(Request::SetShape { id, shape: style }),
+                    },
                     // A connector's swatch rows carry line styles,
                     // arrowhead glyphs and end configurations; the
                     // prefix says which this is.
@@ -2382,6 +2395,14 @@ impl App {
                     }
                     None => {}
                 },
+                KeyCode::Char('f') => {
+                    if let Some(Selected::Node(id)) = self.selected.clone()
+                        && let Some(node) = self.canvas.node(&id)
+                    {
+                        let next = node.fill.cycle();
+                        let _ = self.dispatch(Request::SetFill { id, fill: next.as_str().unwrap_or("none").to_string() });
+                    }
+                }
                 KeyCode::Char('x') => match self.selected.clone() {
                     Some(Selected::Node(id)) => {
                         if let Some(node) = self.canvas.node(&id) {
@@ -2618,6 +2639,7 @@ fn node_fields(node: &Node, z: i64) -> NodeFields {
         subpath,
         color: node.color.as_ref().map(|c| c.to_string()),
         shape: node.shape.as_str().unwrap_or("rectangle").to_string(),
+        fill: node.fill.as_str().map(str::to_string),
         status: node.status.map(|s| s.as_str().to_string()),
         kind: kind.to_string(),
         z,
@@ -2641,6 +2663,7 @@ fn node_from_fields(id: String, f: NodeFields) -> Node {
         ),
         color: f.color.as_deref().map(Color::parse),
         shape: Shape::parse(&f.shape),
+        fill: f.fill.as_deref().map(FillStyle::parse).unwrap_or_default(),
         status: f.status.as_deref().and_then(NodeStatus::parse),
         kind,
     }
@@ -2854,6 +2877,7 @@ mod design_invariants {
         run(&mut app, &format!(r#"{{"type":"set_color","id":"{id}","color":"3"}}"#));
         run(&mut app, &format!(r#"{{"type":"set_shape","id":"{id}","shape":"thick"}}"#));
         run(&mut app, &format!(r#"{{"type":"set_status","id":"{id}","status":"running"}}"#));
+        run(&mut app, &format!(r#"{{"type":"set_fill","id":"{id}","fill":"tint"}}"#));
         run(&mut app, &format!(r#"{{"type":"set_rect","id":"{id}","x":1,"y":1,"w":10,"h":3}}"#));
         run(&mut app, &format!(r#"{{"type":"reorder","id":"{id}","to":"front"}}"#));
         run(&mut app, &format!(r#"{{"type":"duplicate","ids":["{id}"]}}"#));

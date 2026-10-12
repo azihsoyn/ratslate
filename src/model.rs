@@ -282,6 +282,10 @@ pub struct Node {
     pub shape: Shape,
     pub fill: FillStyle,
     pub status: Option<NodeStatus>,
+    /// A stable identity a watched source gave this box (`job:plan`),
+    /// so repeated `sync` documents find the same box — carried as
+    /// `ratslateKey`. Nothing else reads it.
+    pub key: Option<String>,
     pub kind: NodeKind,
 }
 
@@ -389,6 +393,7 @@ impl Canvas {
             shape: Shape::default(),
             fill: FillStyle::default(),
             status: None,
+            key: None,
             kind: NodeKind::Text(String::new()),
         });
         id

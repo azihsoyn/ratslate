@@ -50,6 +50,8 @@ pub struct NodeFields {
     pub shape: String,
     /// "tint" | "solid", or none for outline-only.
     pub fill: Option<String>,
+    /// A watched source's stable key for this box, if any.
+    pub key: Option<String>,
     /// "running" | "ok" | "failed", or none.
     pub status: Option<String>,
     /// "text" | "file" | "link" | "group".
@@ -142,7 +144,7 @@ impl Collab {
             Some(sp) => Any::String(Arc::from(sp.as_str())),
             None => Any::Null,
         };
-        let entry: [(Arc<str>, In); 12] = [
+        let entry: [(Arc<str>, In); 13] = [
             (Arc::from("x"), In::Any(Any::BigInt(f.x))),
             (Arc::from("y"), In::Any(Any::BigInt(f.y))),
             (Arc::from("w"), In::Any(Any::BigInt(f.w))),
@@ -153,6 +155,13 @@ impl Collab {
             (Arc::from("shape"), In::Any(Any::String(Arc::from(f.shape.as_str())))),
             (Arc::from("kind"), In::Any(Any::String(Arc::from(f.kind.as_str())))),
             (Arc::from("z"), In::Any(Any::BigInt(f.z))),
+            (
+                Arc::from("key"),
+                In::Any(match &f.key {
+                    Some(v) => Any::String(Arc::from(v.as_str())),
+                    None => Any::Null,
+                }),
+            ),
             (
                 Arc::from("fill"),
                 In::Any(match &f.fill {
@@ -216,6 +225,10 @@ impl Collab {
                     },
                     color,
                     shape: get_str("shape"),
+                    key: match fields.get("key") {
+                        Some(Any::String(v)) => Some(v.to_string()),
+                        _ => None,
+                    },
                     fill: match fields.get("fill") {
                         Some(Any::String(v)) => Some(v.to_string()),
                         _ => None,

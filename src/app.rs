@@ -335,6 +335,12 @@ pub enum Request {
     /// graph layout — pour in nodes and edges with any coordinates,
     /// then ask for this and get a readable diagram. One undo step.
     Layout,
+    /// Reconcile a [`SyncDoc`] onto the board: an item whose key is
+    /// already on a box updates that box in place (text, status, color…
+    /// — position untouched), a new key becomes a new box, links become
+    /// connectors between keyed boxes. `--watch` sends one of these
+    /// every time the watched command prints a document. One undo step.
+    Sync { doc: SyncDoc },
     /// The whole board, as JSON Canvas.
     State,
     /// The whole board drawn to plain text — the same rendering the
@@ -348,6 +354,87 @@ pub enum Request {
     Undo,
     /// Redo the last change undo stepped back through.
     Redo,
+}
+
+
+/// What a watched source reports: the document `--watch` reads from a
+/// command's stdout every interval, and the body of a `sync` request.
+/// Items are matched to boxes by `key`, so a source can emit the same
+/// document over and over and the board updates in place — a box keeps
+/// its hand-dragged position when only its text or status changes.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SyncDoc {
+    /// Things to show as boxes, each identified by a stable `key`.
+    #[serde(default)]
+    pub items: Vec<SyncItem>,
+    /// Connectors between items, by key.
+    #[serde(default)]
+    pub links: Vec<SyncLink>,
+    /// "auto" (the default) runs the layered layout when the set of
+    /// keys changed since the last sync — new boxes get a sensible spot,
+    /// a document that only changed fields moves nothing. "keep" never
+    /// lays out: new boxes appear below everything, where they are.
+    #[serde(default)]
+    pub layout: Option<String>,
+    /// Remove keyed boxes (and their connectors) the document no longer
+    /// lists. Off by default, so a partial update is safe. Boxes without
+    /// a key — hand-placed ones — are never touched either way.
+    #[serde(default)]
+    pub prune: bool,
+}
+
+/// One box of a [`SyncDoc`]. Every field but `key` is optional: an
+/// omitted one leaves the box's current value alone (so a source that
+/// only knows about statuses can send just keys and statuses), except
+/// `status`, which `null` clears.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SyncItem {
+    /// Stable identity across syncs — a job name, a ticket id. Stored
+    /// on the box as `ratslateKey`.
+    pub key: String,
+    /// The box's text; a GFM table renders as a grid like anywhere else.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// "pending", "running", "ok", "failed", "skipped", or null.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Same grammar as `set_color`: a preset "1".."6" or a hex color.
+    #[serde(default)]
+    pub color: Option<String>,
+    /// "none", "tint" or "solid".
+    #[serde(default)]
+    pub fill: Option<String>,
+    /// "rectangle", "rounded", "thick", "double" or "dashed".
+    #[serde(default)]
+    pub shape: Option<String>,
+    /// Box size; a new box without one is sized to fit its text.
+    #[serde(default)]
+    pub width: Option<u16>,
+    #[serde(default)]
+    pub height: Option<u16>,
+}
+
+/// One connector of a [`SyncDoc`], from one item's key to another's.
+/// A link to a key the document doesn't define (and the board doesn't
+/// have) is skipped, not an error, so a source can emit links before
+/// the items they join show up.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SyncLink {
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// "solid", "rounded", "thick", "double" or "dashed".
+    #[serde(default)]
+    pub style: Option<String>,
+    /// "plain", "triangle", "open", "dot" or "diamond".
+    #[serde(default)]
+    pub arrow: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 impl Request {
@@ -1193,6 +1280,137 @@ impl App {
                 // this is replacing.
                 self.load_imported(canvas);
                 self.status = format!("imported {n} boxes");
+                Ok(Response::Ok)
+            }
+            Request::Sync { doc } => {
+                let layout_mode = doc.layout.as_deref().unwrap_or("auto");
+                if !matches!(layout_mode, "auto" | "keep") {
+                    return Err(format!("unknown layout: {layout_mode} — use auto or keep"));
+                }
+                let known: std::collections::HashSet<String> = self.canvas.nodes.iter().filter_map(|n| n.key.clone()).collect();
+                let wanted: std::collections::HashSet<String> = doc.items.iter().map(|i| i.key.clone()).collect();
+                let mut by_key: std::collections::HashMap<String, ShapeId> =
+                    self.canvas.nodes.iter().filter_map(|n| n.key.clone().map(|k| (k, n.id.clone()))).collect();
+
+                // New boxes land in a column below everything on the
+                // board, so even with layout "keep" they are findable
+                // and never on top of a hand-placed one.
+                let mut next_y = self.canvas.nodes.iter().map(|n| n.rect.y + n.rect.height as i32 + 1).max().unwrap_or(0);
+                for item in &doc.items {
+                    let id = match by_key.get(&item.key) {
+                        Some(id) => id.clone(),
+                        None => {
+                            let text = item.text.as_deref().unwrap_or(&item.key);
+                            let (w, h) = fit_text(text);
+                            let id = self.canvas.place_text(0, next_y, Some(item.width.unwrap_or(w)), Some(item.height.unwrap_or(h)));
+                            next_y += item.height.unwrap_or(h) as i32 + 1;
+                            let node = self.canvas.node_mut(&id).expect("just placed");
+                            node.key = Some(item.key.clone());
+                            node.kind = NodeKind::Text(text.to_string());
+                            by_key.insert(item.key.clone(), id.clone());
+                            id
+                        }
+                    };
+                    let node = self.canvas.node_mut(&id).expect("keyed node exists");
+                    if let Some(text) = &item.text
+                        && let NodeKind::Text(t) = &mut node.kind
+                    {
+                        t.clone_from(text);
+                    }
+                    node.status = match item.status.as_deref() {
+                        None => None,
+                        Some(s) => Some(NodeStatus::parse(s).ok_or_else(|| format!("unknown status: {s}"))?),
+                    };
+                    if let Some(c) = &item.color {
+                        node.color = Some(Color::parse(c));
+                    }
+                    if let Some(f) = &item.fill {
+                        node.fill = FillStyle::parse(f);
+                    }
+                    if let Some(s) = &item.shape {
+                        node.shape = Shape::parse(s);
+                    }
+                    if let Some(w) = item.width {
+                        node.rect.width = w.max(MIN_W);
+                    }
+                    if let Some(h) = item.height {
+                        node.rect.height = h.max(MIN_H);
+                    }
+                    touched_also.push(id);
+                }
+
+                if doc.prune {
+                    let gone: Vec<ShapeId> = self
+                        .canvas
+                        .nodes
+                        .iter()
+                        .filter(|n| n.key.as_ref().is_some_and(|k| !wanted.contains(k)))
+                        .map(|n| n.id.clone())
+                        .collect();
+                    for id in &gone {
+                        touched_edges.extend(
+                            self.canvas.edges.iter().filter(|e| &e.from == id || &e.to == id).map(|e| e.id.clone()),
+                        );
+                        self.canvas.delete(id);
+                        by_key.retain(|_, v| v != id);
+                        touched_also.push(id.clone());
+                    }
+                }
+
+                // Links are owned by the document: between two keyed
+                // boxes there is exactly one connector per (from, to)
+                // listed, and with prune, none that isn't.
+                let mut linked: std::collections::HashSet<(ShapeId, ShapeId)> = std::collections::HashSet::new();
+                let mut n_links = 0;
+                for link in &doc.links {
+                    let (Some(from), Some(to)) = (by_key.get(&link.from), by_key.get(&link.to)) else { continue };
+                    let (from, to) = (from.clone(), to.clone());
+                    let existing = self.canvas.edges.iter().find(|e| e.from == from && e.to == to).map(|e| e.id.clone());
+                    let eid = match existing {
+                        Some(eid) => eid,
+                        None => self.canvas.connect(from.clone(), to.clone()),
+                    };
+                    let edge = self.canvas.edge_mut(&eid).expect("edge exists");
+                    edge.label = link.label.clone();
+                    if let Some(s) = &link.style {
+                        edge.style = LineStyle::parse(s);
+                    }
+                    if let Some(a) = &link.arrow {
+                        edge.arrow = ArrowStyle::parse(a);
+                    }
+                    if let Some(c) = &link.color {
+                        edge.color = Some(Color::parse(c));
+                    }
+                    linked.insert((from, to));
+                    touched_edges.push(eid);
+                    n_links += 1;
+                }
+                if doc.prune {
+                    let keyed: std::collections::HashSet<&ShapeId> = by_key.values().collect();
+                    let stale: Vec<String> = self
+                        .canvas
+                        .edges
+                        .iter()
+                        .filter(|e| keyed.contains(&e.from) && keyed.contains(&e.to) && !linked.contains(&(e.from.clone(), e.to.clone())))
+                        .map(|e| e.id.clone())
+                        .collect();
+                    for eid in stale {
+                        self.canvas.delete_edge(&eid);
+                        touched_edges.push(eid);
+                    }
+                }
+
+                let keys_after: std::collections::HashSet<String> = self.canvas.nodes.iter().filter_map(|n| n.key.clone()).collect();
+                if layout_mode == "auto" && keys_after != known {
+                    for (id, x, y) in crate::layout::layered(&self.canvas) {
+                        if let Some(node) = self.canvas.node_mut(&id) {
+                            node.rect.x = x;
+                            node.rect.y = y;
+                            touched_also.push(id);
+                        }
+                    }
+                }
+                self.status = format!("synced {} items, {n_links} links", doc.items.len());
                 Ok(Response::Ok)
             }
             Request::Layout => {
@@ -2574,6 +2792,16 @@ fn rect_distance(r: WorldRect, x: i32, y: i32) -> u32 {
 /// How tall a box needs to be to show `text` without clipping, wrapped
 /// to `width` columns the same simple way `Paragraph`'s `Wrap` would,
 /// plus the top and bottom border.
+/// A box size that shows all of `text`: wide enough for its longest
+/// line plus a little air, tall enough for its lines — the same rule
+/// `--import` sizes boxes by.
+fn fit_text(text: &str) -> (u16, u16) {
+    let w = text.lines().map(crate::table::display_width).max().unwrap_or(0);
+    let width = (w + 4).clamp(8, 60) as u16;
+    let height = (text.lines().count().max(1) + 2) as u16;
+    (width, height)
+}
+
 fn wrapped_height(text: &str, width: u16) -> u16 {
     let width = width.max(1) as usize;
     let content_lines: u16 = text
@@ -2640,6 +2868,7 @@ fn node_fields(node: &Node, z: i64) -> NodeFields {
         color: node.color.as_ref().map(|c| c.to_string()),
         shape: node.shape.as_str().unwrap_or("rectangle").to_string(),
         fill: node.fill.as_str().map(str::to_string),
+        key: node.key.clone(),
         status: node.status.map(|s| s.as_str().to_string()),
         kind: kind.to_string(),
         z,
@@ -2664,6 +2893,7 @@ fn node_from_fields(id: String, f: NodeFields) -> Node {
         color: f.color.as_deref().map(Color::parse),
         shape: Shape::parse(&f.shape),
         fill: f.fill.as_deref().map(FillStyle::parse).unwrap_or_default(),
+        key: f.key,
         status: f.status.as_deref().and_then(NodeStatus::parse),
         kind,
     }
@@ -2884,6 +3114,7 @@ mod design_invariants {
         run(&mut app, &format!(r#"{{"type":"move_by","ids":["{id}"],"dx":2,"dy":2}}"#));
         run(&mut app, &format!(r#"{{"type":"delete","id":"{id}"}}"#));
         run(&mut app, r#"{"type":"layout"}"#);
+        run(&mut app, r#"{"type":"sync","doc":{"items":[{"key":"job:a","text":"a","status":"ok"}],"links":[],"prune":true}}"#);
         run(&mut app, r#"{"type":"undo"}"#);
         run(&mut app, r#"{"type":"redo"}"#);
     }
@@ -2928,5 +3159,68 @@ mod flash_tests {
         assert!(!a.animating());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    //! `sync`: a watched source's document, reconciled onto the board
+    //! by key — create, update, prune, and lay out only when the set of
+    //! keys changes.
+    use super::*;
+
+    fn doc(json: &str) -> SyncDoc {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn by_key<'a>(app: &'a App, key: &str) -> &'a Node {
+        app.canvas.nodes.iter().find(|n| n.key.as_deref() == Some(key)).unwrap()
+    }
+
+    #[test]
+    fn creates_updates_and_keeps_positions_on_field_changes() {
+        let mut app = App::new(None);
+        app.dispatch(Request::Sync {
+            doc: doc(r#"{"items":[{"key":"a","text":"A","status":"running"},{"key":"b","text":"B"}],"links":[{"from":"a","to":"b","label":"needs"}]}"#),
+        })
+        .unwrap();
+        assert_eq!(app.canvas.nodes.len(), 2);
+        assert_eq!(app.canvas.edges.len(), 1);
+        assert_eq!(by_key(&app, "a").status, Some(NodeStatus::Running));
+        assert_eq!(app.canvas.edges[0].label.as_deref(), Some("needs"));
+        let pos_before = by_key(&app, "a").rect;
+
+        // Same keys, new status: the box is updated in place and does not move.
+        app.dispatch(Request::Sync { doc: doc(r#"{"items":[{"key":"a","text":"A","status":"ok"},{"key":"b","text":"B"}],"links":[{"from":"a","to":"b"}]}"#) })
+            .unwrap();
+        assert_eq!(app.canvas.nodes.len(), 2, "no duplicates for known keys");
+        assert_eq!(by_key(&app, "a").status, Some(NodeStatus::Ok));
+        assert_eq!(by_key(&app, "a").rect, pos_before, "a field change leaves the box where it was");
+        assert_eq!(app.canvas.edges[0].label, None, "link label cleared when the document drops it");
+    }
+
+    #[test]
+    fn prune_removes_what_the_source_no_longer_reports() {
+        let mut app = App::new(None);
+        app.dispatch(Request::Sync { doc: doc(r#"{"items":[{"key":"a"},{"key":"b"}],"links":[{"from":"a","to":"b"}]}"#) }).unwrap();
+        // Without prune, a shorter document leaves things alone.
+        app.dispatch(Request::Sync { doc: doc(r#"{"items":[{"key":"a"}]}"#) }).unwrap();
+        assert_eq!(app.canvas.nodes.len(), 2);
+        // With prune, b and its connector go.
+        app.dispatch(Request::Sync { doc: doc(r#"{"items":[{"key":"a"}],"prune":true}"#) }).unwrap();
+        assert_eq!(app.canvas.nodes.len(), 1);
+        assert!(app.canvas.edges.is_empty());
+    }
+
+    #[test]
+    fn hand_placed_boxes_without_keys_are_never_touched() {
+        let mut app = App::new(None);
+        let mine = match app.dispatch(Request::Place { x: 50, y: 50, w: None, h: None }).unwrap() {
+            Response::Placed { id } => id,
+            _ => unreachable!(),
+        };
+        app.dispatch(Request::Sync { doc: doc(r#"{"items":[{"key":"a"}],"prune":true,"layout":"keep"}"#) }).unwrap();
+        assert!(app.canvas.node(&mine).is_some(), "prune only removes keyed boxes");
+        assert_eq!(app.canvas.node(&mine).unwrap().rect.x, 50, "keep never moves anything");
     }
 }

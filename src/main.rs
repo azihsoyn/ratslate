@@ -54,7 +54,7 @@ fn main() -> io::Result<()> {
                 skip = false;
                 continue;
             }
-            if a == "--api" || a == "--import" {
+            if a == "--api" || a == "--import" || a == "--watch" || a == "--every" {
                 // These flags take a value argument — skip it, or an
                 // `--import graph.mmd` would open `graph.mmd` as a
                 // second board tab.
@@ -93,6 +93,32 @@ fn main() -> io::Result<()> {
                 }
             };
             Some(text)
+        }
+        None => None,
+    };
+
+    // A command to run every `--every` seconds whose stdout is a sync
+    // document (see `SyncDoc` in --schema): the board follows whatever
+    // the command reports — a CI run, a queue, a process tree — with
+    // each document applied as one `sync` request, the same request
+    // `--api` takes.
+    let watch: Option<Watch> = match args.iter().position(|a| a == "--watch") {
+        Some(i) => {
+            let Some(cmd) = args.get(i + 1) else {
+                eprintln!("--watch needs a command to run");
+                std::process::exit(2);
+            };
+            let every = match args.iter().position(|a| a == "--every") {
+                Some(j) => match args.get(j + 1).and_then(|s| s.parse::<f64>().ok()) {
+                    Some(s) if s > 0.0 => Duration::from_secs_f64(s),
+                    _ => {
+                        eprintln!("--every needs a number of seconds");
+                        std::process::exit(2);
+                    }
+                },
+                None => Duration::from_secs(5),
+            };
+            Some(Watch { command: cmd.clone(), every })
         }
         None => None,
     };
@@ -156,7 +182,8 @@ fn main() -> io::Result<()> {
             first.status = format!("import failed: {e}");
         }
     }
-    let result = run_whiteboard(&mut terminal, &mut apps);
+    let watched = watch.map(|w| w.start());
+    let result = run_whiteboard(&mut terminal, &mut apps, watched.as_ref());
     for app in &mut apps {
         if app.save_path.is_some() {
             app.save();
@@ -174,7 +201,64 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn run_whiteboard(terminal: &mut Terminal<Backend>, apps: &mut Vec<App>) -> io::Result<()> {
+/// `--watch`: a command run on a timer in a background thread, each
+/// run's stdout handed over as one document for the first board. Only
+/// a document that differs from the previous one is sent, so an idle
+/// source costs no redraws and no undo steps.
+struct Watch {
+    command: String,
+    every: Duration,
+}
+
+/// What a watch run produced: a parsed document, or why there isn't one
+/// (shown on the status line, not fatal — the next run may succeed).
+enum WatchEvent {
+    Doc(app::SyncDoc),
+    Error(String),
+}
+
+impl Watch {
+    fn start(self) -> std::sync::mpsc::Receiver<WatchEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut last: Option<String> = None;
+            loop {
+                let event = match std::process::Command::new("sh").arg("-c").arg(&self.command).output() {
+                    Ok(out) if out.status.success() => {
+                        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                        if last.as_deref() == Some(text.as_str()) {
+                            None
+                        } else {
+                            last = Some(text.clone());
+                            Some(match serde_json::from_str::<app::SyncDoc>(&text) {
+                                Ok(doc) => WatchEvent::Doc(doc),
+                                Err(e) => WatchEvent::Error(format!("watch: output isn't a sync document: {e}")),
+                            })
+                        }
+                    }
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        Some(WatchEvent::Error(format!("watch: command failed ({}): {}", out.status, err.lines().last().unwrap_or("").trim())))
+                    }
+                    Err(e) => Some(WatchEvent::Error(format!("watch: can't run command: {e}"))),
+                };
+                if let Some(event) = event
+                    && tx.send(event).is_err()
+                {
+                    return;
+                }
+                std::thread::sleep(self.every);
+            }
+        });
+        rx
+    }
+}
+
+fn run_whiteboard(
+    terminal: &mut Terminal<Backend>,
+    apps: &mut Vec<App>,
+    watch: Option<&std::sync::mpsc::Receiver<WatchEvent>>,
+) -> io::Result<()> {
     let mut canvas_area = Rect::default();
     let mut active = 0usize;
     // Redraw only when something actually happened — an input event, a
@@ -201,6 +285,24 @@ fn run_whiteboard(terminal: &mut Terminal<Backend>, apps: &mut Vec<App>) -> io::
 
         dirty |= app.pull_collab();
         dirty |= app.poll_file_reload();
+
+        // A watched command's latest document goes to the first board —
+        // the one named first on the command line — whichever tab is up.
+        if let Some(rx) = watch {
+            while let Ok(event) = rx.try_recv() {
+                let target = &mut apps[0];
+                match event {
+                    WatchEvent::Doc(doc) => {
+                        if let Err(e) = target.dispatch(app::Request::Sync { doc }) {
+                            target.status = format!("watch: {e}");
+                        }
+                    }
+                    WatchEvent::Error(msg) => target.status = msg,
+                }
+                dirty = true;
+            }
+        }
+        let app = &mut apps[active];
 
         if dirty {
             terminal.draw(|frame| {

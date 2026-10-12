@@ -133,12 +133,52 @@ A JSON array runs as a batch, applied in order, replied to in order.
 Nothing is written to disk until a `save` request says so — `--api` is
 safe to use for a read-only `state` query.
 
-## Examples
+## Watch a source
 
-`examples/gh-actions-board.py` draws a GitHub Actions run as a live board:
-jobs as boxes, `needs:` as connectors, each job's status as its badge,
-updated as the run goes. It's nothing but a loop over `ratslate --api`,
-which is the point — see [examples/README.md](examples/README.md).
+```sh
+ratslate board.canvas --watch 'some-command' --every 5
+```
+
+runs the command on a timer and reads its stdout as a *sync document*:
+a list of things to show, each with a stable `key`, and the links
+between them. Ratslate matches items to boxes by key and updates them
+in place — a box keeps wherever you dragged it when only its text or
+status changed, a new key becomes a new box (and the board re-lays
+out), a key that's gone is pruned if the document says so. Boxes you
+placed by hand, which have no key, are never touched. Each document is
+one `sync` request through `--api`, so a script can send the same thing
+by hand, and the exact schema is in `--schema` under `SyncDoc`.
+
+```json
+{
+  "items": [
+    {"key": "job:build", "text": "build\n21s", "status": "ok"},
+    {"key": "job:test",  "text": "test",       "status": "running",
+     "color": "4", "fill": "tint", "shape": "rounded", "width": 24, "height": 4}
+  ],
+  "links": [
+    {"from": "job:build", "to": "job:test", "label": "needs",
+     "style": "dashed", "arrow": "triangle", "color": "2"}
+  ],
+  "layout": "auto",
+  "prune": true
+}
+```
+
+Only `key` is required; an omitted field leaves the box as it was, so a
+source that knows only statuses can send just keys and statuses. A box's
+key is saved as `ratslateKey` — an extension key other JSON Canvas
+readers ignore — so a watch picks the same boxes back up tomorrow.
+`layout` is `auto` (lay out when the set of keys changes) or `keep`
+(never move anything; new boxes land below the board). `prune` is off
+by default, so a partial document is safe.
+
+`examples/gh-actions-board.py` is a watch source: it prints a GitHub
+Actions run as a document — jobs as items, `needs:` as links, each
+job's status as its badge — and `ratslate ci.canvas --watch
+examples/gh-actions-board.py --every 8` draws the run live as it goes.
+It's a stateless script that prints JSON, which is the point — see
+[examples/README.md](examples/README.md).
 
 Ratslate's own emphasis color — selection, related connectors, the flow
 pulse, the spinner — is cyan; if that sinks into your palette, set

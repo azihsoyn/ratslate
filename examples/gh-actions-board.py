@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 """A GitHub Actions run as a live ratslate board.
 
-Jobs become boxes, `needs:` become connectors, and each box carries the
-job's status as a badge: pending, a spinner while it runs, a check or a
-cross when it's done. Open the board in ratslate in another pane and
-watch the run flow through it.
+Prints the run as a sync document — jobs as items keyed by job name,
+`needs:` as links, each job's status as its badge — and ratslate's
+`--watch` does the rest: it runs this script on a timer, matches items
+to boxes by key, and updates the board in place. Boxes keep wherever
+you dragged them; only what changed flashes.
 
-    examples/gh-actions-board.py ci.canvas                    # latest run of this repo
-    examples/gh-actions-board.py ci.canvas --run 123456789    # a specific run
-    examples/gh-actions-board.py ci.canvas --steps            # each job as a table of its steps
-    ratslate ci.canvas                                        # in another pane
+    ratslate ci.canvas --watch examples/gh-actions-board.py --every 8
+    ratslate ci.canvas --watch 'examples/gh-actions-board.py --steps'       # each job as a table of its steps
+    ratslate ci.canvas --watch 'examples/gh-actions-board.py --run 123456'  # a specific run
 
-Everything goes through `ratslate --api`, the same requests a mouse
-click dispatches, and reaches the open TUI live through the CRDT
-sidecar — this script is just an agent that happens to be a shell
-loop. Needs `gh` (logged in) and `ratslate` on PATH. Standard library
-only.
+Each document is applied as one `sync` request — the same thing
+`--api '{"type":"sync","doc":{…}}'` takes by hand. The format is
+`SyncDoc` in `ratslate --schema`. Needs `gh` (logged in). Standard
+library only.
 """
 import argparse
 import base64
 import json
-import os
 import re
 import subprocess
 import sys
-import time
 
 GLYPH = {"pending": "○", "running": "⠋", "ok": "✓", "failed": "✗", "skipped": "⊘"}
 
@@ -38,13 +35,6 @@ def sh(*args):
 
 def gh_json(*args):
     return json.loads(sh("gh", *args))
-
-
-def api(canvas, reqs):
-    """One `--api` batch; returns the list of results."""
-    out = sh("ratslate", canvas, "--api", json.dumps(reqs))
-    res = json.loads(out)["result"]
-    return res if isinstance(res, list) else [res]
 
 
 def status_of(job):
@@ -145,38 +135,31 @@ def job_yaml_id(job_name, yaml_ids):
     return base if base in yaml_ids else None
 
 
-def box_text(job, with_steps):
+def item(job, with_steps):
     """A job's box: its name and running time, or with --steps a table
-    headed by the name with one row per step and the step's own badge."""
+    headed by the name with one row per step and the step's own badge.
+    Tables get an explicit size — they don't grow to fit on their own."""
     name = job["name"]
+    it = {"key": f"job:{name}", "status": status_of(job)}
     if not with_steps:
         d = duration(job)
-        return f"{name}\n{d}" if d else name
-    rows = [f"| {name} | |", "| --- | --- |"]
-    for s in job.get("steps", []):
-        rows.append(f"| {s['name'][:30]} | {GLYPH[status_of(s)]} |")
-    return "\n".join(rows)
-
-
-def box_size(job, with_steps):
-    """Wide enough for the longest line, tall enough for every row —
-    tables don't auto-grow from the API, only from the keyboard."""
-    if not with_steps:
-        return 30, 4
+        it["text"] = f"{name}\n{d}" if d else name
+        return it
     steps = job.get("steps", [])
-    widest = max([len(job["name"])] + [len(s["name"][:30]) for s in steps])
-    return min(widest + 10, 48), len(steps) + 4
+    rows = [f"| {name} | |", "| --- | --- |"]
+    for s in steps:
+        rows.append(f"| {s['name'][:30]} | {GLYPH[status_of(s)]} |")
+    widest = max([len(name)] + [len(s["name"][:30]) for s in steps])
+    it.update(text="\n".join(rows), width=min(widest + 10, 48), height=len(steps) + 4)
+    return it
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("canvas", help="the .canvas file to draw into (created if missing)")
     ap.add_argument("--repo", help="owner/name (default: the current repo)")
     ap.add_argument("--run", help="run id (default: the latest run)")
     ap.add_argument("--workflow", help="only consider runs of this workflow file/name when picking the latest")
-    ap.add_argument("--interval", type=float, default=8, help="seconds between polls (default 8)")
     ap.add_argument("--steps", action="store_true", help="draw each job as a table of its steps")
-    ap.add_argument("--once", action="store_true", help="draw the current state and exit")
     ap.add_argument("--all-edges", action="store_true", help="draw every `needs:` edge, even ones implied by a longer path")
     args = ap.parse_args()
 
@@ -197,65 +180,23 @@ def main():
     if not args.all_edges:
         needs = transitive_reduction(needs)
 
-    # Which box is which job, remembered beside the canvas so a re-run
-    # of this script updates the same boxes instead of drawing new ones.
-    side = args.canvas + ".gh.json"
-    book = json.load(open(side)) if os.path.exists(side) else {}
-    if book.get("run") != run_id:
-        book = {"run": run_id, "boxes": {}}
+    jobs = gh_json("run", "view", run_id, "-R", repo, "--json", "jobs")["jobs"]
 
-    last = {}
-    while True:
-        run = gh_json("run", "view", run_id, "-R", repo, "--json", "jobs,status,conclusion,workflowName,displayTitle")
-        jobs = run["jobs"]
+    # Connectors from `needs`, matrix instances included on both ends.
+    by_yaml = {}
+    for j in jobs:
+        yid = job_yaml_id(j["name"], needs)
+        if yid:
+            by_yaml.setdefault(yid, []).append(j["name"])
+    links = []
+    for j in jobs:
+        yid = job_yaml_id(j["name"], needs)
+        for dep in needs.get(yid, []) if yid else []:
+            for src in by_yaml.get(dep, []):
+                links.append({"from": f"job:{src}", "to": f"job:{j['name']}"})
 
-        # First sight of a job: a box for it.
-        new = [j for j in jobs if j["name"] not in book["boxes"]]
-        if new:
-            res = api(args.canvas, [{"type": "place", "x": 0, "y": 0, "w": box_size(j, args.steps)[0], "h": box_size(j, args.steps)[1]} for j in new])
-            for j, r in zip(new, res):
-                book["boxes"][j["name"]] = r["result"]["id"]
-            # Connectors from `needs`, matrix instances included on both ends.
-            by_yaml = {}
-            for j in jobs:
-                yid = job_yaml_id(j["name"], needs)
-                if yid:
-                    by_yaml.setdefault(yid, []).append(j["name"])
-            edges = []
-            done = set(book.get("edges", []))
-            for j in new:
-                yid = job_yaml_id(j["name"], needs)
-                for dep in needs.get(yid, []) if yid else []:
-                    for src in by_yaml.get(dep, []):
-                        key = f"{src}->{j['name']}"
-                        if key not in done:
-                            edges.append({"type": "connect", "from": book["boxes"][src], "to": book["boxes"][j["name"]]})
-                            done.add(key)
-            book["edges"] = sorted(done)
-            reqs = [{"type": "set_text", "id": book["boxes"][j["name"]], "text": box_text(j, args.steps)} for j in new] + edges
-            reqs.append({"type": "layout"})
-            api(args.canvas, reqs)
-
-        # Status and text, only where something changed.
-        reqs = []
-        for j in jobs:
-            st = status_of(j)
-            text = box_text(j, args.steps)
-            key = (st, text)
-            if last.get(j["name"]) != key:
-                bid = book["boxes"][j["name"]]
-                reqs += [{"type": "set_status", "id": bid, "status": st}, {"type": "set_text", "id": bid, "text": text}]
-                last[j["name"]] = key
-        if reqs:
-            api(args.canvas, reqs + [{"type": "save"}])
-        json.dump(book, open(side, "w"))
-
-        done = run["status"] == "completed"
-        line = f"{run['workflowName']} · {run.get('displayTitle', '')[:40]} · {run['status']}" + (f" · {run['conclusion']}" if done else "")
-        print(line + "   " + " ".join(f"{GLYPH[status_of(j)]}" for j in jobs), flush=True)
-        if done or args.once:
-            break
-        time.sleep(args.interval)
+    # prune: a new run's jobs replace the old run's, instead of piling up.
+    print(json.dumps({"items": [item(j, args.steps) for j in jobs], "links": links, "prune": True}, indent=1))
 
 
 if __name__ == "__main__":

@@ -39,6 +39,8 @@ pub enum FileNode {
         shape: Option<String>,
         #[serde(rename = "ratslateFill", skip_serializing_if = "Option::is_none")]
         fill: Option<String>,
+        #[serde(rename = "ratslateKey", skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
         #[serde(rename = "ratslateStatus", skip_serializing_if = "Option::is_none")]
         status: Option<String>,
         text: String,
@@ -56,6 +58,8 @@ pub enum FileNode {
         subpath: Option<String>,
         #[serde(rename = "ratslateFill", skip_serializing_if = "Option::is_none")]
         fill: Option<String>,
+        #[serde(rename = "ratslateKey", skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
         #[serde(rename = "ratslateStatus", skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -70,6 +74,8 @@ pub enum FileNode {
         url: String,
         #[serde(rename = "ratslateFill", skip_serializing_if = "Option::is_none")]
         fill: Option<String>,
+        #[serde(rename = "ratslateKey", skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
         #[serde(rename = "ratslateStatus", skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -179,7 +185,7 @@ fn from_file(root: FileRoot) -> Canvas {
     let mut canvas = Canvas::default();
 
     for fnode in root.nodes {
-        let (id, x, y, w, h, color, shape, fill, status, kind) = match fnode {
+        let (id, x, y, w, h, color, shape, fill, key, status, kind) = match fnode {
             FileNode::Text {
                 id,
                 x,
@@ -189,9 +195,10 @@ fn from_file(root: FileRoot) -> Canvas {
                 color,
                 shape,
                 fill,
+                key,
                 status,
                 text,
-            } => (id, x, y, width, height, color, shape, fill, status, NodeKind::Text(text)),
+            } => (id, x, y, width, height, color, shape, fill, key, status, NodeKind::Text(text)),
             FileNode::File {
                 id,
                 x,
@@ -202,6 +209,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 file,
                 subpath,
                 fill,
+                key,
                 status,
             } => (
                 id,
@@ -212,6 +220,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 color,
                 None,
                 fill,
+                key,
                 status,
                 NodeKind::File { path: file, subpath },
             ),
@@ -224,8 +233,9 @@ fn from_file(root: FileRoot) -> Canvas {
                 color,
                 url,
                 fill,
+                key,
                 status,
-            } => (id, x, y, width, height, color, None, fill, status, NodeKind::Link(url)),
+            } => (id, x, y, width, height, color, None, fill, key, status, NodeKind::Link(url)),
             FileNode::Group {
                 id,
                 x,
@@ -246,6 +256,7 @@ fn from_file(root: FileRoot) -> Canvas {
                 None,
                 None,
                 None,
+                None,
                 NodeKind::Group {
                     label,
                     background,
@@ -263,6 +274,7 @@ fn from_file(root: FileRoot) -> Canvas {
             rect,
             shape: shape.as_deref().map(Shape::parse).unwrap_or_default(),
             fill: fill.as_deref().map(FillStyle::parse).unwrap_or_default(),
+            key,
             status: status.as_deref().and_then(NodeStatus::parse),
             color: color.as_deref().map(Color::parse),
             kind,
@@ -320,6 +332,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
                     color,
                     shape: n.shape.as_str().map(str::to_string),
                     fill: n.fill.as_str().map(str::to_string),
+                    key: n.key.clone(),
                     status: n.status.map(|s| s.as_str().to_string()),
                     text: text.clone(),
                 },
@@ -333,6 +346,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
                     file: path.clone(),
                     subpath: subpath.clone(),
                     fill: n.fill.as_str().map(str::to_string),
+                    key: n.key.clone(),
                     status: n.status.map(|s| s.as_str().to_string()),
                 },
                 NodeKind::Link(url) => FileNode::Link {
@@ -344,6 +358,7 @@ pub fn to_file(canvas: &Canvas) -> FileRoot {
                     color,
                     url: url.clone(),
                     fill: n.fill.as_str().map(str::to_string),
+                    key: n.key.clone(),
                     status: n.status.map(|s| s.as_str().to_string()),
                 },
                 NodeKind::Group {
@@ -458,6 +473,7 @@ mod compat {
             let n = canvas.node_mut(&a).unwrap();
             n.shape = Shape::Thick;
             n.fill = FillStyle::Tint;
+            n.key = Some("job:a".into());
             n.status = Some(NodeStatus::Running);
             n.color = Some(Color::Hex("#ffd75f".into()));
         }
@@ -491,7 +507,7 @@ mod compat {
         assert!(offenders.is_empty(), "non-spec keys must be ratslate-prefixed: {offenders:?}");
         // And the extras really were written (the test isn't vacuous).
         let s = serde_json::to_string(&out).unwrap();
-        for k in ["ratslateShape", "ratslateFill", "ratslateStatus", "ratslateStyle", "ratslateArrow", "ratslateFromAnchor", "ratslateToAnchor"] {
+        for k in ["ratslateShape", "ratslateFill", "ratslateKey", "ratslateStatus", "ratslateStyle", "ratslateArrow", "ratslateFromAnchor", "ratslateToAnchor"] {
             assert!(s.contains(k), "{k} should be in the file");
         }
     }

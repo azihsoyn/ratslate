@@ -278,8 +278,8 @@ pub enum Request {
     SetEdgeColor { id: String, color: Option<String> },
     /// Which ends carry an arrowhead: "none" or "arrow", for each end.
     SetEdgeEnds { id: String, from_end: String, to_end: String },
-    /// How a connector's line is drawn: "solid", "thick", "double" or
-    /// "dashed".
+    /// How a connector's line is drawn: "solid", "rounded" (solid with
+    /// rounded bends), "thick", "double" or "dashed".
     SetEdgeStyle { id: String, style: String },
     /// The arrowhead glyph: "plain", "triangle", "open", "dot" or
     /// "diamond". Which ends actually carry one is still

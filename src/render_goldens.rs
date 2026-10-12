@@ -201,3 +201,25 @@ fn stacked_fan_out_uses_separate_corridors_and_marks_crossings() {
                           └──────┘
 "#);
 }
+
+#[test]
+fn rounded_line_style_bends_with_round_corners() {
+    let mut app = board(&[(2, 2, 8, 3, "A"), (30, 12, 8, 3, "B")], &[(0, 1)]);
+    let edge_id = app.canvas.edges[0].id.clone();
+    app.dispatch(Request::SetEdgeStyle { id: edge_id, style: "rounded".into() }).unwrap();
+    assert_render(&mut app, r#"
+  ┌──────┐
+  │A     │────────────────────────╮
+  └──────┘                        │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  v
+                              ┌──────┐
+                              │B     │
+                              └──────┘
+"#);
+}

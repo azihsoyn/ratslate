@@ -965,7 +965,7 @@ fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16,
 
     let styles: &[(&str, &str)] = match &target {
         Selected::Node(_) => &[("┌", "rectangle"), ("╭", "rounded"), ("┏", "thick"), ("╔", "double"), ("╌", "dashed")],
-        Selected::Edge(_) => &[("─", "solid"), ("━", "thick"), ("═", "double"), ("╌", "dashed")],
+        Selected::Edge(_) => &[("─", "solid"), ("╭", "rounded"), ("━", "thick"), ("═", "double"), ("╌", "dashed")],
     };
     for (i, (label, value)) in styles.iter().enumerate() {
         let cx = x + 2 * i as u16;
@@ -1480,10 +1480,10 @@ fn line_arms(c: char) -> Option<u8> {
     Some(match c {
         '─' => 4 | 8,
         '│' => 1 | 2,
-        '┌' => 2 | 8,
-        '┐' => 2 | 4,
-        '└' => 1 | 8,
-        '┘' => 1 | 4,
+        '┌' | '╭' => 2 | 8,
+        '┐' | '╮' => 2 | 4,
+        '└' | '╰' => 1 | 8,
+        '┘' | '╯' => 1 | 4,
         '├' => 1 | 2 | 8,
         '┤' => 1 | 2 | 4,
         '┬' => 2 | 4 | 8,
@@ -1960,6 +1960,13 @@ fn route_glyphs(waypoints: &[(i32, i32)]) -> Vec<(i32, i32, char)> {
 fn styled_glyph(ch: char, style: LineStyle) -> char {
     match style {
         LineStyle::Solid => ch,
+        LineStyle::Rounded => match ch {
+            '┌' => '╭',
+            '┐' => '╮',
+            '└' => '╰',
+            '┘' => '╯',
+            c => c,
+        },
         LineStyle::Thick => match ch {
             '─' => '━',
             '│' => '┃',

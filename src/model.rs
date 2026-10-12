@@ -120,6 +120,8 @@ impl Shape {
 pub enum LineStyle {
     #[default]
     Solid,
+    /// Solid, with rounded bends (`╭╮╰╯`) — matches a rounded box.
+    Rounded,
     Thick,
     Double,
     Dashed,
@@ -128,6 +130,7 @@ pub enum LineStyle {
 impl LineStyle {
     pub fn parse(s: &str) -> LineStyle {
         match s {
+            "rounded" => LineStyle::Rounded,
             "thick" => LineStyle::Thick,
             "double" => LineStyle::Double,
             "dashed" => LineStyle::Dashed,
@@ -138,6 +141,7 @@ impl LineStyle {
     pub fn as_str(self) -> Option<&'static str> {
         match self {
             LineStyle::Solid => None,
+            LineStyle::Rounded => Some("rounded"),
             LineStyle::Thick => Some("thick"),
             LineStyle::Double => Some("double"),
             LineStyle::Dashed => Some("dashed"),

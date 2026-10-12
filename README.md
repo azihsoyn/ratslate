@@ -28,8 +28,8 @@ Alacritty, WezTerm, GNOME Terminal, Windows Terminal, tmux).
   JSON Canvas presets — and border styles: plain, rounded, thick, double or
   dashed (`x` cycles them too).
 - **Connectors** — shift+drag from one box to another. Sides, arrowheads,
-  colors, labels, line styles (solid `──`, thick `━━`, double `══`, dashed
-  `╌╌`) and arrowhead glyphs (`>` `▶` `▷` `●` `◆`) all editable; JSON Canvas
+  colors, labels, line styles (solid `──`, rounded bends `╭╯`, thick `━━`,
+  double `══`, dashed `╌╌`) and arrowhead glyphs (`>` `▶` `▷` `●` `◆`) all editable; JSON Canvas
   `fromSide`/`toSide`/`fromEnd`/`toEnd` respected.
 - **Tables** — a box whose text is a GFM markdown table renders as a real
   grid. Double-click a cell to edit it spreadsheet-style (Tab/Enter/arrows,

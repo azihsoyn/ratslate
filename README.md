@@ -138,6 +138,10 @@ jobs as boxes, `needs:` as connectors, each job's status as its badge,
 updated as the run goes. It's nothing but a loop over `ratslate --api`,
 which is the point — see [examples/README.md](examples/README.md).
 
+Ratslate's own emphasis color — selection, related connectors, the flow
+pulse, the spinner — is cyan; if that sinks into your palette, set
+`RATSLATE_ACCENT=#ffd75f` (any hex) and everything emphasized uses that.
+
 ## Boards as launchers
 
 Set `RATSLATE_OPENER` to any command and `o` hands it what's selected —

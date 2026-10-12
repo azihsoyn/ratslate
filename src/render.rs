@@ -329,7 +329,7 @@ pub fn render(frame: &mut Frame, app: &mut App, canvas_area: Rect, status_area: 
         let w = start.0.max(end.0) - x + 1;
         let h = start.1.max(end.1) - y + 1;
         frame.render_widget(
-            Block::bordered().border_style(Style::default().fg(RColor::Cyan)),
+            Block::bordered().border_style(Style::default().fg(accent())),
             Rect::new(x, y, w, h).intersection(canvas_area),
         );
     }
@@ -401,7 +401,7 @@ fn draw_tab_bar(frame: &mut Frame, app: &mut App, canvas_area: Rect) {
             break;
         }
         let style = if i == app.active_tab {
-            Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             dim
         };
@@ -491,7 +491,7 @@ fn node_style_with(color: Option<&Color>, selected: bool, preview: Option<Option
     // so picking a new color while still selected actually shows it
     // instead of selection's own color masking it.
     let border_style = if selected {
-        Style::default().fg(shown.unwrap_or(RColor::Cyan)).add_modifier(Modifier::BOLD)
+        Style::default().fg(shown.unwrap_or(accent())).add_modifier(Modifier::BOLD)
     } else {
         base
     };
@@ -541,7 +541,7 @@ fn status_badge(status: Option<NodeStatus>, tick: u64) -> Option<Span<'static>> 
     const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let (text, color) = match status? {
         NodeStatus::Pending => ("○", RColor::DarkGray),
-        NodeStatus::Running => (SPINNER[(tick % SPINNER.len() as u64) as usize], RColor::Cyan),
+        NodeStatus::Running => (SPINNER[(tick % SPINNER.len() as u64) as usize], accent()),
         NodeStatus::Ok => ("✓", RColor::Green),
         NodeStatus::Failed => ("✗", RColor::Red),
         NodeStatus::Skipped => ("⊘", RColor::DarkGray),
@@ -1011,6 +1011,15 @@ fn draw_color_picker(frame: &mut Frame, app: &mut App, target: Selected, x: u16,
     }
 }
 
+/// The one color ratslate uses for its own emphasis — selection, the
+/// connectors and boxes related to it, flow pulses, the spinner, the
+/// search line. Cyan by default; `RATSLATE_ACCENT=#rrggbb` picks
+/// another, for a terminal palette where cyan sinks into the lines.
+fn accent() -> RColor {
+    static ACCENT: std::sync::OnceLock<RColor> = std::sync::OnceLock::new();
+    *ACCENT.get_or_init(|| std::env::var("RATSLATE_ACCENT").ok().and_then(|h| parse_hex(h.trim())).unwrap_or(RColor::Cyan))
+}
+
 fn ratatui_color(color: &Color) -> RColor {
     match color {
         Color::Preset(1) => RColor::Red,
@@ -1348,9 +1357,9 @@ fn draw_edges(
         let related = matches!(&app.selected, Some(Selected::Node(nid)) if &edge_from == nid || &edge_to == nid);
         let mut style = shown_color.map(|c| Style::default().fg(c)).unwrap_or_default();
         if selected {
-            style = Style::default().fg(shown_color.unwrap_or(RColor::Cyan)).add_modifier(Modifier::BOLD);
+            style = Style::default().fg(shown_color.unwrap_or(accent())).add_modifier(Modifier::BOLD);
         } else if related {
-            style = Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD);
+            style = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
         }
         let others: Vec<WorldRect> =
             obstacles.iter().filter(|(id, _)| id != &edge_from && id != &edge_to).map(|(_, r)| *r).collect();
@@ -1367,10 +1376,25 @@ fn draw_edges(
         // Flow: every fourth cell along the path, counted from the
         // source, lights up, and the set slides one cell toward the
         // arrowhead per tick — the line reads as moving that way.
-        let pulse = Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD);
+        let pulse = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
         let period = 4u64;
         for (k, &(x, y, ch)) in glyphs.iter().enumerate() {
             let lit = app.flow && (k as u64 + period - app.tick % period).is_multiple_of(period);
+            // A lit cell on a straight run becomes an arrowhead pointing
+            // the way the line flows, so the motion reads by shape, not
+            // only by color — corners keep their corner.
+            let ch = if lit && line_arms(ch).is_some_and(|a| a == 0b1100 || a == 0b0011) {
+                let (nx, ny) = glyphs.get(k + 1).map(|&(nx, ny, _)| (nx, ny)).unwrap_or((x, y));
+                match (nx - x, ny - y) {
+                    (dx, _) if dx > 0 => '▸',
+                    (dx, _) if dx < 0 => '◂',
+                    (_, dy) if dy > 0 => '▾',
+                    (_, dy) if dy < 0 => '▴',
+                    _ => ch,
+                }
+            } else {
+                ch
+            };
             // Where this line crosses one already drawn, a junction
             // glyph instead of painting over it — two lines that cross
             // should still read as two lines.
@@ -2121,7 +2145,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             format!("{pos}/{n}")
         };
         let line = format!("/{query}▏  {count}  —  enter: next · esc: done");
-        frame.render_widget(Paragraph::new(line).style(Style::default().fg(RColor::Cyan)), area);
+        frame.render_widget(Paragraph::new(line).style(Style::default().fg(accent())), area);
         return;
     }
     let mode = match &app.mode {
@@ -2254,13 +2278,13 @@ mod highlight_tests {
     /// Does any cell on the connector line between the two boxes (the
     /// gap columns 10..24 on the middle row) carry a cyan foreground?
     fn edge_is_cyan(buf: &Buffer) -> bool {
-        (10u16..24).any(|x| buf[(x, 3)].fg == RColor::Cyan)
+        (10u16..24).any(|x| buf[(x, 3)].fg == accent())
     }
 
     /// Does the far box's border (around column 24) carry a cyan
     /// foreground — i.e. is box B highlighted?
     fn box_b_is_cyan(buf: &Buffer) -> bool {
-        (24u16..32).any(|x| (2u16..5).any(|y| buf[(x, y)].fg == RColor::Cyan))
+        (24u16..32).any(|x| (2u16..5).any(|y| buf[(x, y)].fg == accent()))
     }
 
     #[test]
@@ -2302,7 +2326,7 @@ mod flow_tests {
         term.draw(|f| render(f, app, Rect::new(0, 0, 40, 6), Rect::new(0, 0, 0, 0))).unwrap();
         let buf = term.backend().buffer().clone();
         // The connector runs along row 3 between the boxes (cols 10..24).
-        (10u16..24).filter(|&x| buf[(x, 3)].fg == RColor::Cyan).collect()
+        (10u16..24).filter(|&x| buf[(x, 3)].fg == accent()).collect()
     }
 
     #[test]

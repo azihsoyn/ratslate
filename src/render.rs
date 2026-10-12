@@ -1509,7 +1509,16 @@ fn draw_edges(
             put_char(frame, waypoints[last].0, waypoints[last].1, '●', style);
         }
 
-        let (mx, my) = glyphs.get(glyphs.len() / 2).map(|&(x, y, _)| (x, y)).unwrap_or(waypoints[0]);
+        let mid = glyphs.len() / 2;
+        let (mx, my) = glyphs.get(mid).map(|&(x, y, _)| (x, y)).unwrap_or(waypoints[0]);
+        // A label sits centered on the middle of a horizontal run, so
+        // it reads as part of the line (`──needs─>`) and the layout can
+        // size the gap between columns for it. On a vertical run it
+        // hangs off the right of the line instead, where centering
+        // would print it across the line itself.
+        let horizontal = mid > 0
+            && glyphs.get(mid - 1).is_some_and(|g| g.1 == my)
+            && glyphs.get(mid + 1).is_some_and(|g| g.1 == my);
 
         let shown = if editing {
             Some(format!("{}▏", app.editing_text))
@@ -1521,7 +1530,8 @@ fn draw_edges(
             && my >= 0
         {
             let width = crate::table::display_width(&shown).min(u16::MAX as usize) as u16;
-            frame.render_widget(Paragraph::new(shown).style(style), Rect::new(mx as u16, my as u16, width, 1));
+            let lx = if horizontal { (mx - (width as i32 - 1) / 2).max(0) } else { mx };
+            frame.render_widget(Paragraph::new(shown).style(style), Rect::new(lx as u16, my as u16, width, 1));
         }
 
         if selected && mx >= 0 && my > 0 {

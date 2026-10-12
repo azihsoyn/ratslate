@@ -8,7 +8,11 @@ use std::collections::HashMap;
 
 use crate::model::{Canvas, NodeKind, ShapeId};
 
+/// The least space between two columns; a labeled connector between
+/// adjacent columns widens its gap to fit the label with a line cell
+/// and some air on either side.
 const GAP_X: i32 = 6;
+const LABEL_AIR: i32 = 4;
 const GAP_Y: i32 = 2;
 const COMPONENT_GAP: i32 = 4;
 
@@ -71,6 +75,21 @@ pub fn layered(canvas: &Canvas) -> Vec<(ShapeId, i32, i32)> {
         n_comp += 1;
     }
 
+    // How wide each column gap has to be for the labels crossing it:
+    // a label is drawn centered on the connector's middle, so a gap
+    // narrower than the label would print it over the boxes.
+    let mut gap_after: HashMap<i32, i32> = HashMap::new();
+    for e in &canvas.edges {
+        if let (Some(&a), Some(&b)) = (index.get(e.from.as_str()), index.get(e.to.as_str()))
+            && let Some(label) = e.label.as_deref().filter(|l| !l.is_empty())
+            && (rank[a] - rank[b]).abs() == 1
+        {
+            let need = crate::table::display_width(label) as i32 + LABEL_AIR;
+            let g = gap_after.entry(rank[a].min(rank[b])).or_insert(GAP_X);
+            *g = (*g).max(need);
+        }
+    }
+
     // The whole arrangement starts where the content already is, so
     // layout tidies in place rather than teleporting the board.
     let origin_x = nodes.iter().map(|n| n.rect.x).min().unwrap_or(0);
@@ -110,7 +129,7 @@ pub fn layered(canvas: &Canvas) -> Vec<(ShapeId, i32, i32)> {
 
         let mut x = origin_x;
         let mut comp_bottom = comp_y;
-        for layer in &layers {
+        for (r, layer) in layers.iter().enumerate() {
             if layer.is_empty() {
                 continue;
             }
@@ -122,7 +141,7 @@ pub fn layered(canvas: &Canvas) -> Vec<(ShapeId, i32, i32)> {
                 col_w = col_w.max(nodes[i].rect.width as i32);
             }
             comp_bottom = comp_bottom.max(y - GAP_Y);
-            x += col_w + GAP_X;
+            x += col_w + gap_after.get(&(r as i32)).copied().unwrap_or(GAP_X);
         }
         comp_y = comp_bottom + COMPONENT_GAP;
     }

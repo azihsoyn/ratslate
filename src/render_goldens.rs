@@ -223,3 +223,19 @@ fn rounded_line_style_bends_with_round_corners() {
                               └──────┘
 "#);
 }
+
+#[test]
+fn layout_widens_a_column_gap_for_the_label_crossing_it_and_centers_it() {
+    let mut app = App::new(None);
+    let doc: crate::app::SyncDoc = serde_json::from_str(
+        r#"{"items":[{"key":"a","text":"fetch"},{"key":"b","text":"build"},{"key":"c","text":"test"}],
+            "links":[{"from":"a","to":"b","label":"needs"},{"from":"b","to":"c","label":"artifacts ready"}]}"#,
+    )
+    .unwrap();
+    app.dispatch(Request::Sync { doc }).unwrap();
+    assert_render(&mut app, r#"
+  ┌───────┐         ┌───────┐                   ┌──────┐
+  │fetch  │──needs─>│build  │──artifacts ready─>│test  │
+  └───────┘         └───────┘                   └──────┘
+"#);
+}

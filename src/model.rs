@@ -68,9 +68,9 @@ impl std::fmt::Display for Color {
 }
 
 /// A box's outline. Not part of JSON Canvas — carried as an extra
-/// `shape` field on text nodes that other readers (Obsidian included)
-/// just ignore, rather than a property any importer needs to know
-/// about to render the node at all.
+/// `ratslateShape` field on text nodes that other readers (Obsidian
+/// included) just ignore, rather than a property any importer needs to
+/// know about to render the node at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Shape {
     #[default]
